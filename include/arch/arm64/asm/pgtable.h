@@ -1,0 +1,131 @@
+/*
+ * Copyright (C) 2026 Intel Corporation.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#ifndef ARM64_PGTABLE_H
+#define ARM64_PGTABLE_H
+
+#include <asm/page.h>
+
+#define PG_TABLE_SHIFT			9UL
+#define PG_TABLE_ENTRIES		(1UL << PG_TABLE_SHIFT)
+#define PG_TABLE_ENTRY_MASK		(PG_TABLE_ENTRIES - 1UL)
+
+#define PTE_SHIFT			PAGE_SHIFT
+#define PTRS_PER_PTE			PG_TABLE_ENTRIES
+#define PGD_SHIFT			(PAGE_SHIFT + (3UL * PG_TABLE_SHIFT))
+#define PUD_SHIFT			(PAGE_SHIFT + (2UL * PG_TABLE_SHIFT))
+#define PMD_SHIFT			(PAGE_SHIFT + PG_TABLE_SHIFT)
+#define PTRS_PER_PGD			PG_TABLE_ENTRIES
+#define PTRS_PER_PUD			PG_TABLE_ENTRIES
+#define PTRS_PER_PMD			PG_TABLE_ENTRIES
+
+#define PAGE_PFN_OFFSET			12UL
+#define PAGE_BASE_OFFSET		PAGE_PFN_OFFSET
+#define PAGE_PFN_MASK			0x0000FFFFFFFFF000UL
+#define PTE_PFN_MASK			PAGE_PFN_MASK
+#define PFN_MASK			PTE_PFN_MASK
+
+/*
+ * AArch64 stage-2 output addresses are architecturally capped below bit 52.
+ * Use bit 52 as the common invalid HPA sentinel, matching x86/riscv helpers.
+ */
+#define INVALID_HPA			(0x1UL << 52U)
+
+#define PAGE_TABLE_DESC			0x3UL
+#define PAGE_BLOCK_DESC			0x1UL
+#define PAGE_PAGE_DESC			0x3UL
+#define PAGE_DESC_VALID			0x1UL
+#define PAGE_DESC_TYPE_MASK		0x3UL
+#define PAGE_TYPE_MASK			PAGE_DESC_TYPE_MASK
+#define PAGE_TYPE_TABLE			PAGE_TABLE_DESC
+
+#define PAGE_ATTR_IDX_SHIFT		2UL
+#define PAGE_ATTR_IDX_NORMAL		(0UL << PAGE_ATTR_IDX_SHIFT)
+#define PAGE_ATTR_IDX_DEVICE		(1UL << PAGE_ATTR_IDX_SHIFT)
+#define PAGE_AP_RW_EL2			(0UL << 6U)
+#define PAGE_AP_RO_EL2			(1UL << 7U)
+#define PAGE_SH_INNER			(3UL << 8U)
+#define PAGE_AF				(1UL << 10U)
+#define PAGE_PXN			(1UL << 53U)
+#define PAGE_UXN			(1UL << 54U)
+
+#define PAGE_ATTR_NORMAL		(PAGE_ATTR_IDX_NORMAL | PAGE_SH_INNER | PAGE_AF)
+#define PAGE_ATTR_DEVICE		(PAGE_ATTR_IDX_DEVICE | PAGE_SH_INNER | PAGE_AF | PAGE_PXN | PAGE_UXN)
+
+#define PAGE_S2_MEMATTR_MASK		(0xfUL << 2U)
+#define PAGE_S2_MEMATTR_NORMAL		(0xfUL << 2U)
+#define PAGE_S2_MEMATTR_DEVICE		(0x1UL << 2U)
+#define PAGE_S2_S2AP_READ		(1UL << 6U)
+#define PAGE_S2_S2AP_WRITE		(1UL << 7U)
+#define PAGE_S2_S2AP_RW		(PAGE_S2_S2AP_READ | PAGE_S2_S2AP_WRITE)
+#define PAGE_S2_SH_INNER		(3UL << 8U)
+#define PAGE_S2_AF			(1UL << 10U)
+#define PAGE_S2_XN			(3UL << 53U)
+#define PAGE_S2_ATTR_NORMAL		(PAGE_S2_MEMATTR_NORMAL | PAGE_S2_S2AP_RW | \
+					PAGE_S2_SH_INNER | PAGE_S2_AF)
+#define PAGE_S2_ATTR_DEVICE		(PAGE_S2_MEMATTR_DEVICE | PAGE_S2_S2AP_RW | \
+					PAGE_S2_SH_INNER | PAGE_S2_AF | PAGE_S2_XN)
+
+#define PAGE_V				PAGE_DESC_VALID
+#define PAGE_R				0UL
+#define PAGE_W				0UL
+#define PAGE_X				0UL
+#define PAGE_U				0UL
+#define PAGE_G				0UL
+#define PAGE_NO_RW			(PAGE_V | PAGE_ATTR_NORMAL | PAGE_BLOCK_DESC)
+#define PAGE_RW_RW			(PAGE_V | PAGE_ATTR_NORMAL | PAGE_BLOCK_DESC)
+#define PAGE_NO_RO			(PAGE_V | PAGE_ATTR_NORMAL | PAGE_AP_RO_EL2 | PAGE_BLOCK_DESC)
+#define PAGE_RO_RO			PAGE_NO_RO
+#define PAGE_ATTRIBUTES_MASK		(PAGE_ATTR_IDX_DEVICE | PAGE_AP_RO_EL2 | PAGE_PXN | PAGE_UXN)
+
+#define MAIR_ATTR_DEVICE_nGnRE		0x04UL
+#define MAIR_ATTR_NORMAL_WB		0xffUL
+#define MAIR_EL2_VALUE			(MAIR_ATTR_NORMAL_WB | (MAIR_ATTR_DEVICE_nGnRE << 8U))
+
+#define TCR_T0SZ_48BIT			16UL
+#define TCR_TG0_4K			(0UL << 14U)
+#define TCR_SH0_INNER			(3UL << 12U)
+#define TCR_ORGN0_WBWA			(1UL << 10U)
+#define TCR_IRGN0_WBWA			(1UL << 8U)
+#define TCR_PS_48BIT			(5UL << 16U)
+#define TCR_EL2_VALUE			(TCR_T0SZ_48BIT | TCR_TG0_4K | TCR_SH0_INNER | \
+					TCR_ORGN0_WBWA | TCR_IRGN0_WBWA | TCR_PS_48BIT)
+
+#define VTCR_T0SZ_48BIT		16UL
+#define VTCR_TG0_4K			(0UL << 14U)
+#define VTCR_SH0_INNER			(3UL << 12U)
+#define VTCR_ORGN0_WBWA		(1UL << 10U)
+#define VTCR_IRGN0_WBWA		(1UL << 8U)
+#define VTCR_SL0_LVL0			(2UL << 6U)
+#define VTCR_PS_48BIT			(5UL << 16U)
+#define VTCR_RES1			(1UL << 31U)
+#define VTCR_EL2_VALUE			(VTCR_T0SZ_48BIT | VTCR_TG0_4K | VTCR_SH0_INNER | \
+					VTCR_ORGN0_WBWA | VTCR_IRGN0_WBWA | \
+					VTCR_SL0_LVL0 | VTCR_PS_48BIT | VTCR_RES1)
+
+#define SCTLR_EL2_M			(1UL << 0U)
+#define SCTLR_EL2_A			(1UL << 1U)
+#define SCTLR_EL2_C			(1UL << 2U)
+#define SCTLR_EL2_I			(1UL << 12U)
+#define SCTLR_EL2_SA			(1UL << 3U)
+#define SCTLR_EL2_VALUE			(SCTLR_EL2_M | SCTLR_EL2_C | SCTLR_EL2_I | SCTLR_EL2_SA)
+
+#define DEFINE_PAGE_TABLES(name, nr)					\
+pgtable_t __aligned(PAGE_SIZE) name[PG_TABLE_ENTRIES * (nr)]
+
+#define DEFINE_PAGE_TABLE(name) DEFINE_PAGE_TABLES(name, 1)
+
+#ifndef ASSEMBLER
+
+struct page {
+	uint8_t contents[PAGE_SIZE];
+} __aligned(PAGE_SIZE);
+
+typedef uint64_t pgtable_t;
+
+#endif /* ASSEMBLER */
+
+#endif /* ARM64_PGTABLE_H */

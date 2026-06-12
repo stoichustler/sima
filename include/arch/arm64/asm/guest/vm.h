@@ -1,0 +1,31 @@
+/*
+ * Copyright (C) 2026 Intel Corporation.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#ifndef ARM64_GUEST_VM_H
+#define ARM64_GUEST_VM_H
+
+#include <types.h>
+#include <vm_configurations.h>
+#include <vuart.h>
+#include <fdt_api.h>
+#include <asm/guest/vgicv3.h>
+
+#define INVALID_PIO_IDX		-1U
+#define UART_PIO_IDX0		INVALID_PIO_IDX
+#define EMUL_PIO_IDX_MAX	1U
+
+struct vm_arch {
+	int64_t time_delta;
+	struct arm64_vgicv3 vgic;
+};
+
+struct acrn_vcpu;
+struct acrn_vm;
+
+uint64_t vcpu_get_vmpidr(struct acrn_vcpu *vcpu);
+struct acrn_vcpu *vcpu_from_vmpidr(struct acrn_vm *vm, uint64_t vmpidr);
+
+#endif /* ARM64_GUEST_VM_H */

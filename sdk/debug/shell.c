@@ -1,0 +1,1133 @@
+/*
+ * Copyright (C) 2018-2025 Intel Corporation.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include <types.h>
+#include <errno.h>
+#include <bits.h>
+#include "shell_priv.h"
+#include <console.h>
+#include <per_cpu.h>
+#include <sprintf.h>
+#include <logmsg.h>
+#include <version.h>
+#include <shell.h>
+#include <cpu.h>
+#include <ticks.h>
+#include <schedule.h>
+#include <irq.h>
+#include <bits.h>
+
+#define SHELL_PROMPT_STR	"console:\\> "
+#define SHELL_ASCII_BS		'\b'
+#define SHELL_ASCII_DEL		0x7fU
+
+char shell_log_buf[SHELL_LOG_BUF_SIZE];
+
+extern struct shell_cmd arch_shell_cmds[];
+extern uint32_t arch_shell_cmds_sz;
+/* Input Line Other - Switch to the "other" input line (there are only two
+ * input lines total).
+ */
+
+static int32_t shell_cmd_help(__unused int32_t argc, __unused char **argv);
+static int32_t shell_version(__unused int32_t argc, __unused char **argv);
+static int32_t shell_loglevel(int32_t argc, char **argv);
+static int32_t shell_dump_host_mem(int32_t argc, char **argv);
+static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv);
+static int32_t shell_list_threads(__unused int32_t argc, __unused char **argv);
+static int32_t shell_sched(__unused int32_t argc, __unused char **argv);
+static int32_t shell_irqstats(int32_t argc, char **argv);
+static int32_t shell_to_vm_console(int32_t argc, char **argv);
+
+static struct shell_cmd shell_cmds[] = {
+	{
+		.str		= SHELL_CMD_HELP,
+		.cmd_param	= SHELL_CMD_HELP_PARAM,
+		.help_str	= SHELL_CMD_HELP_HELP,
+		.fcn		= shell_cmd_help,
+	},
+	{
+		.str		= SHELL_CMD_VERSION,
+		.cmd_param	= SHELL_CMD_VERSION_PARAM,
+		.help_str	= SHELL_CMD_VERSION_HELP,
+		.fcn		= shell_version,
+	},
+	{
+		.str		= SHELL_CMD_LOG_LVL,
+		.cmd_param	= SHELL_CMD_LOG_LVL_PARAM,
+		.help_str	= SHELL_CMD_LOG_LVL_HELP,
+		.fcn		= shell_loglevel,
+	},
+	{
+		.str		= SHELL_CMD_DUMP_HOST_MEM,
+		.cmd_param	= SHELL_CMD_DUMP_HOST_MEM_PARAM,
+		.help_str	= SHELL_CMD_DUMP_HOST_MEM_HELP,
+		.fcn		= shell_dump_host_mem,
+	},
+	{
+		.str		= SHELL_CMD_VCPU_LIST,
+		.cmd_param	= SHELL_CMD_VCPU_LIST_PARAM,
+		.help_str	= SHELL_CMD_VCPU_LIST_HELP,
+		.fcn		= shell_list_vcpu,
+	},
+	{
+		.str		= SHELL_CMD_THREAD_LIST,
+		.cmd_param	= SHELL_CMD_THREAD_LIST_PARAM,
+		.help_str	= SHELL_CMD_THREAD_LIST_HELP,
+		.fcn		= shell_list_threads,
+	},
+	{
+		.str		= SHELL_CMD_SCHED,
+		.cmd_param	= SHELL_CMD_SCHED_PARAM,
+		.help_str	= SHELL_CMD_SCHED_HELP,
+		.fcn		= shell_sched,
+	},
+	{
+		.str		= SHELL_CMD_IRQ_STATS,
+		.cmd_param	= SHELL_CMD_IRQ_STATS_PARAM,
+		.help_str	= SHELL_CMD_IRQ_STATS_HELP,
+		.fcn		= shell_irqstats,
+	},
+	{
+		.str		= SHELL_CMD_VM_CONSOLE,
+		.cmd_param	= SHELL_CMD_VM_CONSOLE_PARAM,
+		.help_str	= SHELL_CMD_VM_CONSOLE_HELP,
+		.fcn		= shell_to_vm_console,
+	},
+};
+
+/* for function key: up/down/right/left/home/end and delete key */
+enum function_key {
+	KEY_NONE,
+
+	KEY_DELETE = 0x5B33,
+	KEY_UP = 0x5B41,
+	KEY_DOWN = 0x5B42,
+	KEY_RIGHT = 0x5B43,
+	KEY_LEFT = 0x5B44,
+	KEY_END = 0x5B46,
+	KEY_HOME = 0x5B48,
+};
+
+extern uint16_t mem_loglevel;
+extern uint16_t console_loglevel;
+extern uint16_t npk_loglevel;
+
+
+static struct shell hv_shell;
+static struct shell *p_shell = &hv_shell;
+static struct thread_object shell_thread;
+static uint8_t shell_stack[CONFIG_STACK_SIZE] __aligned(16);
+static bool shell_started;
+static bool shell_prompt_enabled;
+
+static void shell_thread_main(__unused struct thread_object *obj);
+
+static int32_t string_to_argv(char *argv_str, void *p_argv_mem,
+		__unused uint32_t argv_mem_size,
+		uint32_t *p_argc, char ***p_argv)
+{
+	uint32_t argc;
+	char **argv;
+	char *p_ch;
+
+	/* Setup initial argument values. */
+	argc = 0U;
+	argv = NULL;
+
+	/* Ensure there are arguments to be processed. */
+	if (argv_str == NULL) {
+		*p_argc = argc;
+		*p_argv = argv;
+		return -EINVAL;
+	}
+
+	/* Process the argument string (there is at least one element). */
+	argv = (char **)p_argv_mem;
+	p_ch = argv_str;
+
+	/* Remove all spaces at the beginning of cmd*/
+	while (*p_ch == ' ') {
+		p_ch++;
+	}
+
+	while (*p_ch != 0) {
+		/* Add argument (string) pointer to the vector. */
+		argv[argc] = p_ch;
+
+		/* Move past the vector entry argument string (in the
+		 * argument string).
+		 */
+		while ((*p_ch != ' ') && (*p_ch != ',') && (*p_ch != 0)) {
+			p_ch++;
+		}
+
+		/* Count the argument just processed. */
+		argc++;
+
+		/* Check for the end of the argument string. */
+		if (*p_ch != 0) {
+			/* Terminate the vector entry argument string
+			 * and move to the next.
+			 */
+			*p_ch = 0;
+			/* Remove all space in middile of cmdline */
+			p_ch++;
+			while (*p_ch == ' ') {
+				p_ch++;
+			}
+		}
+	}
+
+	/* Update return parameters */
+	*p_argc = argc;
+	*p_argv = argv;
+
+	return 0;
+}
+
+static struct shell_cmd *shell_find_cmd(const char *cmd_str)
+{
+	uint32_t i;
+	struct shell_cmd *p_cmd = NULL;
+
+	for (i = 0U; i < p_shell->cmd_count; i++) {
+		p_cmd = &p_shell->cmds[i];
+		if (strcmp(p_cmd->str, cmd_str) == 0) {
+			return p_cmd;
+		}
+	}
+	for (i = 0U; i < p_shell->arch_cmd_count; i++) {
+		p_cmd = &p_shell->arch_cmds[i];
+		if (strcmp(p_cmd->str, cmd_str) == 0) {
+			return p_cmd;
+		}
+	}
+	return NULL;
+}
+
+static char shell_getc(void)
+{
+	return console_getc();
+}
+
+void shell_puts(const char *string_ptr)
+{
+	/* Output the string */
+	(void)console_write(string_ptr, strnlen_s(string_ptr,
+				SHELL_STRING_MAX_LEN));
+}
+
+static void clear_input_line(uint32_t len)
+{
+	while (len > 0) {
+		len--;
+		shell_puts("\b");
+		shell_puts(" \b");
+	}
+}
+
+static void set_cursor_pos(uint32_t left_offset)
+{
+	while (left_offset > 0) {
+		left_offset--;
+		shell_puts("\b");
+	}
+}
+
+static void handle_delete_key(void)
+{
+	if (p_shell->cursor_offset < p_shell->input_line_len) {
+
+		uint32_t delta = p_shell->input_line_len - p_shell->cursor_offset - 1;
+
+		/* Send a space + backspace sequence to delete character */
+		shell_puts(" \b");
+
+		/* display the left input chars and remove former last one */
+		shell_puts(p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset + 1);
+		shell_puts(" \b");
+
+		set_cursor_pos(delta);
+
+		memcpy(p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset,
+			p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset + 1, delta);
+
+		/* Null terminate the last character to erase it */
+		p_shell->buffered_line[p_shell->input_line_active][p_shell->input_line_len - 1] = 0;
+
+		/* Reduce the length of the string by one */
+		p_shell->input_line_len--;
+	}
+}
+
+static void handle_updown_key(enum function_key key_value)
+{
+	int32_t to_select, current_select = p_shell->to_select_index;
+
+	/* update current_select and p_shell->to_select_index as up/down key */
+	if (key_value == KEY_UP) {
+		/* if the ring buffer not full, just decrease one until to 0; if full, need handle overflow case */
+		to_select = p_shell->to_select_index - 1;
+		if (to_select < 0) {
+			to_select += MAX_BUFFERED_CMDS;
+		}
+
+		if (p_shell->buffered_line[to_select][0] != '\0') {
+			current_select = to_select;
+		}
+
+	} else {
+		/* if down key and current is active line, not need update */
+		if (p_shell->to_select_index != p_shell->input_line_active) {
+			current_select = (p_shell->to_select_index + 1) % MAX_BUFFERED_CMDS;
+		}
+	}
+
+	/* go up/down until first buffered cmd or current input line: user will know it is end to select */
+	if (current_select != p_shell->input_line_active) {
+		p_shell->to_select_index = current_select;
+	}
+
+	if (strcmp(p_shell->buffered_line[current_select], p_shell->buffered_line[p_shell->input_line_active]) != 0) {
+		/* reset cursor pos and clear current input line first, then output selected cmd */
+		if (p_shell->cursor_offset < p_shell->input_line_len) {
+			shell_puts(p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset);
+		}
+
+		clear_input_line(p_shell->input_line_len);
+		shell_puts(p_shell->buffered_line[current_select]);
+
+		size_t len = strnlen_s(p_shell->buffered_line[current_select], SHELL_CMD_MAX_LEN);
+
+		memcpy_s(p_shell->buffered_line[p_shell->input_line_active], SHELL_CMD_MAX_LEN,
+			p_shell->buffered_line[current_select], len + 1);
+		p_shell->input_line_len = len;
+		p_shell->cursor_offset = len;
+	}
+}
+
+static void shell_handle_special_char(char ch)
+{
+	enum function_key key_value = KEY_NONE;
+
+	switch (ch) {
+	/* original function key value: ESC + key (2/3 bytes), so consume the next 2/3 characters */
+	case 0x1b:
+		key_value = (shell_getc() << 8) | shell_getc();
+		if (key_value == KEY_DELETE) {
+			(void)shell_getc(); /* delete key has one more byte */
+		}
+
+		switch (key_value) {
+		case KEY_DELETE:
+			handle_delete_key();
+			break;
+		case KEY_UP:
+		case KEY_DOWN:
+			handle_updown_key(key_value);
+			break;
+		case KEY_RIGHT:
+			if (p_shell->cursor_offset < p_shell->input_line_len) {
+				shell_puts(p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset);
+				p_shell->cursor_offset++;
+				set_cursor_pos(p_shell->input_line_len - p_shell->cursor_offset);
+			}
+			break;
+		case KEY_LEFT:
+			if (p_shell->cursor_offset > 0) {
+				p_shell->cursor_offset--;
+				shell_puts("\b");
+			}
+			break;
+		case KEY_END:
+			if (p_shell->cursor_offset < p_shell->input_line_len) {
+				shell_puts(p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset);
+				p_shell->cursor_offset = p_shell->input_line_len;
+			}
+			break;
+		case KEY_HOME:
+			if (p_shell->cursor_offset > 0) {
+				set_cursor_pos(p_shell->cursor_offset);
+				p_shell->cursor_offset = 0;
+			}
+			break;
+		default:
+			break;
+		}
+
+		break;
+	default:
+		/*
+		 * Only the Escape character is treated as special character.
+		 * All the other characters have been handled properly in
+		 * shell_input_line, so they will not be handled in this API.
+		 * Gracefully return if prior case clauses have not been met.
+		 */
+		break;
+	}
+}
+
+static void handle_backspace_key(void)
+{
+	/* Ensure length is not 0 */
+	if (p_shell->cursor_offset > 0U) {
+		/* Echo backspace */
+		shell_puts("\b");
+		/* Send a space + backspace sequence to delete character */
+		shell_puts(" \b");
+
+		if (p_shell->cursor_offset < p_shell->input_line_len) {
+			uint32_t delta = p_shell->input_line_len - p_shell->cursor_offset;
+
+			/* display the left input-chars and remove the former last one */
+			shell_puts(p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset);
+			shell_puts(" \b");
+
+			set_cursor_pos(delta);
+			memcpy(p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset - 1,
+				p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset, delta);
+		}
+
+		/* Null terminate the last character to erase it */
+		p_shell->buffered_line[p_shell->input_line_active][p_shell->input_line_len - 1] = 0;
+
+		/* Reduce the length of the string by one */
+		p_shell->input_line_len--;
+		p_shell->cursor_offset--;
+	}
+}
+
+static void handle_input_char(char ch)
+{
+	uint32_t delta = p_shell->input_line_len - p_shell->cursor_offset;
+
+	/* move the input from cursor offset back first */
+	if (delta > 0) {
+		memcpy_backwards(p_shell->buffered_line[p_shell->input_line_active] + p_shell->input_line_len,
+			p_shell->buffered_line[p_shell->input_line_active] + p_shell->input_line_len - 1, delta);
+	}
+
+	p_shell->buffered_line[p_shell->input_line_active][p_shell->cursor_offset] = ch;
+
+	/* Echo back the input */
+	shell_puts(p_shell->buffered_line[p_shell->input_line_active] + p_shell->cursor_offset);
+	set_cursor_pos(delta);
+
+	/* Move to next character in string */
+	p_shell->input_line_len++;
+	p_shell->cursor_offset++;
+}
+
+static bool shell_input_line(void)
+{
+	bool done = false;
+	char ch;
+
+	ch = shell_getc();
+
+	/* Check character */
+	switch (ch) {
+	/* Backspace: terminals commonly send either BS or DEL. */
+	case SHELL_ASCII_BS:
+	case SHELL_ASCII_DEL:
+		handle_backspace_key();
+		break;
+
+	/* Carriage-return */
+	case '\r':
+		/* Echo carriage return / line feed */
+		shell_puts("\r\n");
+
+		/* Set flag showing line input done */
+		done = true;
+
+		/* Reset command length for next command processing */
+		p_shell->input_line_len = 0U;
+		p_shell->cursor_offset = 0U;
+		break;
+
+	/* Line feed */
+	case '\n':
+		/* Do nothing */
+		break;
+
+	/* All other characters */
+	default:
+		/* Ensure data doesn't exceed full terminal width */
+		if (p_shell->input_line_len < SHELL_CMD_MAX_LEN) {
+			/* See if a "standard" prINTable ASCII character received */
+			if ((ch >= 32) && (ch <= 126)) {
+				handle_input_char(ch);
+			} else {
+				/* call special character handler */
+				shell_handle_special_char(ch);
+			}
+		} else {
+			/* Echo carriage return / line feed */
+			shell_puts("\r\n");
+
+			/* Set flag showing line input done */
+			done = true;
+
+			/* Reset command length for next command processing */
+			p_shell->input_line_len = 0U;
+			p_shell->cursor_offset = 0U;
+		}
+		break;
+	}
+
+
+	return done;
+}
+
+static int32_t shell_process_cmd(const char *p_input_line)
+{
+	int32_t status = -EINVAL;
+	struct shell_cmd *p_cmd;
+	char cmd_argv_str[SHELL_CMD_MAX_LEN + 1U];
+	int32_t cmd_argv_mem[sizeof(char *) * ((SHELL_CMD_MAX_LEN + 1U) >> 1U)];
+	int32_t cmd_argc;
+	char **cmd_argv;
+
+	/* Copy the input line INTo an argument string to become part of the
+	 * argument vector.
+	 */
+	(void)strncpy_s(&cmd_argv_str[0], SHELL_CMD_MAX_LEN + 1U, p_input_line, SHELL_CMD_MAX_LEN);
+	cmd_argv_str[SHELL_CMD_MAX_LEN] = 0;
+
+	/* Build the argv vector from the string. The first argument in the
+	 * resulting vector will be the command string itself.
+	 */
+
+	/* NOTE: This process is destructive to the argument string! */
+
+	(void) string_to_argv(&cmd_argv_str[0],
+			(void *) &cmd_argv_mem[0],
+			sizeof(cmd_argv_mem), (void *)&cmd_argc, &cmd_argv);
+
+	/* Determine if there is a command to process. */
+	if (cmd_argc != 0) {
+		/* See if command is in cmds supported */
+		p_cmd = shell_find_cmd(cmd_argv[0]);
+		if (p_cmd == NULL) {
+			shell_puts("\r\nerror: invalid command.\r\n");
+			return -EINVAL;
+		}
+
+		status = p_cmd->fcn(cmd_argc, &cmd_argv[0]);
+		if (status == -EINVAL) {
+			shell_puts("\r\nerror: invalid parameters.\r\n");
+		} else if (status != 0) {
+			shell_puts("\r\ncommand launch failed.\r\n");
+		} else {
+			/* No other state currently, do nothing */
+		}
+	}
+
+	return status;
+}
+
+static int32_t shell_process(void)
+{
+	int32_t status, former_index;
+	char *p_input_line;
+
+	/* Process current command (using active input line). */
+	p_input_line = p_shell->buffered_line[p_shell->input_line_active];
+
+	former_index = (p_shell->input_line_active + MAX_BUFFERED_CMDS - 1) % MAX_BUFFERED_CMDS;
+
+	/* just buffer current cmd if current is not empty and not same with last buffered one */
+	if ((strnlen_s(p_input_line, SHELL_CMD_MAX_LEN) > 0) &&
+		(strcmp(p_input_line, p_shell->buffered_line[former_index]) != 0)) {
+		p_shell->input_line_active = (p_shell->input_line_active + 1) % MAX_BUFFERED_CMDS;
+	}
+
+	p_shell->to_select_index = p_shell->input_line_active;
+
+	/* Process command */
+	status = shell_process_cmd(p_input_line);
+
+	/* Now that the command is processed, zero fill the input buffer */
+	(void)memset(p_shell->buffered_line[p_shell->input_line_active], 0, SHELL_CMD_MAX_LEN + 1U);
+
+	/* Process command and return result to caller */
+	return status;
+}
+
+
+void shell_kick(void)
+{
+	static bool is_cmd_cmplt = false;
+
+	if (console_vm_kick()) {
+		return;
+	}
+
+	if (!shell_prompt_enabled) {
+		char ch = shell_getc();
+
+		/*
+		 * Guest APs can still be brought up by PSCI after shell_start() because
+		 * only VM BSPs are launched by the host autostart path. Keep the CLAN
+		 * shell quiet until the user presses Enter so the first prompt does not
+		 * appear in the middle of late vCPU scheduling logs.
+		 */
+		if ((ch == '\r') || (ch == '\n')) {
+			shell_prompt_enabled = true;
+			shell_puts("\r\n");
+			shell_puts(SHELL_PROMPT_STR);
+			is_cmd_cmplt = false;
+		}
+		return;
+	}
+
+	/* At any given instance, UART may be owned by the HV
+	 * OR by the guest that has enabled the vUart.
+	 * Show HV shell prompt ONLY when HV owns the
+	 * serial port.
+	 */
+	/* Prompt the user for a selection. */
+	if (is_cmd_cmplt) {
+		shell_puts(SHELL_PROMPT_STR);
+	}
+
+	/* Get user's input */
+	is_cmd_cmplt = shell_input_line();
+
+	/* If user has pressed the ENTER then process
+	 * the command
+	 */
+	if (is_cmd_cmplt) {
+		/* Process current input line. */
+		(void)shell_process();
+	}
+}
+
+static void shell_thread_main(__unused struct thread_object *obj)
+{
+	while (true) {
+		shell_kick();
+		yield_current();
+		schedule();
+	}
+}
+
+void shell_init(void)
+{
+	p_shell->cmds = shell_cmds;
+	p_shell->cmd_count = ARRAY_SIZE(shell_cmds);
+
+	p_shell->arch_cmds = arch_shell_cmds;
+	p_shell->arch_cmd_count = arch_shell_cmds_sz;
+
+	p_shell->to_select_index = 0;
+
+	/* Zero fill the input buffer */
+	(void)memset(p_shell->buffered_line[p_shell->input_line_active], 0U, SHELL_CMD_MAX_LEN + 1U);
+}
+
+void shell_start(void)
+{
+	struct sched_params shell_params = {0U};
+
+	if (shell_started) {
+		return;
+	}
+
+	(void)strncpy_s(shell_thread.name, sizeof(shell_thread.name), "shell", sizeof(shell_thread.name));
+	shell_thread.pcpu_id = BSP_CPU_ID;
+	shell_thread.sched_ctl = &per_cpu(sched_ctl, BSP_CPU_ID);
+	shell_thread.thread_entry = shell_thread_main;
+	shell_thread.switch_out = NULL;
+	shell_thread.switch_in = NULL;
+	shell_thread.host_sp = arch_setup_thread_stack(&shell_thread, shell_stack, CONFIG_STACK_SIZE);
+
+	shell_params.prio = PRIO_LOW;
+	init_thread_data(&shell_thread, &shell_params);
+	wake_thread(&shell_thread);
+	shell_started = true;
+}
+
+#define SHELL_ROWS	30
+#define MAX_OUTPUT_LEN  80
+static int32_t shell_cmd_help(__unused int32_t argc, __unused char **argv)
+{
+	struct shell_cmd *p_cmd = NULL;
+
+	char str[MAX_STR_SIZE];
+	char* help_str;
+	uint32_t cmd_cnt = p_shell->cmd_count + p_shell->arch_cmd_count;
+	/* Print title */
+	shell_puts("\r\nregistered commands:\r\n\r\n");
+
+	/* Proceed based on the number of registered commands. */
+	if (cmd_cnt == 0U) {
+		/* No registered commands */
+		shell_puts("none\r\n");
+	} else {
+		int32_t i = 0;
+		uint32_t j;
+
+		for (j = 0U; j < cmd_cnt; j++) {
+			if (j < p_shell->cmd_count) {
+				p_cmd = &p_shell->cmds[j];
+			} else {
+				p_cmd = &p_shell->arch_cmds[j - p_shell->cmd_count];
+			}
+
+			/* Check if we've filled the screen with info */
+			/* i + 1 used to avoid 0%SHELL_ROWS=0 */
+			if (((i + 1) % SHELL_ROWS) == 0) {
+				/* Pause before we continue on to the next
+				 * page.
+				 */
+
+				/* Print message to the user. */
+				shell_puts("hit any key to continue");
+
+				/* Wait for a character from user (NOT USED) */
+				(void)shell_getc();
+
+				/* Print a new line after the key is hit. */
+				shell_puts("\r\n");
+			}
+
+			i++;
+			if (p_cmd->cmd_param == NULL)
+				p_cmd->cmd_param = " ";
+			(void)memset(str, ' ', sizeof(str));
+			/* Output the command & parameter string */
+			snprintf(str, MAX_OUTPUT_LEN, " %-15s%-64s",
+					p_cmd->str, p_cmd->cmd_param);
+			shell_puts(str);
+			shell_puts("\r\n");
+
+			help_str = p_cmd->help_str;
+			while (strnlen_s(help_str, MAX_OUTPUT_LEN > 0)) {
+				(void)memset(str, ' ', sizeof(str));
+				if (strnlen_s(help_str, MAX_OUTPUT_LEN) > 65) {
+					snprintf(str, MAX_OUTPUT_LEN, "               %-s", help_str);
+					shell_puts(str);
+					shell_puts("\r\n");
+					help_str = help_str + 65;
+				} else {
+					snprintf(str, MAX_OUTPUT_LEN, "               %-s", help_str);
+					shell_puts(str);
+					shell_puts("\r\n");
+					break;
+				}
+			}
+		}
+	}
+
+	shell_puts("\r\n");
+
+	return 0;
+}
+
+static int32_t shell_version(__unused int32_t argc, __unused char **argv)
+{
+	char temp_str[MAX_STR_SIZE];
+
+	snprintf(temp_str, MAX_STR_SIZE, "hv: %s-%s-%s %s%s%s%s %s@%s build by %s %s\r\n",
+		HV_BRANCH_VERSION, HV_COMMIT_TIME, HV_COMMIT_DIRTY, HV_BUILD_TYPE,
+		(sizeof(HV_COMMIT_TAGS) > 1) ? "(tag: " : "", HV_COMMIT_TAGS, 
+		(sizeof(HV_COMMIT_TAGS) > 1) ? ")" : "",
+		HV_BUILD_SCENARIO, HV_BUILD_BOARD, HV_BUILD_USER, HV_BUILD_TIME);
+	shell_puts(temp_str);
+
+	return 0;
+}
+
+static int32_t shell_loglevel(int32_t argc, char **argv)
+{
+	char str[MAX_STR_SIZE] = {0};
+
+	switch (argc) {
+	case 4:
+		npk_loglevel = (uint16_t)strtol_deci(argv[3]);
+		/* falls through */
+	case 3:
+		mem_loglevel = (uint16_t)strtol_deci(argv[2]);
+		/* falls through */
+	case 2:
+		console_loglevel = (uint16_t)strtol_deci(argv[1]);
+		break;
+	case 1:
+		snprintf(str, MAX_STR_SIZE, "console_loglevel: %u, "
+			"mem_loglevel: %u, npk_loglevel: %u\r\n",
+			console_loglevel, mem_loglevel, npk_loglevel);
+		shell_puts(str);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int32_t shell_dump_host_mem(int32_t argc, char **argv)
+{
+	uint64_t *hva;
+	int32_t ret;
+	uint32_t i, length, loop_cnt;
+	char temp_str[MAX_STR_SIZE];
+
+	/* User input invalidation */
+	if (argc != 3) {
+		ret = -EINVAL;
+	} else	{
+		hva = (uint64_t *)strtoul_hex(argv[1]);
+		length = (uint32_t)strtol_deci(argv[2]);
+
+		snprintf(temp_str, MAX_STR_SIZE, "dump physical memory addr: 0x%016lx, length %d:\r\n", hva, length);
+		shell_puts(temp_str);
+		/* Change the length to a multiple of 32 if the length is not */
+		loop_cnt = ((length & 0x1fU) == 0U) ? ((length >> 5U)) : ((length >> 5U) + 1U);
+		for (i = 0U; i < loop_cnt; i++) {
+			snprintf(temp_str, MAX_STR_SIZE, "hva(0x%llx): 0x%016lx  0x%016lx  0x%016lx  0x%016lx\r\n",
+					hva, *hva, *(hva + 1UL), *(hva + 2UL), *(hva + 3UL));
+			hva += 4UL;
+			shell_puts(temp_str);
+		}
+		ret = 0;
+	}
+
+	return ret;
+}
+
+static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv)
+{
+	char temp_str[MAX_STR_SIZE];
+	struct acrn_vm *vm;
+	struct acrn_vcpu *vcpu;
+	char vcpu_state_str[32], thread_state_str[32];
+	uint16_t i;
+	uint16_t idx;
+
+	shell_puts("\r\nvm id    pcpu id    vcpu id    vcpu role    vcpu state    thread state"
+		"\r\n─────    ───────    ───────    ─────────    ──────────    ──────────\r\n");
+
+	for (idx = 0U; idx < CONFIG_MAX_VM_NUM; idx++) {
+		vm = get_vm_from_vmid(idx);
+		if (is_poweroff_vm(vm)) {
+			continue;
+		}
+		foreach_vcpu(i, vm, vcpu) {
+			switch (vcpu->state) {
+			case VCPU_INIT:
+				(void)strncpy_s(vcpu_state_str, 32U, "init", 32U);
+				break;
+			case VCPU_RUNNING:
+				(void)strncpy_s(vcpu_state_str, 32U, "running", 32U);
+				break;
+			case VCPU_ZOMBIE:
+				(void)strncpy_s(vcpu_state_str, 32U, "zombie", 32U);
+				break;
+			default:
+				(void)strncpy_s(vcpu_state_str, 32U, "unknown", 32U);
+				break;
+			}
+
+			switch (vcpu->thread_obj.status) {
+			case THREAD_STS_RUNNING:
+				(void)strncpy_s(thread_state_str, 32U, "running", 32U);
+				break;
+			case THREAD_STS_RUNNABLE:
+				(void)strncpy_s(thread_state_str, 32U, "runnable", 32U);
+				break;
+			case THREAD_STS_BLOCKED:
+				(void)strncpy_s(thread_state_str, 32U, "blocked", 32U);
+				break;
+			default:
+				(void)strncpy_s(thread_state_str, 32U, "unknown", 32U);
+				break;
+			}
+			/* Create output string consisting of VM name
+			 * and VM id
+			 */
+			snprintf(temp_str, MAX_STR_SIZE,
+					"  %-9d %-10d %-7hu %-12s %-16s %-16s\r\n",
+					vm->vm_id,
+					pcpuid_from_vcpu(vcpu),
+					vcpu->vcpu_id,
+					is_vcpu_bsp(vcpu) ?
+					"primary" : "secondary",
+					vcpu_state_str, thread_state_str);
+			/* Output information for this task */
+			shell_puts(temp_str);
+		}
+	}
+
+	return 0;
+}
+
+static const char *thread_state_str(enum thread_object_state state)
+{
+	const char *str;
+
+	switch (state) {
+	case THREAD_STS_RUNNING:
+		str = "running";
+		break;
+	case THREAD_STS_RUNNABLE:
+		str = "runnable";
+		break;
+	case THREAD_STS_BLOCKED:
+		str = "blocked";
+		break;
+	default:
+		str = "unknown";
+		break;
+	}
+
+	return str;
+}
+
+static int32_t shell_list_threads(__unused int32_t argc, __unused char **argv)
+{
+	const struct list_head *head = sched_get_thread_list();
+	struct list_head *pos;
+	struct thread_object *thread;
+	struct thread_object *current;
+	char temp_str[MAX_STR_SIZE];
+
+	snprintf(temp_str, MAX_STR_SIZE, "\r\nthreads: %u\r\n", sched_get_thread_count());
+	shell_puts(temp_str);
+	shell_puts("name             pcpu    state       current    entry\r\n");
+	shell_puts("───────────────  ────    ────────    ───────    ────────────────\r\n");
+
+	list_for_each(pos, head) {
+		thread = container_of(pos, struct thread_object, node);
+		current = sched_get_current(thread->pcpu_id);
+		snprintf(temp_str, MAX_STR_SIZE,
+			"%-15s  %-4hu    %-8s    %-7s    0x%014lx\r\n",
+			thread->name,
+			thread->pcpu_id,
+			thread_state_str(thread->status),
+			(current == thread) ? "yes" : "no",
+			(uint64_t)thread->thread_entry);
+		shell_puts(temp_str);
+	}
+
+	return 0;
+}
+
+static int32_t shell_sched(__unused int32_t argc, __unused char **argv)
+{
+	char temp_str[MAX_STR_SIZE];
+	uint16_t pcpu_id;
+	uint16_t pcpu_num = get_pcpu_nums();
+
+	shell_puts("\r\npcpu    scheduler     ticks           ctx_switches    current_thread    state\r\n");
+	shell_puts("────    ─────────     ────────────    ────────────    ──────────────    ────────\r\n");
+
+	for (pcpu_id = 0U; pcpu_id < pcpu_num; pcpu_id++) {
+		struct thread_object *current = sched_get_current(pcpu_id);
+		const char *name = (current != NULL) ? current->name : "-";
+		const char *state = (current != NULL) ? thread_state_str(current->status) : "-";
+
+		snprintf(temp_str, MAX_STR_SIZE,
+			"%-7hu %-13s %-15lu %-15lu %-17s %s\r\n",
+			pcpu_id,
+			sched_get_scheduler_name(pcpu_id),
+			sched_get_ticks(pcpu_id),
+			sched_get_context_switches(pcpu_id),
+			name,
+			state);
+		shell_puts(temp_str);
+	}
+
+	return 0;
+}
+
+static bool irq_should_show(uint32_t irq, uint16_t pcpu_num, uint64_t *total)
+{
+	uint16_t pcpu_id;
+	uint64_t irq_total = 0UL;
+	bool has_handler;
+
+	has_handler = irq_desc_array[irq].action != NULL;
+	for (pcpu_id = 0U; pcpu_id < pcpu_num; pcpu_id++) {
+		irq_total += per_cpu(irq_count, pcpu_id)[irq];
+	}
+
+	if (total != NULL) {
+		*total = irq_total;
+	}
+
+	return (irq_total != 0UL) || has_handler;
+}
+
+#define IRQ_STATS_COMPACT_WIDTH		96U
+#define IRQ_STATS_SPACE_CHUNK		32U
+#define IRQ_STATS_CPU_TOKEN_WIDTH	14U
+
+static void shell_put_spaces(uint32_t count)
+{
+	char spaces[IRQ_STATS_SPACE_CHUNK + 1U];
+	uint32_t chunk;
+
+	for (uint32_t i = 0U; i < IRQ_STATS_SPACE_CHUNK; i++) {
+		spaces[i] = ' ';
+	}
+	spaces[IRQ_STATS_SPACE_CHUNK] = '\0';
+
+	while (count > 0U) {
+		chunk = (count > IRQ_STATS_SPACE_CHUNK) ? IRQ_STATS_SPACE_CHUNK : count;
+		spaces[chunk] = '\0';
+		shell_puts(spaces);
+		spaces[chunk] = ' ';
+		count -= chunk;
+	}
+}
+
+static void shell_print_irq_cpu_counts(uint32_t irq, uint16_t pcpu_num, uint32_t prefix_len)
+{
+	char token[32U];
+	uint16_t pcpu_id;
+	uint64_t count;
+	uint32_t line_len = prefix_len;
+	uint32_t token_len;
+	bool printed = false;
+
+	for (pcpu_id = 0U; pcpu_id < pcpu_num; pcpu_id++) {
+		count = per_cpu(irq_count, pcpu_id)[irq];
+		if (count == 0UL) {
+			continue;
+		}
+
+		snprintf(token, sizeof(token), "cpu%hu:%lu", pcpu_id, count);
+		token_len = IRQ_STATS_CPU_TOKEN_WIDTH;
+		if ((line_len + token_len + (printed ? 1U : 0U)) > IRQ_STATS_COMPACT_WIDTH) {
+			shell_puts("\r\n");
+			shell_put_spaces(prefix_len);
+			line_len = prefix_len;
+		}
+
+		if (printed && (line_len != prefix_len)) {
+			shell_puts(" ");
+			line_len++;
+		}
+		/*
+		 * Keep each per-pCPU token in a fixed-width slot so cpuN:count
+		 * values remain visually aligned while still wrapping on narrow UARTs.
+		 */
+		shell_puts(token);
+		shell_put_spaces(IRQ_STATS_CPU_TOKEN_WIDTH -
+			(uint32_t)strnlen_s(token, sizeof(token)));
+		line_len += token_len;
+		printed = true;
+	}
+
+	if (!printed) {
+		shell_puts("-");
+	}
+	shell_puts("\r\n");
+}
+
+static int32_t shell_irqstats(int32_t argc, __unused char **argv)
+{
+	char temp_str[MAX_STR_SIZE];
+	uint16_t pcpu_num = get_pcpu_nums();
+	uint32_t irq;
+	uint32_t shown = 0U;
+
+	if (argc != 1) {
+		shell_puts("usage: irqs\r\n");
+		return -EINVAL;
+	}
+
+	snprintf(temp_str, MAX_STR_SIZE,
+		"\r\nirq statistics: nr_irqs=%u, pcpus=%hu\r\n",
+		NR_IRQS, pcpu_num);
+	shell_puts(temp_str);
+	shell_puts("irq   name             active flags  action         total   cpu counts\r\n");
+	shell_puts("───── ──────────────── ────── ────── ────────────── ─────── ───────────────────────────────\r\n");
+
+	for (irq = 0U; irq < NR_IRQS; irq++) {
+		struct irq_desc *desc = &irq_desc_array[irq];
+		uint64_t total;
+		bool allocated;
+
+		if (!irq_should_show(irq, pcpu_num, &total)) {
+			continue;
+		}
+
+		allocated = bitmap_test((uint16_t)(irq & 0x3FU), irq_alloc_bitmap + (irq >> 6U));
+		snprintf(temp_str, MAX_STR_SIZE, "%-5u %-16s %-6s 0x%04x 0x%012lx %-7lu ",
+			irq,
+			arch_irq_name(irq),
+			allocated ? "yes" : "no",
+			desc->flags,
+			(uint64_t)desc->action,
+			total);
+		shell_puts(temp_str);
+		shell_print_irq_cpu_counts(irq, pcpu_num, (uint32_t)strnlen_s(temp_str, MAX_STR_SIZE));
+		shown++;
+	}
+
+	if (shown == 0U) {
+		shell_puts("(no allocated irqs and no interrupt counts)\r\n");
+	}
+
+	return 0;
+}
+
+uint16_t sanitize_vmid(uint16_t vmid)
+{
+	uint16_t sanitized_vmid = vmid;
+	char temp_str[TEMP_STR_SIZE];
+
+	if (vmid >= CONFIG_MAX_VM_NUM) {
+		snprintf(temp_str, TEMP_STR_SIZE,
+			"vm id given exceeds the max_vm_num(%u), using 0 instead\r\n",
+			CONFIG_MAX_VM_NUM);
+		shell_puts(temp_str);
+		sanitized_vmid = 0U;
+	}
+
+	return sanitized_vmid;
+}
+
+static int32_t shell_to_vm_console(int32_t argc, char **argv)
+{
+	char temp_str[TEMP_STR_SIZE];
+	uint16_t vm_id = 0U;
+
+	struct acrn_vm *vm;
+	struct acrn_vuart *vu;
+
+	if (argc == 2) {
+		vm_id = sanitize_vmid((uint16_t)strtol_deci(argv[1]));
+	}
+
+	/* Get the virtual device node */
+	vm = get_vm_from_vmid(vm_id);
+	if (is_poweroff_vm(vm)) {
+		shell_puts("vm is not valid \n");
+		return -EINVAL;
+	}
+	vu = vm_console_vuart(vm);
+	if (!vu->active) {
+		shell_puts("vuart console is not active \n");
+		return 0;
+	}
+
+	/*
+	 * Print the ownership marker before replaying buffered VM output. The ring
+	 * may already contain boot logs produced while CLAN shell owned the UART;
+	 * draining it first makes the marker appear in the middle of guest logs.
+	 */
+	snprintf(temp_str, TEMP_STR_SIZE, "\r\n──────── [switch to vm-%d shell] ────────\r\n", vm_id);
+	shell_puts(temp_str);
+	console_vmid = vm_id;
+	console_vm_ring_drain(vm_id);
+
+	return 0;
+}

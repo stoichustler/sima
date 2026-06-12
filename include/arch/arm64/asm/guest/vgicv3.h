@@ -1,0 +1,97 @@
+/*
+ * Copyright (C) 2026 Intel Corporation.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#ifndef ARM64_GUEST_VGICV3_H
+#define ARM64_GUEST_VGICV3_H
+
+#include <types.h>
+#include <spinlock.h>
+#include <asm/irq.h>
+
+#define ARM64_VGIC_MAX_LRS		8U
+#define ARM64_VGIC_SGI_NUM		16U
+#define ARM64_VGIC_PPI_NUM		16U
+#define ARM64_VGIC_LOCAL_IRQ_NUM	(ARM64_VGIC_SGI_NUM + ARM64_VGIC_PPI_NUM)
+#define ARM64_VGIC_SPI_NUM		(IRQ_NUM_GIC_DOMAIN - ARM64_VGIC_LOCAL_IRQ_NUM)
+#define ARM64_VGIC_IRQ_NUM		IRQ_NUM_GIC_DOMAIN
+#define ARM64_VGIC_WORDS		(ARM64_VGIC_IRQ_NUM / 32U)
+#define ARM64_VGIC_MAX_VCPUS		MAX_PCPU_NUM
+
+#define ARM64_VGIC_MAINTENANCE_INTID	ARM64_GIC_PPI_VGIC_MAINTENANCE
+
+struct acrn_vm;
+struct acrn_vcpu;
+struct io_request;
+
+/*
+ * Per-vCPU hardware virtualization context. List registers are the hardware
+ * slots used by GICv3 to present pending/active virtual interrupts to EL1; the
+ * AP/VMCR/SRE/PMR fields mirror the EL1-visible interrupt-controller state.
+ */
+struct arm64_vgicv3_vcpu_ctx {
+	uint64_t lr[ARM64_VGIC_MAX_LRS];
+	uint64_t ap0r0;
+	uint64_t ap1r0;
+	uint64_t vmcr;
+	uint64_t hcr;
+	uint64_t sre;
+	uint64_t pmr;
+	uint64_t ctlr;
+	uint8_t used_lrs;
+};
+
+/*
+ * Software model for a virtual INTID as observed by one target vCPU. The model
+ * is intentionally per-vCPU so SGIs/PPIs are naturally private, while the
+ * current SPI implementation can still target a selected vCPU during bring-up.
+ */
+struct arm64_vgic_irq {
+	uint16_t virq;
+	uint16_t pirq;
+	uint8_t priority;
+	uint8_t target_vcpu;
+	bool enabled;
+	bool pending;
+	bool active;
+	bool level;
+	bool hw;
+};
+
+/*
+ * Per-VM vGIC state. Guest MMIO updates this model, physical events mark IRQs
+ * pending here, and flush/sync operations reconcile it with the hardware list
+ * registers of the running vCPU.
+ */
+struct arm64_vgicv3 {
+	spinlock_t lock;
+	bool initialized;
+	uint32_t lr_count;
+	uint32_t vmcr;
+	uint32_t gicd_ctlr;
+	uint32_t gicd_typer;
+	uint32_t gicd_pidr2;
+	uint32_t gicr_waker[ARM64_VGIC_MAX_VCPUS];
+	struct arm64_vgic_irq irq[ARM64_VGIC_MAX_VCPUS][ARM64_VGIC_IRQ_NUM];
+};
+
+void arm64_vgicv3_global_init(void);
+void arm64_vgicv3_init_vm(struct acrn_vm *vm);
+void arm64_vgicv3_init_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_reset_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_load_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_save_vcpu(struct acrn_vcpu *vcpu);
+int32_t arm64_vgicv3_inject_irq(struct acrn_vcpu *vcpu, uint32_t virq, bool level);
+int32_t arm64_vgicv3_clear_irq(struct acrn_vcpu *vcpu, uint32_t virq);
+int32_t arm64_vgicv3_handle_sgi1r(struct acrn_vcpu *vcpu, uint64_t value);
+void arm64_vgicv3_flush_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_sync_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_flush_current_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_sync_current_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_maintenance_irq_handler(uint32_t irq, void *data);
+void arm64_vgicv3_virtual_timer_irq_handler(uint32_t irq, void *data);
+int32_t arm64_vgicv3_mmio_handler(struct io_request *io_req, void *handler_private_data);
+
+#endif /* ARM64_GUEST_VGICV3_H */

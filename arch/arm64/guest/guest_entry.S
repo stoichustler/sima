@@ -1,0 +1,60 @@
+/*
+ * Copyright (C) 2026 Intel Corporation.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include <asm/cpu.h>
+#include <asm/trap.h>
+
+#define VCPU_RUN_STACK_SIZE	(CPU_REGS_OFFSET_LAST + 8)
+
+	.text
+	.align 4
+	.globl arm64_run_vcpu
+arm64_run_vcpu:
+	/* guest_vector_entry subtracts CPU_REGS_OFFSET_LAST before calling C. */
+	sub	sp, sp, #VCPU_RUN_STACK_SIZE
+	mov	x16, x0
+	mov	x17, sp
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X0]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X0]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X2]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X2]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X4]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X4]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X6]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X6]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X8]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X8]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X10]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X10]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X12]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X12]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X14]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X14]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X16]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X16]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X18]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X18]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X20]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X20]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X22]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X22]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X24]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X24]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X26]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X26]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X28]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_X28]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_LR]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_LR]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_ELR]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_ELR]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_ESR]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_ESR]
+	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_HPFAR]
+	stp	x0, x1, [x17, #CPU_REGS_OFFSET_HPFAR]
+	ldr	x0, [x16, #CPU_REGS_OFFSET_EXC_SP]
+	str	x0, [x17, #CPU_REGS_OFFSET_EXC_SP]
+	b	vcpu_exit_return

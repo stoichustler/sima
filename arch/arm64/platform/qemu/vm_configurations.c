@@ -1,0 +1,120 @@
+/*
+ * Copyright (C) 2026 Intel Corporation.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include <vm_config.h>
+#include <asm/page.h>
+#include <pgtable.h>
+
+#define QEMU_LK_RAM_START		0x40000000UL
+#define QEMU_LK_RAM_SIZE		0x02000000UL
+#define QEMU_ZEPHYR_RAM_START		0x42000000UL
+#define QEMU_ZEPHYR_RAM_SIZE		0x06000000UL
+
+#define QEMU_GUEST_GICD_BASE		0x08000000UL
+#define QEMU_GUEST_GICD_SIZE		0x00010000UL
+#define QEMU_GUEST_GICR_BASE		0x080A0000UL
+#define QEMU_GUEST_GICR_STRIDE		0x00020000UL
+#define QEMU_GUEST_GICR_SIZE		(MAX_PCPU_NUM * QEMU_GUEST_GICR_STRIDE)
+
+#define QEMU_GUEST_UART_BASE		0x09000000UL
+#define QEMU_GUEST_UART_SIZE		0x00001000UL
+#define QEMU_GUEST_UART_IRQ		33U
+
+/*
+ * QEMU keeps a deliberately static VM layout for the SDK bring-up path:
+ * - pCPU0..5 model ordinary cores; pCPU6..7 model performance cores.
+ * - VM0 is the Zephyr service VM and is kept on ordinary cores only.
+ * - VM1 is the LK pre-launched VM and may mix ordinary/performance cores.
+ * - pCPU3 is intentionally shared by one AP vCPU from each VM. The common
+ *   scheduler time-slices those vCPU threads; this file only describes the
+ *   static placement policy.
+ *
+ * Guest RAM windows are split and mapped with GPA/IPA == HPA. That keeps the
+ * RTOS raw-image boot path simple and avoids firmware-discovered memory while
+ * Linux support can later replace the raw-image/incbin flow with modules.
+ */
+static struct vm_hpa_regions zephyr_memory_regions[] = {
+	{
+		.start_hpa = QEMU_ZEPHYR_RAM_START,
+		.size_hpa = QEMU_ZEPHYR_RAM_SIZE,
+	},
+};
+
+static struct vm_hpa_regions lk_memory_regions[] = {
+	{
+		.start_hpa = QEMU_LK_RAM_START,
+		.size_hpa = QEMU_LK_RAM_SIZE,
+	},
+};
+
+struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
+	[0] = {
+		CONFIG_SERVICE_VM,
+		.name = "zephyr",
+		.cpu_affinity = AFFINITY_CPU(0) | AFFINITY_CPU(2) |
+			AFFINITY_CPU(3) | AFFINITY_CPU(4),
+		.guest_flags = GUEST_FLAG_STATIC_VM | GUEST_FLAG_NO_FW,
+		.memory = {
+			.size = QEMU_ZEPHYR_RAM_SIZE,
+			.region_num = ARRAY_SIZE(zephyr_memory_regions),
+			.host_regions = zephyr_memory_regions,
+		},
+		.os_config = {
+			.name = "zephyr",
+			.kernel_type = KERNEL_RAWIMAGE,
+			.kernel_mod_tag = "zephyr",
+			.kernel_load_addr = 0x42000000UL,
+			.kernel_entry_addr = 0x42000000UL,
+		},
+		.arch = {
+			.guest_ram_start = QEMU_ZEPHYR_RAM_START,
+			.guest_ram_size = QEMU_ZEPHYR_RAM_SIZE,
+			.guest_ram_hpa = QEMU_ZEPHYR_RAM_START,
+			.guest_gicd_base = QEMU_GUEST_GICD_BASE,
+			.guest_gicd_size = QEMU_GUEST_GICD_SIZE,
+			.guest_gicr_base = QEMU_GUEST_GICR_BASE,
+			.guest_gicr_size = QEMU_GUEST_GICR_SIZE,
+			.guest_gicr_stride = QEMU_GUEST_GICR_STRIDE,
+			.guest_uart_base = QEMU_GUEST_UART_BASE,
+			.guest_uart_size = QEMU_GUEST_UART_SIZE,
+			.guest_uart_irq = QEMU_GUEST_UART_IRQ,
+		},
+	},
+	[1] = {
+		CONFIG_PRE_STD_VM,
+		.name = "lk",
+		.cpu_affinity = AFFINITY_CPU(3) | AFFINITY_CPU(5) |
+			AFFINITY_CPU(6) | AFFINITY_CPU(7),
+		.guest_flags = GUEST_FLAG_STATIC_VM | GUEST_FLAG_NO_FW,
+		.memory = {
+			.size = QEMU_LK_RAM_SIZE,
+			.region_num = ARRAY_SIZE(lk_memory_regions),
+			.host_regions = lk_memory_regions,
+		},
+		.os_config = {
+			.name = "lk",
+			.kernel_type = KERNEL_RAWIMAGE,
+			.kernel_mod_tag = "lk",
+			.kernel_load_addr = 0x40100000UL,
+			.kernel_entry_addr = 0x40100000UL,
+		},
+		.arch = {
+			.guest_ram_start = QEMU_LK_RAM_START,
+			.guest_ram_size = QEMU_LK_RAM_SIZE,
+			.guest_ram_hpa = QEMU_LK_RAM_START,
+			.guest_gicd_base = QEMU_GUEST_GICD_BASE,
+			.guest_gicd_size = QEMU_GUEST_GICD_SIZE,
+			.guest_gicr_base = QEMU_GUEST_GICR_BASE,
+			.guest_gicr_size = QEMU_GUEST_GICR_SIZE,
+			.guest_gicr_stride = QEMU_GUEST_GICR_STRIDE,
+			.guest_uart_base = QEMU_GUEST_UART_BASE,
+			.guest_uart_size = QEMU_GUEST_UART_SIZE,
+			.guest_uart_irq = QEMU_GUEST_UART_IRQ,
+		},
+	},
+};
+
+struct acrn_vm_config *const service_vm_config = &vm_configs[0];

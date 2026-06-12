@@ -1,0 +1,4 @@
+interface:
+  display_name: "CLAN Hypervisor Dev"
+  short_description: "Develop and debug the CLAN ARM64 hypervisor."
+  default_prompt: "Use this skill when working on CLAN hypervisor development tasks in this repository."
