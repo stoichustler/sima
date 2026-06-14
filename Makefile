@@ -18,7 +18,9 @@ GIT_TOPDIR := $(shell git rev-parse --show-toplevel 2>/dev/null)
 LICENSE_FILE := $(or $(firstword $(wildcard ../LICENSE $(if $(GIT_TOPDIR),$(GIT_TOPDIR)/LICENSE))),/dev/null)
 HV_OBJDIR ?= $(CURDIR)/build
 HV_MODDIR ?= $(HV_OBJDIR)/modules
-HV_FILE := acrn
+HV_FILE := clan
+HV_DEBUG_FILE := clan.debug
+HV_COMPAT_FILE := acrn
 
 # initialize the flags we used
 CFLAGS :=
@@ -156,6 +158,7 @@ AS ?= as
 AR ?= ar
 LD ?= ld
 OBJCOPY ?= objcopy
+NM ?= $(CROSS_COMPILE)nm
 
 include arch/$(ARCH)/Makefile
 
@@ -340,7 +343,7 @@ $(HV_CONFIG_DIR):
 endif
 
 .PHONY: all
-all: $(ARCH_ALL_TARGETS) $(HV_OBJDIR)/$(HV_FILE).bin
+all: $(ARCH_ALL_TARGETS) $(HV_OBJDIR)/$(HV_DEBUG_FILE).bin
 
 .PHONY: lib
 
@@ -357,9 +360,11 @@ $(COMMON_MOD): $(COMMON_C_OBJS)
 	$(Q)echo "ar        $(notdir $@)"
 	$(Q)$(AR) $(ARFLAGS) $(COMMON_MOD) $(COMMON_C_OBJS)
 
-$(HV_OBJDIR)/$(HV_FILE).bin: $(HV_OBJDIR)/$(HV_FILE).out
+$(HV_OBJDIR)/$(HV_DEBUG_FILE).bin: $(HV_OBJDIR)/$(HV_DEBUG_FILE).out
 	$(Q)echo "objcopy   $(notdir $@)"
-	$(Q)$(OBJCOPY) -O binary $< $(HV_OBJDIR)/$(HV_FILE).bin
+	$(Q)$(OBJCOPY) -O binary $< $@
+	$(Q)cp $< $(HV_OBJDIR)/$(HV_COMPAT_FILE).out
+	$(Q)cp $@ $(HV_OBJDIR)/$(HV_COMPAT_FILE).bin
 	$(Q)rm -f $(UPDATE_RESULT)
 
 $(HV_OBJDIR)/$(HV_FILE).out: $(MODULES)
@@ -367,6 +372,20 @@ $(HV_OBJDIR)/$(HV_FILE).out: $(MODULES)
 	$(Q)${BASH} ${LD_IN_TOOL} $(ARCH_LDSCRIPT_IN) $(ARCH_LDSCRIPT) ${HV_CONFIG_MK}
 	$(Q)$(CC) -Wl,-Map=$(HV_OBJDIR)/$(HV_FILE).map -o $@ $(LDFLAGS) $(ARCH_LDFLAGS) -T$(ARCH_LDSCRIPT) \
 		-Wl,--start-group $^ -Wl,--end-group
+
+$(HV_OBJDIR)/symtab.c: $(HV_OBJDIR)/$(HV_FILE).out scripts/gen_symtab.py
+	$(Q)echo "symtab    $(notdir $@)"
+	$(Q)python3 scripts/gen_symtab.py --nm $(NM) --elf $< --out $@
+
+$(HV_OBJDIR)/symtab.o: $(HV_OBJDIR)/symtab.c $(HEADERS)
+	$(Q)echo "cc        $(notdir $@)"
+	$(Q)$(CC) $(patsubst %, -I%, $(INCLUDE_PATH)) -I. -c $(CFLAGS) $(ARCH_CFLAGS) $< -o $@ -MMD -MT $@
+
+$(HV_OBJDIR)/$(HV_DEBUG_FILE).out: $(MODULES) $(HV_OBJDIR)/symtab.o
+	$(Q)echo "cc        $(notdir $@)"
+	$(Q)${BASH} ${LD_IN_TOOL} $(ARCH_LDSCRIPT_IN) $(ARCH_LDSCRIPT) ${HV_CONFIG_MK}
+	$(Q)$(CC) -Wl,-Map=$(HV_OBJDIR)/$(HV_DEBUG_FILE).map -o $@ $(LDFLAGS) $(ARCH_LDFLAGS) -T$(ARCH_LDSCRIPT) \
+		-Wl,--start-group $(HV_OBJDIR)/symtab.o $(MODULES) -Wl,--end-group
 
 .PHONY: clean
 clean:

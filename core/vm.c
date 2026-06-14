@@ -354,8 +354,13 @@ void launch_vms(uint16_t pcpu_id)
 
 		if ((vm_config->load_order == SERVICE_VM) || (vm_config->load_order == PRE_LAUNCHED_VM)) {
 			if (pcpu_id == get_vm_launch_pcpu_id(vm_config)) {
+				vm = &vm_array[vm_id];
+				if (!is_poweroff_vm(vm)) {
+					continue;
+				}
+
 				if (vm_config->load_order == SERVICE_VM) {
-					service_vm_ptr = &vm_array[vm_id];
+					service_vm_ptr = vm;
 				}
 
 				/*

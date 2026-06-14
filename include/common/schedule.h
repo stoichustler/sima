@@ -44,6 +44,14 @@ struct sched_params {
 	uint32_t bvt_unwarp_period;	/* min unwarp time after a warp */
 };
 
+struct sched_latency_stats {
+	uint64_t switches;
+	uint64_t last_wait_ticks;
+	uint64_t max_wait_ticks;
+	uint64_t state_since;
+	uint64_t runnable_since;
+};
+
 struct thread_object;
 typedef void (*thread_entry_t)(struct thread_object *obj);
 typedef void (*switch_t)(struct thread_object *obj);
@@ -62,6 +70,7 @@ struct thread_object {
 	switch_t switch_in;
 
 	uint8_t data[THREAD_DATA_SIZE];
+	struct sched_latency_stats latency;
 };
 
 struct sched_control {
@@ -76,14 +85,17 @@ struct sched_control {
 	 * context_switches counts real thread changes in schedule(). A tick may
 	 * request a reschedule, but it does not imply that a different thread was
 	 * selected.
+	 * reschedule_requests counts requests raised through make_reschedule_request().
 	 */
 	uint64_t scheduler_ticks;
 	uint64_t context_switches;
+	uint64_t reschedule_requests;
 };
 
 #define SCHEDULER_MAX_NUMBER 4U
 struct acrn_scheduler {
 	char name[16];
+	char stat_desc[64];
 
 	/* init scheduler */
 	int32_t	(*init)(struct sched_control *ctl);
@@ -139,9 +151,12 @@ bool is_idle_thread(const struct thread_object *obj);
 uint16_t sched_get_pcpuid(const struct thread_object *obj);
 struct thread_object *sched_get_current(uint16_t pcpu_id);
 const char *sched_get_scheduler_name(uint16_t pcpu_id);
+const char *sched_get_scheduler_stat_desc(uint16_t pcpu_id);
 uint64_t sched_get_ticks(uint16_t pcpu_id);
 uint64_t sched_get_context_switches(uint16_t pcpu_id);
+uint64_t sched_get_reschedule_requests(uint16_t pcpu_id);
 void sched_account_tick(struct sched_control *ctl);
+void sched_get_latency(const struct thread_object *obj, struct sched_latency_stats *stats);
 
 void init_sched(uint16_t pcpu_id);
 void deinit_sched(uint16_t pcpu_id);

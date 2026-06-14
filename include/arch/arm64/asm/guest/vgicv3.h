@@ -57,6 +57,8 @@ struct arm64_vgic_irq {
 	bool pending;
 	bool active;
 	bool level;
+	bool group1;
+	bool groupmod;
 	bool hw;
 };
 
@@ -68,17 +70,22 @@ struct arm64_vgic_irq {
 struct arm64_vgicv3 {
 	spinlock_t lock;
 	bool initialized;
+	uint16_t vcpu_count;
+	uint16_t rdist_count;
 	uint32_t lr_count;
 	uint32_t vmcr;
 	uint32_t gicd_ctlr;
 	uint32_t gicd_typer;
 	uint32_t gicd_pidr2;
+	uint16_t rdist_vcpu[ARM64_VGIC_MAX_VCPUS];
 	uint32_t gicr_waker[ARM64_VGIC_MAX_VCPUS];
+	uint64_t spi_router[ARM64_VGIC_SPI_NUM];
+	uint32_t pending_bitmap[ARM64_VGIC_MAX_VCPUS][ARM64_VGIC_WORDS];
 	struct arm64_vgic_irq irq[ARM64_VGIC_MAX_VCPUS][ARM64_VGIC_IRQ_NUM];
 };
 
 void arm64_vgicv3_global_init(void);
-void arm64_vgicv3_init_vm(struct acrn_vm *vm);
+void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity);
 void arm64_vgicv3_init_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_reset_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_load_vcpu(struct acrn_vcpu *vcpu);

@@ -3,12 +3,13 @@
 ## Repository Map
 
 - `Makefile`: static ARM64 QEMU config path when `ARCH=arm64 PLATFORM=qemu`.
-- `scripts/kick.py`: QEMU launcher for `build/acrn.out`.
+- `scripts/kick.py`: QEMU launcher for `build/clan.debug.out`.
+- `scripts/regress.py`: boot regression harness for QEMU shell and VM console checks.
 - `arch/arm64/platform/qemu`: QEMU board/scenario, static VM config, embedded RTOS images, platform helpers.
 - `arch/arm64/guest`: stage-2 VM setup, vCPU entry/exit, vGICv3, vPL011, hypercall handling.
 - `core`: common VM, vCPU, scheduler, timer, hypercall, and MMIO request logic.
 - `sdk/boot`: boot module discovery and kernel loaders.
-- `sdk/debug`: CLAN shell, console, debug commands, vsh, vdump, irqs.
+- `sdk/debug`: CLAN shell, console, debug commands, vsh, dumpstat, irqs.
 - `sdk/sdk.md`: current implementation status and verified behavior.
 
 ## Build And Run
@@ -24,10 +25,15 @@ When editing `sdk/debug/*`, stale archive dependencies may hide source changes.
 Force a debug rebuild before validation:
 
 ```bash
-rm -f build/modules/libdebug.a build/acrn.out build/acrn.bin
+rm -f build/modules/libdebug.a build/clan.out build/clan.debug.out build/clan.debug.bin
 PATH=/path/to/clan-arm64-none-elf/bin:$PATH \
 make ARCH=arm64 PLATFORM=qemu CROSS_COMPILE=aarch64-none-elf- -j$(nproc)
 ```
+
+When changing shared layout headers such as `vm.h`, `vcpu.h`, or ARM64 guest
+vGIC/vCPU headers, prefer a clean build before runtime validation. Mixed object
+layouts can make VM/vCPU state appear corrupted even when the source logic is
+correct.
 
 Run:
 
@@ -41,6 +47,12 @@ Dry run:
 ./scripts/kick.py --dry-run
 ```
 
+Regression:
+
+```bash
+./scripts/regress.py --toolchains /path/to/clan-arm64-none-elf/bin
+```
+
 Default QEMU shape:
 
 ```bash
@@ -51,7 +63,7 @@ qemu-system-aarch64 \
   -m 1024M \
   -nographic \
   -serial mon:stdio \
-  -kernel build/acrn.out
+  -kernel build/clan.debug.out
 ```
 
 ## Current VM Layout
@@ -95,21 +107,27 @@ the pCPU shared with the service VM.
 Useful CLAN shell commands:
 
 - `vcpus`: VM/vCPU pCPU binding and state.
-- `sched`: per-pCPU scheduler name, scheduler ticks, context switches, current
-  thread, and thread state.
+- `schedstat`: scheduler algorithm plus per-pCPU timer, switch, reschedule,
+  runnable-thread, and current-thread statistics.
 - `vmap`: host stage-1 and VM stage-2 maps.
-- `vdump [vm id] [vcpu id]`: ARM64 VM/vCPU register and stack dump.
+- `dumpstat [vm id]`: ARM64 VM/vCPU register, scheduler state, raw guest stack,
+  and saved host stack for the vCPU thread on its bound pCPU. Guest stack
+  entries remain raw addresses because guest symbols are not embedded. Host
+  return addresses resolve through the symbol table embedded in
+  `clan.debug.out`; offline vCPUs skip stack output.
 - `irqs`: interrupt names, active state, and per-pCPU counts.
 - `vsh 0`: switch to Zephyr console, expect `zero ~>`.
 - `vsh 1`: switch to LK console, expect `beau ~>`.
 - Ctrl-D: return from VM console to `console:\>`.
 
-`sched` field meaning:
+`schedstat` field meaning:
 
-- `ticks`: scheduler timer callback count on the pCPU. It represents periodic
+- `timer`: scheduler timer callback count on the pCPU. It represents periodic
   opportunities to charge runtime and request rescheduling.
-- `ctx_switches`: number of times `schedule()` actually selected a different
+- `switches`: number of times `schedule()` actually selected a different
   thread. A tick may not switch; wake/sleep/yield can also switch.
+- `resched`: number of requests raised through `make_reschedule_request()`.
+- `runqueue`: number of runnable threads currently bound to the pCPU.
 
 ## Runtime Checklist
 
@@ -118,7 +136,7 @@ For VM/scheduler/console changes, validate:
 1. QEMU finishes boot logs; pressing Enter prints `console:\>`.
 2. VM0 and VM1 autostart.
 3. `vcpus` shows VM0 on pCPU0,2,3,4 and VM1 on pCPU3,5,6,7.
-4. `sched` shows `sched_iorr`; pCPU3 context switches grow when both VMs run.
+4. `schedstat` shows `sched_iorr`; pCPU3 context switches grow when both VMs run.
 5. `vsh 0` reaches `zero ~>` and the switch banner appears before replayed VM0
    logs.
 6. `vsh 1` reaches `beau ~>`.

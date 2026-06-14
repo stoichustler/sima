@@ -30,14 +30,19 @@
 	stp	x26, x27, [sp, #CPU_REGS_OFFSET_X26]
 	stp	x28, x29, [sp, #CPU_REGS_OFFSET_X28]
 	str	x30, [sp, #CPU_REGS_OFFSET_LR]
+	/* ELR_EL2 is the PC that ERET will resume after the exception. */
 	mrs	x0, elr_el2
 	str	x0, [sp, #CPU_REGS_OFFSET_ELR]
+	/* SPSR_EL2 stores the pre-exception PSTATE, including DAIF and mode. */
 	mrs	x0, spsr_el2
 	str	x0, [sp, #CPU_REGS_OFFSET_SPSR]
+	/* ESR_EL2 describes the exception class and instruction syndrome. */
 	mrs	x0, esr_el2
 	str	x0, [sp, #CPU_REGS_OFFSET_ESR]
+	/* FAR_EL2 is the faulting virtual address for data/instruction aborts. */
 	mrs	x0, far_el2
 	str	x0, [sp, #CPU_REGS_OFFSET_FAR]
+	/* HPFAR_EL2 carries the stage-2 IPA fault address for guest aborts. */
 	mrs	x0, hpfar_el2
 	str	x0, [sp, #CPU_REGS_OFFSET_HPFAR]
 	add	x0, sp, #CPU_REGS_OFFSET_LAST
@@ -47,8 +52,10 @@
 
 .macro restore_cpu_context
 	ldr	x0, [sp, #CPU_REGS_OFFSET_ELR]
+	/* Restore the EL2 return PC consumed by ERET. */
 	msr	elr_el2, x0
 	ldr	x0, [sp, #CPU_REGS_OFFSET_SPSR]
+	/* Restore PSTATE so ERET returns with the original masks and EL mode. */
 	msr	spsr_el2, x0
 	ldp	x0, x1, [sp, #CPU_REGS_OFFSET_X0]
 	ldp	x2, x3, [sp, #CPU_REGS_OFFSET_X2]
@@ -83,6 +90,7 @@
 	.align 11
 	.globl arm64_exception_vectors
 arm64_exception_vectors:
+	/* Current EL with SP0: synchronous, IRQ, FIQ, SError. */
 	b	arm64_sync_handler
 	.balign 0x80
 	b	arm64_irq_handler
@@ -92,6 +100,7 @@ arm64_exception_vectors:
 	b	arm64_serror_handler
 
 	.balign 0x80
+	/* Current EL with SPx: normal EL2 host exceptions use these slots. */
 	b	arm64_sync_handler
 	.balign 0x80
 	b	arm64_irq_handler
@@ -101,6 +110,7 @@ arm64_exception_vectors:
 	b	arm64_serror_handler
 
 	.balign 0x80
+	/* Lower EL AArch64: guest EL1 traps and interrupts land here. */
 	b	arm64_guest_sync_handler
 	.balign 0x80
 	b	arm64_guest_irq_handler
@@ -110,6 +120,7 @@ arm64_exception_vectors:
 	b	arm64_guest_serror_handler
 
 	.balign 0x80
+	/* Lower EL AArch32 is not supported; route it to the host trap path. */
 	b	arm64_sync_handler
 	.balign 0x80
 	b	arm64_irq_handler
@@ -135,6 +146,7 @@ arm64_serror_handler:
 	/* Preserve the guest's SP_EL1 separately from the EL2 vector stack. */
 	sub	sp, sp, #CPU_REGS_OFFSET_LAST
 	save_cpu_context
+	/* SP_EL1 is the guest kernel stack pointer when EL1 uses SP_EL1. */
 	mrs	x0, sp_el1
 	str	x0, [sp, #CPU_REGS_OFFSET_SP]
 	mov	x0, sp
@@ -158,10 +170,13 @@ arm64_guest_serror_handler:
 vcpu_exit_return:
 	/* Restore guest architectural state from the frame prepared by C code. */
 	ldr	x0, [sp, #CPU_REGS_OFFSET_ELR]
+	/* ELR_EL2 holds the guest PC used by ERET back to EL1. */
 	msr	elr_el2, x0
 	ldr	x0, [sp, #CPU_REGS_OFFSET_SPSR]
+	/* SPSR_EL2 selects guest EL1h/EL1t and restores guest PSTATE. */
 	msr	spsr_el2, x0
 	ldr	x0, [sp, #CPU_REGS_OFFSET_SP]
+	/* Restore the guest's SP_EL1 before returning to EL1. */
 	msr	sp_el1, x0
 	ldp	x0, x1, [sp, #CPU_REGS_OFFSET_X0]
 	ldp	x2, x3, [sp, #CPU_REGS_OFFSET_X2]

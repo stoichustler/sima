@@ -15,14 +15,18 @@
 	 */
 	.globl _start
 _start:
+	/* DAIF masks Debug, SError, IRQ, and FIQ while EL2 state is incomplete. */
 	msr	daifset, #0xf
 
+	/* CurrentEL must report EL2; CLAN runs as a hypervisor, not as EL1 code. */
 	mrs	x2, CurrentEL
 	cmp	x2, #CURRENTEL_EL2
 	b.ne	_start_hang
+	/* SPSel=1 selects SP_EL2 as the active stack pointer at EL2. */
 	msr	spsel, #1
 	isb
 
+	/* VBAR_EL2 points all EL2 exceptions to arm64_exception_vectors. */
 	adrp	x2, arm64_exception_vectors
 	add	x2, x2, :lo12:arm64_exception_vectors
 	msr	vbar_el2, x2
@@ -42,6 +46,7 @@ _start:
 	add	x4, x4, :lo12:_boot_stack_end
 	mov	sp, x4
 
+	/* MPIDR_EL1 carries the CPU affinity ID used to identify the boot pCPU. */
 	mrs	x0, mpidr_el1
 	tst	x1, x1
 	b.ne	3f
@@ -53,16 +58,20 @@ _start:
 	.align 2
 	.globl _start_secondary_psci
 _start_secondary_psci:
+	/* Secondary CPUs enter with interrupts masked until per-CPU init is done. */
 	msr	daifset, #0xf
+	/* Use SP_EL2 for the scheduler/EL2 stack on secondary CPUs as well. */
 	msr	spsel, #1
 	isb
 
+	/* Install the EL2 vector base before calling C code. */
 	adrp	x2, arm64_exception_vectors
 	add	x2, x2, :lo12:arm64_exception_vectors
 	msr	vbar_el2, x2
 	isb
 
 	mov	sp, x0
+	/* Pass this CPU's MPIDR affinity to init_secondary_pcpu(). */
 	mrs	x0, mpidr_el1
 	bl	init_secondary_pcpu
 	b	_start_hang
@@ -70,5 +79,6 @@ _start_secondary_psci:
 	.align 2
 	.globl _start_hang
 _start_hang:
+	/* WFI keeps a failed or returned boot path parked without spinning hot. */
 	wfi
 	b	_start_hang

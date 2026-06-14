@@ -92,6 +92,7 @@ static void sched_prio_wake(struct thread_object *obj)
 
 struct acrn_scheduler sched_prio = {
 	.name		= "sched_prio",
+	.stat_desc	= "policy:priority",
 	.init		= sched_prio_init,
 	.init_data	= sched_prio_init_data,
 	.pick_next	= sched_prio_pick_next,

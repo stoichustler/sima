@@ -191,6 +191,10 @@ static int32_t handle_mmio_abort(struct acrn_vcpu *vcpu)
 			*reg = extend_mmio_read(mmio->value, size, esr);
 		}
 		advance_vcpu_elr(vcpu);
+	} else {
+		pr_err("arm64 mmio abort failed: ipa=0x%lx size=%lu dir=%s srt=%u esr=0x%lx ret=%d",
+			ipa, size, ((esr & ESR_DABT_WNR) != 0UL) ? "write" : "read",
+			reg_idx, esr, ret);
 	}
 
 	return ret;
@@ -304,18 +308,17 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 {
 	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
 	uint64_t now = read_cntvct_el0();
+	uint64_t write_value = (reg != NULL) ? *reg : 0UL;
 	uint64_t val;
 	int32_t ret = 0;
-
-	if (reg == NULL) {
-		return -EINVAL;
-	}
 
 	switch (sysreg) {
 	case SYSREG_CNTPCT_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
-			*reg = read_cntvct_el0();
+			if (reg != NULL) {
+				*reg = read_cntvct_el0();
+			}
 		} else {
 			ret = -EINVAL;
 		}
@@ -323,7 +326,9 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 	case SYSREG_CNTVCT_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
-			*reg = read_cntvct_el0();
+			if (reg != NULL) {
+				*reg = read_cntvct_el0();
+			}
 		} else {
 			ret = -EINVAL;
 		}
@@ -331,45 +336,55 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 	case SYSREG_CNTP_CTL_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
-			*reg = read_cntv_ctl_el0();
+			if (reg != NULL) {
+				*reg = read_cntv_ctl_el0();
+			}
 		} else {
-			gctx->cntv_ctl_el0 = (uint32_t)*reg;
+			gctx->cntv_ctl_el0 = (uint32_t)write_value;
 			write_cntv_ctl_el0(gctx->cntv_ctl_el0);
 		}
 		break;
 	case SYSREG_CNTV_CTL_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
-			*reg = read_cntv_ctl_el0();
+			if (reg != NULL) {
+				*reg = read_cntv_ctl_el0();
+			}
 		} else {
-			gctx->cntv_ctl_el0 = (uint32_t)*reg;
+			gctx->cntv_ctl_el0 = (uint32_t)write_value;
 			write_cntv_ctl_el0(gctx->cntv_ctl_el0);
 		}
 		break;
 	case SYSREG_CNTP_CVAL_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
-			*reg = read_cntv_cval_el0();
+			if (reg != NULL) {
+				*reg = read_cntv_cval_el0();
+			}
 		} else {
-			gctx->cntv_cval_el0 = *reg;
+			gctx->cntv_cval_el0 = write_value;
 			write_cntv_cval_el0(gctx->cntv_cval_el0);
 		}
 		break;
 	case SYSREG_CNTV_CVAL_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
-			*reg = read_cntv_cval_el0();
+			if (reg != NULL) {
+				*reg = read_cntv_cval_el0();
+			}
 		} else {
-			gctx->cntv_cval_el0 = *reg;
+			gctx->cntv_cval_el0 = write_value;
 			write_cntv_cval_el0(gctx->cntv_cval_el0);
 		}
 		break;
 	case SYSREG_CNTP_TVAL_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
-			*reg = read_cntv_cval_el0() - now;
+			if (reg != NULL) {
+				*reg = read_cntv_cval_el0() - now;
+			}
 		} else {
-			val = now + (uint32_t)*reg;
+			val = now + (uint32_t)write_value;
 			gctx->cntv_cval_el0 = val;
 			write_cntv_cval_el0(val);
 		}
@@ -377,9 +392,11 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 	case SYSREG_CNTV_TVAL_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
-			*reg = read_cntv_cval_el0() - now;
+			if (reg != NULL) {
+				*reg = read_cntv_cval_el0() - now;
+			}
 		} else {
-			val = now + (uint32_t)*reg;
+			val = now + (uint32_t)write_value;
 			gctx->cntv_cval_el0 = val;
 			write_cntv_cval_el0(val);
 		}
@@ -462,8 +479,9 @@ int32_t vcpu_exit_handler(struct acrn_vcpu *vcpu)
 		return 0;
 	}
 
-	pr_err("unhandled arm64 vcpu exit esr=0x%lx elr=0x%lx",
-		vcpu->arch.regs.esr, vcpu->arch.regs.elr);
+	pr_err("unhandled arm64 vcpu exit vm%u-vcpu%u ec=0x%lx esr=0x%lx elr=0x%lx far=0x%lx hpfar=0x%lx",
+		vcpu->vm->vm_id, vcpu->vcpu_id, ec, vcpu->arch.regs.esr,
+		vcpu->arch.regs.elr, vcpu->arch.regs.far, vcpu->arch.regs.hpfar);
 	return -EINVAL;
 }
 

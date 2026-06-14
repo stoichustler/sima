@@ -63,7 +63,7 @@ struct shell {
 
 #define SHELL_CMD_LOG_LVL		"log"
 #define SHELL_CMD_LOG_LVL_PARAM		"[<console_loglevel> [<mem_loglevel> [npk_loglevel]]]"
-#define SHELL_CMD_LOG_LVL_HELP		"no argument: get the level of logging {0-6}"
+#define SHELL_CMD_LOG_LVL_HELP		"loglevel {0-6}"
 
 #define SHELL_CMD_DUMP_HOST_MEM		"hmm"
 #define SHELL_CMD_DUMP_HOST_MEM_PARAM	"<addr, length>"
@@ -77,9 +77,9 @@ struct shell {
 #define SHELL_CMD_THREAD_LIST_PARAM	NULL
 #define SHELL_CMD_THREAD_LIST_HELP	"list scheduler threads and state"
 
-#define SHELL_CMD_SCHED		"sched"
+#define SHELL_CMD_SCHED		"schedstat"
 #define SHELL_CMD_SCHED_PARAM		NULL
-#define SHELL_CMD_SCHED_HELP		"list per-pcpu scheduler status"
+#define SHELL_CMD_SCHED_HELP		"list per-pcpu scheduler statistics"
 
 #define SHELL_CMD_IRQ_STATS		"irqs"
 #define SHELL_CMD_IRQ_STATS_PARAM	NULL
@@ -87,9 +87,13 @@ struct shell {
 
 #define SHELL_CMD_VM_CONSOLE		"vsh"
 #define SHELL_CMD_VM_CONSOLE_PARAM	"<vm id>"
-#define SHELL_CMD_VM_CONSOLE_HELP	"switch to the vm's console. use ctrl-d to return to the clan shell"
+#define SHELL_CMD_VM_CONSOLE_HELP	"switch to the vm console. type `CTRL-D` switch to CLAN"
 
 void shell_puts(const char *string_ptr);
+void shell_item_begin(const char *fmt, ...);
+void shell_item_section(const char *fmt, ...);
+void shell_item_line(const char *fmt, ...);
+void shell_item_end(void);
 uint16_t sanitize_vmid(uint16_t vmid);
 
 #endif /* SHELL_PRIV_H */

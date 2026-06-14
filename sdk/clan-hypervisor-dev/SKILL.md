@@ -31,11 +31,16 @@ description: Develop, debug, validate, and document the CLAN hypervisor in this 
      ```
    - For debug/shell/console changes, force rebuild stale debug artifacts first:
      ```bash
-     rm -f build/modules/libdebug.a build/acrn.out build/acrn.bin
+     rm -f build/modules/libdebug.a build/clan.out build/clan.debug.out build/clan.debug.bin
      ```
    - Check QEMU command:
      ```bash
      ./scripts/kick.py --dry-run
+     ```
+   - Run the boot regression when touching boot, scheduler, IRQ, memory-map, or
+     console behavior:
+     ```bash
+     ./scripts/regress.py --toolchains /path/to/clan-arm64-none-elf/bin
      ```
    - Run `./scripts/kick.py` for boot/runtime validation when behavior changes.
 
@@ -45,20 +50,25 @@ description: Develop, debug, validate, and document the CLAN hypervisor in this 
 
 - Inspect `arch/arm64/platform/qemu/vm_configurations.c`, `arch/arm64/guest/vm.c`, `sdk/boot/guest/vboot_info.c`, and `sdk/boot/guest/rawimage_loader.c`.
 - Verify VM RAM windows, load/entry addresses, `GUEST_FLAG_NO_FW`, static vFDT placement, and stage-2 identity logs.
-- In QEMU, check `vcpus`, `sched`, `vsh 0`, and `vsh 1`.
+- In QEMU, check `vcpus`, `schedstat`, `vsh 0`, and `vsh 1`.
 
 ### Shared pCPU Scheduling
 
 - Inspect `core/vm.c`, `core/schedule.c`, `core/sched_iorr.c`, and ARM64 vCPU context switch files.
 - Keep VM0 on ordinary pCPUs and allow VM1 to mix ordinary/performance pCPUs.
 - Ensure shared pCPUs are time-sliced by scheduler behavior, not by adding ad hoc VM placement hacks.
-- Use `sched` to compare scheduler `ticks` with `ctx_switches`.
+- Use `schedstat` to compare scheduler `timer`, `resched`, and `switches`.
 
 ### Console Or Shell Work
 
 - Inspect `sdk/debug/shell.c`, `sdk/debug/shell_priv.h`, `sdk/debug/console.c`, and `arch/arm64/guest/vpl011.c`.
 - For `vsh`, make ownership markers appear before replaying buffered VM output.
 - Remember selected and non-selected VM console output use per-VM async rings.
+- Keep shell observability fields actionable for live diagnosis. Do not add
+  cumulative time totals or averaged-from-total latency fields to shell command
+  output by default; prefer current, recent, and high-water values such as
+  `since.us`, `lastwait.us`, and `maxwait.us`. Interrupt counts and scheduler
+  or vCPU `switches` are allowed as event-count exceptions.
 
 ### Hypercall Work
 

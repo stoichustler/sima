@@ -228,7 +228,7 @@ int32_t arch_init_vm(struct acrn_vm *vm, struct acrn_vm_config *vm_config)
 	 * handlers against those trapped ranges.
 	 */
 	init_stage2_identity_map(vm);
-	arm64_vgicv3_init_vm(vm);
+	arm64_vgicv3_init_vm(vm, vm_config->cpu_affinity);
 	arm64_vpl011_init_vm(vm);
 	register_arm64_vio_mmio(vm);
 

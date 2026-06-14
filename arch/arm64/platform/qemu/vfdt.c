@@ -23,7 +23,6 @@
 #define QEMU_FDT_GIC_PPI		1U
 #define QEMU_FDT_IRQ_TYPE_EDGE		1U
 #define QEMU_FDT_IRQ_TYPE_LEVEL		4U
-#define QEMU_FDT_IRQ_DEFAULT_PRIORITY	0xa0U
 
 #define QEMU_FDT_UART_CLOCK_HZ		24000000U
 #define QEMU_FDT_UART_BAUD		115200U
@@ -152,18 +151,13 @@ static void fdt_add_memory(void *fdt, struct acrn_vm *vm)
 
 static void fdt_add_gic(void *fdt, struct acrn_vm *vm)
 {
-	static const char gic_compat[] = "arm,gic-v3\0arm,gic";
 	char name[48];
 	uint64_t gicd_base = arm64_platform_guest_gicd_base(vm->vm_id);
 
 	snprintf(name, sizeof(name), "interrupt-controller@%lx", gicd_base);
 	fdt_check_ret(fdt_begin_node(fdt, name), "gic");
-	fdt_check_ret(fdt_property(fdt, "compatible", gic_compat, sizeof(gic_compat)),
-		"gic compatible");
+	fdt_check_ret(fdt_property_string(fdt, "compatible", "arm,gic-v3"), "gic compatible");
 	fdt_check_ret(fdt_property_u32(fdt, "#interrupt-cells", 3U), "gic interrupt-cells");
-	fdt_check_ret(fdt_property_u32(fdt, "#address-cells", 2U), "gic address-cells");
-	fdt_check_ret(fdt_property_u32(fdt, "#size-cells", 2U), "gic size-cells");
-	fdt_check_ret(fdt_property(fdt, "ranges", NULL, 0), "gic ranges");
 	fdt_check_ret(fdt_property(fdt, "interrupt-controller", NULL, 0), "gic controller");
 	fdt_check_ret(fdt_property_u32(fdt, "phandle", QEMU_FDT_PHANDLE_GIC), "gic phandle");
 	fdt_property_gic_reg(fdt, vm);

@@ -11,6 +11,7 @@
 #include <console.h>
 #include <per_cpu.h>
 #include <sprintf.h>
+#include <util.h>
 #include <logmsg.h>
 #include <version.h>
 #include <shell.h>
@@ -38,9 +39,10 @@ static int32_t shell_loglevel(int32_t argc, char **argv);
 static int32_t shell_dump_host_mem(int32_t argc, char **argv);
 static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv);
 static int32_t shell_list_threads(__unused int32_t argc, __unused char **argv);
-static int32_t shell_sched(__unused int32_t argc, __unused char **argv);
+static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv);
 static int32_t shell_irqstats(int32_t argc, char **argv);
 static int32_t shell_to_vm_console(int32_t argc, char **argv);
+static const char *thread_state_str(enum thread_object_state state);
 
 static struct shell_cmd shell_cmds[] = {
 	{
@@ -83,7 +85,7 @@ static struct shell_cmd shell_cmds[] = {
 		.str		= SHELL_CMD_SCHED,
 		.cmd_param	= SHELL_CMD_SCHED_PARAM,
 		.help_str	= SHELL_CMD_SCHED_HELP,
-		.fcn		= shell_sched,
+		.fcn		= shell_schedstat,
 	},
 	{
 		.str		= SHELL_CMD_IRQ_STATS,
@@ -219,6 +221,48 @@ void shell_puts(const char *string_ptr)
 	/* Output the string */
 	(void)console_write(string_ptr, strnlen_s(string_ptr,
 				SHELL_STRING_MAX_LEN));
+}
+
+static void shell_item_vprint(const char *prefix, const char *fmt, va_list args)
+{
+	char body[MAX_STR_SIZE];
+	char line[MAX_STR_SIZE];
+
+	(void)vsnprintf(body, sizeof(body), fmt, args);
+	(void)snprintf(line, sizeof(line), "%s%s\r\n", prefix, body);
+	shell_puts(line);
+}
+
+void shell_item_begin(const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	shell_item_vprint("\r\n┌─  ", fmt, args);
+	va_end(args);
+}
+
+void shell_item_section(const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	shell_item_vprint("├─  ", fmt, args);
+	va_end(args);
+}
+
+void shell_item_line(const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	shell_item_vprint("│   ", fmt, args);
+	va_end(args);
+}
+
+void shell_item_end(void)
+{
+	shell_puts("└─\r\n");
 }
 
 static void clear_input_line(uint32_t len)
@@ -801,17 +845,43 @@ static int32_t shell_dump_host_mem(int32_t argc, char **argv)
 	return ret;
 }
 
+static bool pcpu_is_shared_by_vcpus(uint16_t pcpu_id)
+{
+	struct acrn_vm *vm;
+	struct acrn_vcpu *vcpu;
+	uint16_t vm_id;
+	uint16_t vcpu_id;
+	uint16_t count = 0U;
+
+	for (vm_id = 0U; vm_id < CONFIG_MAX_VM_NUM; vm_id++) {
+		vm = get_vm_from_vmid(vm_id);
+		if (is_poweroff_vm(vm)) {
+			continue;
+		}
+
+		foreach_vcpu(vcpu_id, vm, vcpu) {
+			if (pcpuid_from_vcpu(vcpu) == pcpu_id) {
+				count++;
+				if (count > 1U) {
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
 static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv)
 {
 	char temp_str[MAX_STR_SIZE];
 	struct acrn_vm *vm;
 	struct acrn_vcpu *vcpu;
-	char vcpu_state_str[32], thread_state_str[32];
 	uint16_t i;
 	uint16_t idx;
 
-	shell_puts("\r\nvm id    pcpu id    vcpu id    vcpu role    vcpu state    thread state"
-		"\r\n─────    ───────    ───────    ─────────    ──────────    ──────────\r\n");
+	shell_puts("\r\nvmid  vcpu  pcpu  pcpu_mode  state     switches  lastwait.us  maxwait.us  since.us\r\n");
+	shell_puts("────  ────  ────  ─────────  ────────  ────────  ───────────  ──────────  ────────\r\n");
 
 	for (idx = 0U; idx < CONFIG_MAX_VM_NUM; idx++) {
 		vm = get_vm_from_vmid(idx);
@@ -819,47 +889,30 @@ static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv)
 			continue;
 		}
 		foreach_vcpu(i, vm, vcpu) {
-			switch (vcpu->state) {
-			case VCPU_INIT:
-				(void)strncpy_s(vcpu_state_str, 32U, "init", 32U);
-				break;
-			case VCPU_RUNNING:
-				(void)strncpy_s(vcpu_state_str, 32U, "running", 32U);
-				break;
-			case VCPU_ZOMBIE:
-				(void)strncpy_s(vcpu_state_str, 32U, "zombie", 32U);
-				break;
-			default:
-				(void)strncpy_s(vcpu_state_str, 32U, "unknown", 32U);
-				break;
-			}
+			struct sched_latency_stats stats = { 0U };
+			char since_us[24U];
+			uint64_t since_ticks;
+			uint16_t pcpu_id = pcpuid_from_vcpu(vcpu);
+			bool shared_pcpu = pcpu_is_shared_by_vcpus(pcpu_id);
 
-			switch (vcpu->thread_obj.status) {
-			case THREAD_STS_RUNNING:
-				(void)strncpy_s(thread_state_str, 32U, "running", 32U);
-				break;
-			case THREAD_STS_RUNNABLE:
-				(void)strncpy_s(thread_state_str, 32U, "runnable", 32U);
-				break;
-			case THREAD_STS_BLOCKED:
-				(void)strncpy_s(thread_state_str, 32U, "blocked", 32U);
-				break;
-			default:
-				(void)strncpy_s(thread_state_str, 32U, "unknown", 32U);
-				break;
+			sched_get_latency(&vcpu->thread_obj, &stats);
+			if (shared_pcpu) {
+				since_ticks = (stats.state_since != 0UL) ? (cpu_ticks() - stats.state_since) : 0UL;
+				snprintf(since_us, sizeof(since_us), "%lu", ticks_to_us(since_ticks));
+			} else {
+				snprintf(since_us, sizeof(since_us), "-");
 			}
-			/* Create output string consisting of VM name
-			 * and VM id
-			 */
 			snprintf(temp_str, MAX_STR_SIZE,
-					"  %-9d %-10d %-7hu %-12s %-16s %-16s\r\n",
-					vm->vm_id,
-					pcpuid_from_vcpu(vcpu),
-					vcpu->vcpu_id,
-					is_vcpu_bsp(vcpu) ?
-					"primary" : "secondary",
-					vcpu_state_str, thread_state_str);
-			/* Output information for this task */
+				"%-5hu %-5hu %-5hu %-10s %-9s %-9lu %-12lu %-11lu %-8s\r\n",
+				vm->vm_id,
+				vcpu->vcpu_id,
+				pcpu_id,
+				shared_pcpu ? "shared" : "isolate",
+				thread_state_str(vcpu->thread_obj.status),
+				stats.switches,
+				ticks_to_us(stats.last_wait_ticks),
+				ticks_to_us(stats.max_wait_ticks),
+				since_us);
 			shell_puts(temp_str);
 		}
 	}
@@ -918,28 +971,49 @@ static int32_t shell_list_threads(__unused int32_t argc, __unused char **argv)
 	return 0;
 }
 
-static int32_t shell_sched(__unused int32_t argc, __unused char **argv)
+static uint32_t shell_sched_runqueue_count(uint16_t pcpu_id)
+{
+	const struct list_head *head = sched_get_thread_list();
+	struct list_head *pos;
+	uint32_t count = 0U;
+
+	list_for_each(pos, head) {
+		struct thread_object *thread = container_of(pos, struct thread_object, node);
+
+		if ((thread->pcpu_id == pcpu_id) && (thread->status == THREAD_STS_RUNNABLE)) {
+			count++;
+		}
+	}
+
+	return count;
+}
+
+static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 {
 	char temp_str[MAX_STR_SIZE];
 	uint16_t pcpu_id;
 	uint16_t pcpu_num = get_pcpu_nums();
+	const char *algorithm = (pcpu_num != 0U) ? sched_get_scheduler_name(0U) : "none";
+	const char *params = (pcpu_num != 0U) ? sched_get_scheduler_stat_desc(0U) : "";
 
-	shell_puts("\r\npcpu    scheduler     ticks           ctx_switches    current_thread    state\r\n");
-	shell_puts("────    ─────────     ────────────    ────────────    ──────────────    ────────\r\n");
+	snprintf(temp_str, MAX_STR_SIZE,
+		"\r\nschedstat algorithm:%s %s pcpus:%hu\r\n", algorithm, params, pcpu_num);
+	shell_puts(temp_str);
+	shell_puts("pcpu  timer  switches  resched  runqueue  thread\r\n");
+	shell_puts("────  ─────  ────────  ───────  ────────  ────────────────\r\n");
 
 	for (pcpu_id = 0U; pcpu_id < pcpu_num; pcpu_id++) {
 		struct thread_object *current = sched_get_current(pcpu_id);
 		const char *name = (current != NULL) ? current->name : "-";
-		const char *state = (current != NULL) ? thread_state_str(current->status) : "-";
 
 		snprintf(temp_str, MAX_STR_SIZE,
-			"%-7hu %-13s %-15lu %-15lu %-17s %s\r\n",
+			"%-5hu %-6lu %-9lu %-8lu %-9u %s\r\n",
 			pcpu_id,
-			sched_get_scheduler_name(pcpu_id),
 			sched_get_ticks(pcpu_id),
 			sched_get_context_switches(pcpu_id),
-			name,
-			state);
+			sched_get_reschedule_requests(pcpu_id),
+			shell_sched_runqueue_count(pcpu_id),
+			name);
 		shell_puts(temp_str);
 	}
 
@@ -953,6 +1027,14 @@ static bool irq_should_show(uint32_t irq, uint16_t pcpu_num, uint64_t *total)
 	bool has_handler;
 
 	has_handler = irq_desc_array[irq].action != NULL;
+	if ((has_handler == false) &&
+		(bitmap_test((uint16_t)(irq & 0x3FU), irq_alloc_bitmap + (irq >> 6U)) == false)) {
+		if (total != NULL) {
+			*total = 0UL;
+		}
+		return false;
+	}
+
 	for (pcpu_id = 0U; pcpu_id < pcpu_num; pcpu_id++) {
 		irq_total += per_cpu(irq_count, pcpu_id)[irq];
 	}
@@ -1019,9 +1101,13 @@ static void shell_print_irq_cpu_counts(uint32_t irq, uint16_t pcpu_num, uint32_t
 		 * values remain visually aligned while still wrapping on narrow UARTs.
 		 */
 		shell_puts(token);
-		shell_put_spaces(IRQ_STATS_CPU_TOKEN_WIDTH -
-			(uint32_t)strnlen_s(token, sizeof(token)));
-		line_len += token_len;
+		token_len = (uint32_t)strnlen_s(token, sizeof(token));
+		if (token_len < IRQ_STATS_CPU_TOKEN_WIDTH) {
+			shell_put_spaces(IRQ_STATS_CPU_TOKEN_WIDTH - token_len);
+			line_len += IRQ_STATS_CPU_TOKEN_WIDTH;
+		} else {
+			line_len += token_len;
+		}
 		printed = true;
 	}
 

@@ -13,8 +13,13 @@
 	.align 4
 	.globl arm64_run_vcpu
 arm64_run_vcpu:
-	/* guest_vector_entry subtracts CPU_REGS_OFFSET_LAST before calling C. */
+	/*
+	 * Build the same cpu_regs frame that guest_vector_entry would have saved
+	 * on an exit. vcpu_exit_return then programs ELR_EL2/SPSR_EL2/SP_EL1 and
+	 * executes ERET, so first entry and trap return share one restore path.
+	 */
 	sub	sp, sp, #VCPU_RUN_STACK_SIZE
+	/* x16 is the source vCPU register frame, x17 is the temporary EL2 frame. */
 	mov	x16, x0
 	mov	x17, sp
 	ldp	x0, x1, [x16, #CPU_REGS_OFFSET_X0]

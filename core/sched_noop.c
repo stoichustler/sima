@@ -48,6 +48,7 @@ static void sched_noop_wake(struct thread_object *obj)
 
 struct acrn_scheduler sched_noop = {
 	.name		= "sched_noop",
+	.stat_desc	= "policy:single-runnable",
 	.init		= sched_noop_init,
 	.pick_next	= sched_noop_pick_next,
 	.sleep		= sched_noop_sleep,

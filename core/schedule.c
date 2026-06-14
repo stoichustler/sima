@@ -13,6 +13,7 @@
 #include <sprintf.h>
 #include <irq.h>
 #include <trace.h>
+#include <ticks.h>
 #include <asm/guest/vm_reset.h>
 
 static struct list_head thread_list;
@@ -57,6 +58,41 @@ static inline bool is_running(const struct thread_object *obj)
 static inline void set_thread_status(struct thread_object *obj, enum thread_object_state status)
 {
 	obj->status = status;
+}
+
+static void sched_mark_runnable(struct thread_object *obj, uint64_t now)
+{
+	obj->latency.state_since = now;
+	obj->latency.runnable_since = now;
+}
+
+static void sched_mark_blocked(struct thread_object *obj, uint64_t now)
+{
+	obj->latency.state_since = now;
+	obj->latency.runnable_since = 0UL;
+}
+
+static void sched_mark_running(struct thread_object *obj, uint64_t now)
+{
+	uint64_t wait_ticks = 0UL;
+
+	if (obj->latency.runnable_since != 0UL) {
+		wait_ticks = now - obj->latency.runnable_since;
+		obj->latency.last_wait_ticks = wait_ticks;
+		if (wait_ticks > obj->latency.max_wait_ticks) {
+			obj->latency.max_wait_ticks = wait_ticks;
+		}
+	}
+
+	obj->latency.switches++;
+	obj->latency.state_since = now;
+	obj->latency.runnable_since = 0UL;
+}
+
+static void sched_mark_not_running(struct thread_object *obj, uint64_t now, bool runnable)
+{
+	obj->latency.state_since = now;
+	obj->latency.runnable_since = runnable ? now : 0UL;
 }
 
 static void register_thread_object(struct thread_object *obj)
@@ -104,6 +140,7 @@ void init_sched(uint16_t pcpu_id)
 	ctl->pcpu_id = pcpu_id;
 	ctl->scheduler_ticks = 0UL;
 	ctl->context_switches = 0UL;
+	ctl->reschedule_requests = 0UL;
 #ifdef CONFIG_SCHED_NOOP
 	ctl->scheduler = &sched_noop;
 #endif
@@ -154,12 +191,14 @@ void init_thread_data(struct thread_object *obj, struct sched_params *params)
 	uint64_t rflag;
 
 	INIT_LIST_HEAD(&obj->node);
+	(void)memset(&obj->latency, 0U, sizeof(obj->latency));
 	obtain_schedule_lock(obj->pcpu_id, &rflag);
 	if (scheduler->init_data != NULL) {
 		scheduler->init_data(obj, params);
 	}
 	/* initial as BLOCKED status, so we can wake it up to run */
 	set_thread_status(obj, THREAD_STS_BLOCKED);
+	obj->latency.state_since = cpu_ticks();
 	register_thread_object(obj);
 	release_schedule_lock(obj->pcpu_id, rflag);
 }
@@ -186,6 +225,13 @@ const char *sched_get_scheduler_name(uint16_t pcpu_id)
 	return (ctl->scheduler != NULL) ? ctl->scheduler->name : "none";
 }
 
+const char *sched_get_scheduler_stat_desc(uint16_t pcpu_id)
+{
+	struct sched_control *ctl = &per_cpu(sched_ctl, pcpu_id);
+
+	return (ctl->scheduler != NULL) ? ctl->scheduler->stat_desc : "";
+}
+
 uint64_t sched_get_ticks(uint16_t pcpu_id)
 {
 	struct sched_control *ctl = &per_cpu(sched_ctl, pcpu_id);
@@ -200,6 +246,33 @@ uint64_t sched_get_context_switches(uint16_t pcpu_id)
 	return ctl->context_switches;
 }
 
+uint64_t sched_get_reschedule_requests(uint16_t pcpu_id)
+{
+	struct sched_control *ctl = &per_cpu(sched_ctl, pcpu_id);
+
+	return ctl->reschedule_requests;
+}
+
+void sched_get_latency(const struct thread_object *obj, struct sched_latency_stats *stats)
+{
+	enum thread_object_state status;
+	uint64_t now;
+
+	if ((obj != NULL) && (stats != NULL)) {
+		*stats = obj->latency;
+		status = obj->status;
+		now = cpu_ticks();
+
+		if ((status == THREAD_STS_RUNNABLE) && (stats->runnable_since != 0UL)) {
+			uint64_t wait_ticks = now - stats->runnable_since;
+
+			if (wait_ticks > stats->max_wait_ticks) {
+				stats->max_wait_ticks = wait_ticks;
+			}
+		}
+	}
+}
+
 void sched_account_tick(struct sched_control *ctl)
 {
 	if (ctl != NULL) {
@@ -211,6 +284,7 @@ void make_reschedule_request(uint16_t pcpu_id)
 {
 	struct sched_control *ctl = &per_cpu(sched_ctl, pcpu_id);
 
+	ctl->reschedule_requests++;
 	bitmap_set(NEED_RESCHEDULE, &ctl->flags);
 	if (get_pcpu_id() != pcpu_id) {
 		arch_send_reschedule_request(pcpu_id);
@@ -231,6 +305,7 @@ void schedule(void)
 	struct thread_object *next = &per_cpu(idle, pcpu_id);
 	struct thread_object *prev = ctl->curr_obj;
 	uint64_t rflag;
+	uint64_t now;
 	char name[16];
 
 	obtain_schedule_lock(pcpu_id, &rflag);
@@ -241,6 +316,7 @@ void schedule(void)
 
 	/* If we picked different sched object, switch context */
 	if (prev != next) {
+		now = cpu_ticks();
 		if (prev != NULL) {
 			memcpy(name, prev->name, 4);
 			memcpy(name + 4, next->name, 4);
@@ -249,6 +325,7 @@ void schedule(void)
 			if (prev->switch_out != NULL) {
 				prev->switch_out(prev);
 			}
+			sched_mark_not_running(prev, now, !prev->be_blocking);
 			set_thread_status(prev, prev->be_blocking ? THREAD_STS_BLOCKED : THREAD_STS_RUNNABLE);
 			prev->be_blocking = false;
 		}
@@ -256,6 +333,7 @@ void schedule(void)
 		if (next->switch_in != NULL) {
 			next->switch_in(next);
 		}
+		sched_mark_running(next, now);
 		set_thread_status(next, THREAD_STS_RUNNING);
 
 		ctl->curr_obj = next;
@@ -281,6 +359,7 @@ void sleep_thread(struct thread_object *obj)
 		make_reschedule_request(pcpu_id);
 		obj->be_blocking = true;
 	} else {
+		sched_mark_blocked(obj, cpu_ticks());
 		set_thread_status(obj, THREAD_STS_BLOCKED);
 	}
 	release_schedule_lock(pcpu_id, rflag);
@@ -307,6 +386,7 @@ void wake_thread(struct thread_object *obj)
 			scheduler->wake(obj);
 		}
 		if (is_blocked(obj)) {
+			sched_mark_runnable(obj, cpu_ticks());
 			set_thread_status(obj, THREAD_STS_RUNNABLE);
 			make_reschedule_request(pcpu_id);
 		}
@@ -326,6 +406,7 @@ void run_thread(struct thread_object *obj)
 
 	obtain_schedule_lock(obj->pcpu_id, &rflag);
 	get_cpu_var(sched_ctl).curr_obj = obj;
+	sched_mark_running(obj, cpu_ticks());
 	set_thread_status(obj, THREAD_STS_RUNNING);
 	release_schedule_lock(obj->pcpu_id, rflag);
 

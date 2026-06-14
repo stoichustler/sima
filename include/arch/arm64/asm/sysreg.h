@@ -9,17 +9,59 @@
 
 #include <types.h>
 
+/*
+ * ARM64 system-register quick reference for CLAN:
+ *
+ * MPIDR_EL1: CPU affinity identifier. The low affinity levels are used to map
+ *            physical CPUs, redistributors, and guest vMPIDR values.
+ * CurrentEL: current exception level. Boot code requires EL2 before enabling
+ *            the hypervisor runtime.
+ * DAIF:      PSTATE interrupt masks for Debug, SError, IRQ, and FIQ. Context
+ *            switch code saves it so each task keeps its interrupt-mask state.
+ * VBAR_EL2:  EL2 exception-vector base. All host and guest exits branch through
+ *            the vector table installed here.
+ * ELR_ELx:   exception link register. ERET resumes execution at this address.
+ * SPSR_ELx:  saved PSTATE for exception return, including target EL and masks.
+ * ESR_ELx:   exception syndrome, used to decode traps such as system-register
+ *            accesses and data aborts.
+ * FAR_ELx:   faulting virtual address for abort exceptions.
+ * HPFAR_EL2: stage-2 fault IPA fragment for guest memory abort handling.
+ *
+ * Timer registers:
+ * CNTFRQ_EL0 reports counter frequency, CNTP* controls the physical timer, and
+ * CNTV* controls the virtual timer. CNTHCTL_EL2 decides which EL1 timer/counter
+ * accesses are allowed or trapped.
+ *
+ * GIC system registers:
+ * ICC_* registers are the EL1 CPU-interface view. ICH_* registers are the EL2
+ * virtual CPU-interface state: HCR enables vGIC delivery, VMCR mirrors guest
+ * control, LR<n> entries hold pending/active virtual interrupts, AP registers
+ * hold active-priority state, and VTR reports hardware vGIC capacity.
+ *
+ * Virtualization registers:
+ * HCR_EL2 enables stage-2 translation and controls EL1 trap routing. VTCR_EL2
+ * describes the stage-2 table format, VTTBR_EL2 selects the VM's stage-2 root,
+ * and VMPIDR_EL2 provides the guest-visible MPIDR value.
+ *
+ * Translation registers:
+ * SCTLR_ELx enables MMU/cache behavior. TTBR*_ELx selects translation tables,
+ * TCR_ELx describes address-size/cacheability/shareability, and MAIR_ELx maps
+ * page-table attribute indexes to memory types.
+ */
 #define MPIDR_AFFINITY_MASK	0x00FFFFFFUL
 
+/* CNTV_CTL_EL0 bits shared by virtual and emulated guest timer control paths. */
 #define CNTV_CTL_ENABLE		(1U << 0U)
 #define CNTV_CTL_IMASK		(1U << 1U)
 #define CNTV_CTL_ISTATUS	(1U << 2U)
 
+/* CNTHCTL_EL2 grants EL1 access to physical/virtual counter and timer state. */
 #define CNTHCTL_EL2_EL1PCTEN	(1UL << 0U)
 #define CNTHCTL_EL2_EL1PCEN	(1UL << 1U)
 #define CNTHCTL_EL2_EL1VCTEN	(1UL << 8U)
 #define CNTHCTL_EL2_EL1VTEN	(1UL << 9U)
 
+/* HCR_EL2 controls virtualization, interrupt routing, guest width, and traps. */
 #define HCR_VM			(1UL << 0U)
 #define HCR_IMO			(1UL << 4U)
 #define HCR_FMO			(1UL << 3U)
@@ -29,14 +71,17 @@
 #define HCR_VF			(1UL << 6U)
 #define HCR_TSC			(1UL << 19U)
 
+/* ICH_HCR_EL2 controls the virtual GIC CPU interface exposed to a vCPU. */
 #define ICH_HCR_EN		(1UL << 0U)
 #define ICH_HCR_UIE		(1UL << 1U)
 #define ICH_HCR_LRENPIE		(1UL << 2U)
 #define ICH_HCR_NPIE		(1UL << 3U)
 
+/* ICH_VMCR_EL2 mirrors guest-visible GIC CPU-interface control state. */
 #define ICH_VMCR_VENG1		(1UL << 1U)
 #define ICH_VMCR_DEFAULT_MASK	(0xf8UL << 24U)
 
+/* ICH_LR<n> encodes one virtual interrupt presented through a list register. */
 #define ICH_LR_VINTID_MASK	0xffffffffUL
 #define ICH_LR_PINTID_SHIFT	32U
 #define ICH_LR_PRIORITY_SHIFT	48U
@@ -48,6 +93,7 @@
 #define ICH_LR_STATE_ACTIVE	2UL
 #define ICH_LR_STATE_ACTIVE_PENDING 3UL
 
+/* ICC_SRE enables system-register access to the GIC CPU interface. */
 #define ICC_CTLR_EL1_EOIMODE	(1UL << 1U)
 #define ICC_SRE_SRE		(1UL << 0U)
 #define ICC_SRE_DFB		(1UL << 1U)

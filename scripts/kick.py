@@ -22,7 +22,7 @@ def render(cmd, toolchains=None):
 
 
 def parse_args():
-    kernel = relpath(os.environ["CLAN_KERNEL"]) if "CLAN_KERNEL" in os.environ else ROOT / "build/acrn.out"
+    kernel = relpath(os.environ["CLAN_KERNEL"]) if "CLAN_KERNEL" in os.environ else ROOT / "build/clan.debug.out"
     toolchains = os.getenv("CLAN_TOOLCHAINS", os.getenv("CLAN_TOOLCHAIN"))
     toolchains = relpath(toolchains) if toolchains else None
 

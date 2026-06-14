@@ -18,7 +18,7 @@ qemu-system-aarch64 \
   -m 1024M \
   -nographic \
   -serial mon:stdio \
-  -kernel build/acrn.out
+  -kernel build/clan.debug.out
 ```
 
 Build with the local bare-metal toolchain:
@@ -47,10 +47,12 @@ Current QEMU VM layout:
 - VM0 uses ordinary cores only. VM1 may mix ordinary and performance cores; the
   static QEMU scenario uses pCPU3 as the shared ordinary core plus pCPU5-pCPU7.
 
-The generated `build/acrn.out` has been boot-tested on QEMU. Both RTOS guests
-autostart without external ACPI/FDT modules. The CLAN shell stays quiet during
-late guest AP bring-up; press Enter after the boot logs settle to show the
-`console:\>` prompt.
+The generated `build/clan.debug.out` has been boot-tested on QEMU. The build
+also emits `build/clan.out` as the base link image, `build/clan.debug.bin` as
+the raw debug image, and compatibility copies at `build/acrn.out` and
+`build/acrn.bin`. Both RTOS guests autostart without external ACPI/FDT modules.
+The CLAN shell stays quiet during late guest AP bring-up; press Enter after the
+boot logs settle to show the `console:\>` prompt.
 
 ## Implemented
 
@@ -58,6 +60,8 @@ late guest AP bring-up; press Enter after the boot logs settle to show the
 - `scripts/kick.py` QEMU launcher with `--kernel`, `--qemu`, `--smp`,
   `--memory`, `--toolchains`, `--cross-prefix`, `--build`, `--dry-run`, and
   extra QEMU argument support.
+- `scripts/regress.py` boot regression harness for build, QEMU launch, CLAN
+  shell commands, VM console switching, and fatal boot-log checks.
 - QEMU platform code and static board/scenario configuration under
   `arch/arm64/platform/qemu`.
 - Bare-boot image embedding for both LK and Zephyr raw images.
@@ -115,30 +119,34 @@ late guest AP bring-up; press Enter after the boot logs settle to show the
 - VM and vCPU debug commands:
   - `vcpus`
   - `threads`
-  - `sched`
+  - `schedstat`
   - `vmap`
   - `irqs`
-  - `vdump [vm id] [vcpu id]`
+  - `dumpstat [vm id]`
   - `vsh <vm id>`
-  - `bench [loops] [mem_kb]`
 - `vsh <vm id>` switches the serial console to a VM vPL011/vUART console.
   Ctrl-D switches back to the CLAN shell.
-- `sched` prints the scheduler name, scheduler tick count, context switch
-  count, current thread, and thread state for each pCPU.
-  - `ticks` is the number of scheduler timer callbacks observed on that pCPU.
-    It is a periodic opportunity to charge runtime and request rescheduling.
-  - `ctx_switches` is the number of times `schedule()` actually selected a
-    different thread. A tick can happen without a context switch, and a context
-    switch can also be caused by events such as wake/sleep/yield paths.
+- `schedstat` prints the scheduler algorithm and one physical-CPU row with
+  `pcpu`, scheduler `timer` callbacks, context `switches`, `resched` requests,
+  runnable-thread count, and current `thread`.
+  - `timer` is the number of scheduler timer callbacks observed on that pCPU.
+  - `switches` is the number of times `schedule()` actually selected a
+    different thread.
+  - `resched` counts requests raised through `make_reschedule_request()`,
+    including tick, wake, yield, and remote reschedule paths.
+  - `runqueue` is the current count of runnable threads bound to that pCPU.
 - `irqs` prints a short IRQ name/purpose column when the architecture can decode
   it. ARM64 maps ACRN IRQ numbers back to GIC SGI/PPI/SPI sources and names the
   EL2-owned SMP-call, physical-timer, virtual-timer, and vGIC-maintenance
   interrupts. Per-pCPU counts use aligned `cpuN:count` fields, and `active`
   shows whether the IRQ is allocated in the common IRQ table.
-- `bench` runs a bounded CLAN shell CPU/memory stress loop. `loops` controls
-  the stress loop count, and `mem_kb` controls how much of the static scratch
-  buffer is touched per loop. The command prints elapsed ticks/time, loop
-  throughput, current per-pCPU thread occupancy, and visible memory occupancy.
+- `dumpstat [vm id]` prints all created vCPUs in the VM, including the saved
+  ARM64 register image, scheduler state, current-thread status, a raw guest
+  stack trace from the VM register image, and the host stack saved by the vCPU
+  thread on its bound pCPU. Guest stack entries are raw addresses because CLAN
+  does not embed guest symbol tables. The debug image embeds the CLAN symbol
+  table, so host stack return addresses are printed as `function+offset`.
+  Offline vCPUs skip stack output.
 - VM vPL011 TX output from the currently selected `vsh` VM is written into a
   Xen-style per-VM async console ring buffer, using monotonic producer/consumer
   indexes and a 4KB power-of-two data area with 4095 bytes of usable capacity.
@@ -164,7 +172,11 @@ late guest AP bring-up; press Enter after the boot logs settle to show the
   - Maintenance IRQ handler.
   - SGI system-register trap handling through `ICC_SGI1R_EL1`.
   - GICD/GICR MMIO vio and 64-bit MMIO split handling.
+  - Redistributor frames are addressed by pCPU slot and mapped to the VM's
+    bound vCPU local IRQ bank.
   - GICD/GICR `IPRIORITYR` byte/halfword/word access support.
+  - GICD/GICR `ICFGR` read/write support for SGI/PPI/SPI trigger type state.
+  - GICD `IROUTER` low/high word access and SPI target-vCPU delivery.
   - Virtual timer PPI handling and injection back into the running guest vCPU.
 - ARM64 IRQ domains for CPU-local and GIC interrupts.
 - ARM64 memory logging for host stage-1 and VM stage-2 mappings.
@@ -192,8 +204,8 @@ The following have been verified on QEMU with `-smp 8`:
 - Boot logs show each VM stage-2 RAM map as identity mapped:
   VM0 `ipa[0x42000000-0x48000000]:pa[0x42000000-0x48000000]` and VM1
   `ipa[0x40000000-0x42000000]:pa[0x40000000-0x42000000]`.
-- `sched` reports `sched_iorr`, per-pCPU scheduler ticks, and per-pCPU context
-  switch counters.
+- `schedstat` reports `sched_iorr`, per-pCPU scheduler timer callbacks,
+  reschedule requests, runnable-thread counts, and context switch counters.
 - `vcpus` reports both VMs and all 8 guest vCPUs. VM0 uses pCPU0, pCPU2,
   pCPU3, and pCPU4; VM1 uses pCPU3, pCPU5, pCPU6, and pCPU7.
 - `vsh 0` enters the Zephyr console and reaches `zero ~>`.
@@ -204,9 +216,6 @@ The following have been verified on QEMU with `-smp 8`:
   `zero ~>` prompt with async batched VM console output.
 - VM console output bypasses vUART TX FIFO forwarding for the selected `vsh`
   VM console.
-- `bench 0 0` prints CPU and memory occupancy without stress, and
-  `bench 100 4` runs a bounded CPU/memory stress loop and reports touched
-  memory and loop throughput.
 - Ctrl-D returns from VM console mode to `console:\>`.
 - The `crash` command prints an ARM64 exception stack with `[cut here]` and
   `[end here]` markers, then cold reboots CLAN automatically.
@@ -260,8 +269,8 @@ QEMU, but it is still a bring-up target rather than a complete architectural
 virtualization port.
 
 - vGICv3 is sufficient for the current Zephyr and LK boot path, but it is not a
-  complete GICv3 model yet. Routing, active-state edge cases, full redistributor
-  behavior, and full distributor register coverage still need work.
+  complete GICv3 model yet. Active-state stress cases, deeper redistributor
+  behavior, MSI/LPI paths, and richer distributor coverage still need work.
 - QEMU VM layout is still statically configured in `vm_configurations.c`;
   QEMU FDT parsing is not yet used to derive VM layout.
 - The current Zephyr and LK VMs are RTOS raw images and boot with
@@ -270,16 +279,17 @@ virtualization port.
 - VM console output from SMP guests can interleave because multiple guest CPUs
   write concurrently to the same PL011 console.
 - Stage-2 mapping is still static for the QEMU `virt` platform.
-- No automated regression harness exists yet for the multi-VM boot sequence.
+- The automated regression harness covers the core multi-VM boot sequence, but
+  broader stress and overflow coverage is still pending.
 
 ## Next Steps
 
 1. Add a Linux-oriented loader/module path that does not rely on platform
    `.incbin` image embedding, then clear `GUEST_FLAG_NO_FW` for Linux guests.
-2. Extend vGICv3 coverage for routing, active-state handling, redistributor SGI
-   and PPI registers, and remaining distributor registers used by richer guests.
-3. Add a repeatable boot regression script that checks build, `scripts/kick.py`
-   launch, VM states, Zephyr `zero ~>`, LK `beau ~>`, `vmap`, and `irqs`.
+2. Extend vGICv3 coverage for active-state stress, deeper redistributor state,
+   MSI/LPI paths, and remaining distributor registers used by richer guests.
+3. Extend `scripts/regress.py` with richer stress coverage and log artifacts
+   suitable for CI.
 4. Move QEMU platform memory and device discovery toward host-FDT-derived data
    where it helps reduce static board assumptions.
 5. Add a repeatable automated console regression for async per-VM output,

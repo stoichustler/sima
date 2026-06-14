@@ -38,7 +38,7 @@
 #define CONFIG_IGD_SBDF			0U
 
 #define MAX_PCPU_NUM			8U
-#define PRE_VM_NUM			1U
+#define PRE_VM_NUM			2U
 #define SERVICE_VM_NUM			1U
 #define MAX_POST_VM_NUM			0U
 #define MAX_TRUSTY_VM_NUM		0U

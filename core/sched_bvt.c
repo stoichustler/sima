@@ -334,6 +334,7 @@ static void sched_bvt_wake(struct thread_object *obj)
 
 struct acrn_scheduler sched_bvt = {
 	.name		= "sched_bvt",
+	.stat_desc	= "mcu:1ms csa:5 weight:1-128",
 	.init		= sched_bvt_init,
 	.init_data	= sched_bvt_init_data,
 	.pick_next	= sched_bvt_pick_next,

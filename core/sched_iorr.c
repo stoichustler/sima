@@ -217,6 +217,7 @@ static void sched_iorr_wake(struct thread_object *obj)
 
 struct acrn_scheduler sched_iorr = {
 	.name		= "sched_iorr",
+	.stat_desc	= "tick:1ms slice:10ms",
 	.init		= sched_iorr_init,
 	.init_data	= sched_iorr_init_data,
 	.pick_next	= sched_iorr_pick_next,

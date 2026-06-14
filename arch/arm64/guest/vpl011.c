@@ -31,6 +31,8 @@
 #define PL011_FR_RXFE		(1U << 4U)
 #define PL011_INT_TX		(1U << 5U)
 #define PL011_INT_RX		(1U << 4U)
+#define PL011_INT_RT		(1U << 6U)
+#define PL011_INT_RX_ANY	(PL011_INT_RX | PL011_INT_RT)
 
 #define PL011_PID_BASE		0xFE0U
 #define PL011_CID_BASE		0xFF0U
@@ -52,7 +54,7 @@ static struct arm64_vpl011 vpl011_devs[CONFIG_MAX_VM_NUM];
 
 static uint32_t vpl011_rx_int_state(struct acrn_vm *vm)
 {
-	return vuart_rx_pending(vm_console_vuart(vm)) ? PL011_INT_RX : 0U;
+	return vuart_rx_pending(vm_console_vuart(vm)) ? PL011_INT_RX_ANY : 0U;
 }
 
 static void vpl011_update_irq(struct acrn_vm *vm, struct arm64_vpl011 *vu)
@@ -186,7 +188,7 @@ static void vpl011_write(struct acrn_vm *vm, struct arm64_vpl011 *vu, uint32_t o
 		break;
 	case PL011_IMSC:
 		vu->imsc = value;
-		if ((value & PL011_INT_RX) != 0U) {
+		if ((value & PL011_INT_RX_ANY) != 0U) {
 			console->ier |= IER_ERBFI;
 		} else {
 			console->ier &= (uint8_t)~IER_ERBFI;
