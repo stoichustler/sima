@@ -5,7 +5,9 @@
  */
 
 #include <types.h>
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <config.h>
+#endif
 #include <reloc.h>
 
 uint64_t arch_get_hv_image_delta(void)

@@ -7,7 +7,9 @@
 #ifndef ACPI_H
 #define ACPI_H
 
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <board_info.h>
+#endif
 
 #define ACPI_RSDP_CHECKSUM_LENGTH   20U
 #define ACPI_RSDP_XCHECKSUM_LENGTH  36U

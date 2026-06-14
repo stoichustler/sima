@@ -9,10 +9,14 @@
 
 #include <types.h>
 #include <pci.h>
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <board_info.h>
+#endif
 #include <boot.h>
 #include <acrn_common.h>
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <vm_configurations.h>
+#endif
 #include <acrn_hv_defs.h>
 #include <schedule.h>
 #include <asm/vm_config.h>

@@ -55,7 +55,7 @@ HOST_C_SRCS += arch/arm64/trap.c
 HOST_C_SRCS += arch/arm64/security.c
 HOST_C_SRCS += arch/arm64/pm.c
 ifeq ($(PLATFORM),qemu)
-HOST_C_SRCS += arch/arm64/platform/qemu/platform.c
+HOST_C_SRCS += arch/arm64/platform/qemu/platform_qemu.c
 endif
 
 VP_S_SRCS +=
@@ -68,17 +68,15 @@ VP_C_SRCS += arch/arm64/guest/vcpu_exit.c
 VP_C_SRCS += arch/arm64/guest/virq.c
 VP_C_SRCS += arch/arm64/guest/vgicv3.c
 VP_C_SRCS += arch/arm64/guest/vpl011.c
-ifeq ($(CONFIG_STATIC_VFDT),y)
-VP_C_SRCS += arch/arm64/platform/qemu/vfdt.c
-endif
-
+ifeq ($(PLATFORM),qemu)
+VM_CFG_C_SRCS += arch/arm64/platform/qemu/vm_config.c
+VM_CFG_S_SRCS += arch/arm64/platform/qemu/platform_image.S
+else
 VM_CFG_C_SRCS += $(SCENARIO_CFG_DIR)/vm_configurations.c
 VM_CFG_C_SRCS += $(BOARD_CFG_DIR)/pci_dev.c
 VM_CFG_C_SRCS += $(BOARD_CFG_DIR)/pt_intx.c
 VM_CFG_C_SRCS += $(BOARD_INFO_DIR)/board.c
 VM_CFG_C_SRCS += $(BOARD_INFO_DIR)/bare.c
-ifeq ($(PLATFORM),qemu)
-VM_CFG_S_SRCS += arch/arm64/platform/qemu/lk_image.S
 endif
 
 HOST_C_OBJS := $(patsubst %.c,$(HV_OBJDIR)/%.o,$(HOST_C_SRCS))

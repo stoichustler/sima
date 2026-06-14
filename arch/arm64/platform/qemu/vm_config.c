@@ -4,26 +4,20 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include <types.h>
+#include <bare.h>
 #include <vm_config.h>
 #include <asm/page.h>
 #include <pgtable.h>
 
-#define QEMU_LK_RAM_START		0x40000000UL
-#define QEMU_LK_RAM_SIZE		0x02000000UL
-#define QEMU_ZEPHYR_RAM_START		0x42000000UL
-#define QEMU_ZEPHYR_RAM_SIZE		0x06000000UL
-#define QEMU_CLOT_RAM_START		0x48000000UL
-#define QEMU_CLOT_RAM_SIZE		0x08000000UL
+#include "vm_config.h"
 
-#define QEMU_GUEST_GICD_BASE		0x08000000UL
-#define QEMU_GUEST_GICD_SIZE		0x00010000UL
-#define QEMU_GUEST_GICR_BASE		0x080A0000UL
-#define QEMU_GUEST_GICR_STRIDE		0x00020000UL
-#define QEMU_GUEST_GICR_SIZE		(MAX_PCPU_NUM * QEMU_GUEST_GICR_STRIDE)
-
-#define QEMU_GUEST_UART_BASE		0x09000000UL
-#define QEMU_GUEST_UART_SIZE		0x00001000UL
-#define QEMU_GUEST_UART_IRQ		33U
+extern const uint8_t qemu_lk_image_start[];
+extern const uint8_t qemu_lk_image_size[];
+extern const uint8_t qemu_clot_image_start[];
+extern const uint8_t qemu_clot_image_size[];
+extern const uint8_t qemu_zephyr_image_start[];
+extern const uint8_t qemu_zephyr_image_size[];
 
 /*
  * QEMU keeps a deliberately static VM layout for the SDK bring-up path:
@@ -75,8 +69,8 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 			.name = "zephyr",
 			.kernel_type = KERNEL_RAWIMAGE,
 			.kernel_mod_tag = "zephyr",
-			.kernel_load_addr = 0x42000000UL,
-			.kernel_entry_addr = 0x42000000UL,
+			.kernel_load_addr = QEMU_ZEPHYR_RAM_START,
+			.kernel_entry_addr = QEMU_ZEPHYR_RAM_START,
 		},
 		.arch = {
 			.guest_ram_start = QEMU_ZEPHYR_RAM_START,
@@ -159,3 +153,23 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 };
 
 struct acrn_vm_config *const service_vm_config = &vm_configs[0];
+
+struct bare_boot_option bare_boot_options[] = {
+	{
+		.addr = (uint64_t)qemu_zephyr_image_start,
+		.size = (uint64_t)qemu_zephyr_image_size,
+		.tag = "zephyr",
+	},
+	{
+		.addr = (uint64_t)qemu_lk_image_start,
+		.size = (uint64_t)qemu_lk_image_size,
+		.tag = "lk",
+	},
+	{
+		.addr = (uint64_t)qemu_clot_image_start,
+		.size = (uint64_t)qemu_clot_image_size,
+		.tag = "clot",
+	},
+};
+
+uint16_t n_bare_boot_options = ARRAY_SIZE(bare_boot_options);

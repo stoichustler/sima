@@ -7,7 +7,9 @@
 #ifndef SHELL_PRIV_H
 #define SHELL_PRIV_H
 
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <board_info.h>
+#endif
 #include <spinlock.h>
 #include <asm/page.h>
 

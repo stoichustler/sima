@@ -19,7 +19,9 @@
 #include <asm/security.h>
 #include <notify.h>
 #include <cpu.h>
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <board_info.h>
+#endif
 
 
 struct per_cpu_region {

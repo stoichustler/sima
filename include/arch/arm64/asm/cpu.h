@@ -11,7 +11,9 @@
 #include <types.h>
 #include <lib/util.h>
 #include <logmsg.h>
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <board_info.h>
+#endif
 #include <barrier.h>
 #endif
 

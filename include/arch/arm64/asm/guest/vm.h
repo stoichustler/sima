@@ -8,7 +8,9 @@
 #define ARM64_GUEST_VM_H
 
 #include <types.h>
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <vm_configurations.h>
+#endif
 #include <vuart.h>
 #include <fdt_api.h>
 #include <asm/guest/vgicv3.h>

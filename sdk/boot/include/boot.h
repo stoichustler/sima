@@ -9,7 +9,9 @@
 
 #include <multiboot_std.h>
 #include <efi.h>
+#ifndef CONFIG_STATIC_QEMU_PLATFORM
 #include <vm_configurations.h>
+#endif
 
 /* TODO: MAX_MMAP_ENTRIES shall be config by config tool, and same as E820_MAX_ENTRIES */
 #define MAX_MMAP_ENTRIES		32U
