@@ -114,6 +114,16 @@ uint64_t arm64_platform_guest_gicr_size(uint16_t vm_id)
 	return rk356x_guest_config(vm_id)->guest_gicr_size;
 }
 
+uint64_t arm64_platform_guest_its_base(__unused uint16_t vm_id)
+{
+	return 0UL;
+}
+
+uint64_t arm64_platform_guest_its_size(__unused uint16_t vm_id)
+{
+	return 0UL;
+}
+
 uint64_t arm64_platform_guest_uart_base(uint16_t vm_id)
 {
 	return rk356x_guest_config(vm_id)->guest_uart_base;
@@ -152,6 +162,16 @@ uint64_t arm64_platform_gicr_stride(void)
 uint64_t arm64_platform_gicr_size(void)
 {
 	return RK356X_GICR_SIZE;
+}
+
+uint64_t arm64_platform_gits_base(void)
+{
+	return 0UL;
+}
+
+uint64_t arm64_platform_gits_size(void)
+{
+	return 0UL;
 }
 
 uint64_t arm64_platform_gic_mmio_start(void)

@@ -21,6 +21,7 @@
 #define QEMU_FDT_PHANDLE_RAM		2U
 #define QEMU_FDT_PHANDLE_UART		3U
 #define QEMU_FDT_PHANDLE_UARTCLK	4U
+#define QEMU_FDT_PHANDLE_ITS		5U
 
 #define QEMU_FDT_GIC_SPI		0U
 #define QEMU_FDT_GIC_PPI		1U
@@ -118,6 +119,16 @@ uint64_t arm64_platform_guest_gicr_size(uint16_t vm_id)
 	return qemu_guest_config(vm_id)->guest_gicr_size;
 }
 
+uint64_t arm64_platform_guest_its_base(uint16_t vm_id)
+{
+	return qemu_guest_config(vm_id)->guest_its_base;
+}
+
+uint64_t arm64_platform_guest_its_size(uint16_t vm_id)
+{
+	return qemu_guest_config(vm_id)->guest_its_size;
+}
+
 uint64_t arm64_platform_guest_uart_base(uint16_t vm_id)
 {
 	return qemu_guest_config(vm_id)->guest_uart_base;
@@ -156,6 +167,16 @@ uint64_t arm64_platform_gicr_stride(void)
 uint64_t arm64_platform_gicr_size(void)
 {
 	return QEMU_VIRT_GICR_SIZE;
+}
+
+uint64_t arm64_platform_gits_base(void)
+{
+	return QEMU_VIRT_GITS_BASE;
+}
+
+uint64_t arm64_platform_gits_size(void)
+{
+	return QEMU_VIRT_GITS_SIZE;
 }
 
 uint64_t arm64_platform_gic_mmio_start(void)
@@ -310,6 +331,27 @@ static void fdt_add_gic(void *fdt, struct acrn_vm *vm)
 	fdt_check_ret(fdt_end_node(fdt), "gic end");
 }
 
+static void fdt_add_its(void *fdt, struct acrn_vm *vm)
+{
+	char name[48];
+	uint64_t its_base = arm64_platform_guest_its_base(vm->vm_id);
+	uint64_t its_size = arm64_platform_guest_its_size(vm->vm_id);
+
+	if (its_size == 0UL) {
+		return;
+	}
+
+	snprintf(name, sizeof(name), "msi-controller@%lx", its_base);
+	fdt_check_ret(fdt_begin_node(fdt, name), "its");
+	fdt_check_ret(fdt_property_string(fdt, "compatible", "arm,gic-v3-its"),
+		"its compatible");
+	fdt_check_ret(fdt_property(fdt, "msi-controller", NULL, 0), "its msi-controller");
+	fdt_check_ret(fdt_property_u32(fdt, "#msi-cells", 1U), "its msi-cells");
+	fdt_check_ret(fdt_property_u32(fdt, "phandle", QEMU_FDT_PHANDLE_ITS), "its phandle");
+	fdt_property_reg64(fdt, "reg", its_base, its_size);
+	fdt_check_ret(fdt_end_node(fdt), "its end");
+}
+
 static void fdt_add_timer(void *fdt)
 {
 	static const char timer_compat[] = "arm,armv8-timer\0arm,armv7-timer";
@@ -383,6 +425,7 @@ void arch_init_service_vm_vfdt(struct acrn_vm *vm)
 	fdt_add_psci(fdt);
 	fdt_add_memory(fdt, vm);
 	fdt_add_gic(fdt, vm);
+	fdt_add_its(fdt, vm);
 	fdt_add_timer(fdt);
 	fdt_add_uart_clock(fdt);
 	fdt_add_uart(fdt, vm);

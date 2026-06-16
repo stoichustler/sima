@@ -13,7 +13,7 @@ The wrapper expands to the ARM64 QEMU `virt` command with:
 
 ```bash
 qemu-system-aarch64 \
-  -machine virt,virtualization=on,gic-version=3 \
+  -machine virt,virtualization=on,gic-version=3,its=on \
   -cpu cortex-a57 \
   -smp 8 \
   -m 1024M \
@@ -81,6 +81,7 @@ Current QEMU VM layout:
   - Boot console: `console=ttyAMA0 earlycon=pl011,0x09000000`
   - Identity RAM window: `0x48000000-0x50000000`
   - vCPUs: 4, running on pCPU1, pCPU4, pCPU6, and pCPU7
+  - QEMU vITS window: `0x08080000-0x0809ffff`
   - Login: `root` / `root`
 - pCPU0-pCPU5 model ordinary cores.
 - pCPU6-pCPU7 model performance cores.
@@ -231,6 +232,22 @@ boot logs settle to show the `console:\>` prompt.
   - GICD/GICR `ICFGR` read/write support for SGI/PPI/SPI trigger type state.
   - GICD `IROUTER` low/high word access and SPI target-vCPU delivery.
   - Virtual timer PPI handling and injection back into the running guest vCPU.
+- Initial QEMU GICv3 ITS/vGICv3 ITS support:
+  - QEMU launch and regression use `-machine
+    virt,virtualization=on,gic-version=3,its=on`.
+  - Host GICv3 early init detects and quiesces the QEMU ITS at
+    `0x08080000-0x0809ffff`.
+  - VM2 Linux has a guest ITS window and DT `msi-controller@8080000` node.
+    VM0 Zephyr and VM1 LK do not expose ITS/LPI capability in the QEMU
+    scenario.
+  - vGICv3 advertises LPIs only for VMs with `guest_its_size != 0`, including
+    GICD `LPIS/NumLPIs/IDbits` and GICR `PLPIS`.
+  - vITS models CTLR/IIDR/TYPER/CBASER/CWRITER/CREADR/BASERn/TRANSLATER and
+    the GICR LPI registers needed by Linux ITS setup.
+  - vITS command queue supports MAPD, MAPC, MAPI, MAPTI, MOVI, DISCARD, INT,
+    CLEAR, INV, INVALL, SYNC, and MOVALL for the current software model.
+  - `arm64_vgicv3_inject_msi()` provides the hypervisor-side entry point for
+    injecting a mapped `(device_id, event_id)` as an LPI.
 - ARM64 IRQ domains for CPU-local and GIC interrupts.
 - ARM64 memory logging for host stage-1 and VM stage-2 mappings.
 - ARM64 exception stack dumps print directly to the console without per-line
@@ -300,6 +317,14 @@ The following have been verified on QEMU with `-smp 8`:
 - VM2 Linux no longer stops at `smp: Bringing up secondary CPUs ...` in the
   current 4-vCPU path: logs show CPU1, CPU2, and CPU3 entering EL1 and Linux
   reporting `smp: Brought up 1 node, 4 CPUs`.
+- ITS regression `out/qemu_out/regress-its-vm2-only.log` was run after a
+  successful QEMU build. VM0 Zephyr and VM1 LK passed the regression gate, and
+  VM2 Linux enumerated the virtual ITS:
+  `ITS [mem 0x08080000-0x0809ffff]`,
+  `ITS: Using hypervisor restricted LPI range [8192]`, and allocated LPI
+  pending tables for CPU0-CPU3. VM2 Linux still timed out waiting for
+  `clou login:`, matching the existing VM2 timer/login instability rather than
+  a new ITS-specific panic or warning.
 
 ## VM2 Linux Debug Snapshot
 
@@ -355,6 +380,13 @@ Status as of 2026-06-16:
   runs reached `console [ttyAMA0] enabled`; in both cases the VM2 diagnostic
   state remains centered on virtual timer PPI27 rather than a proven PL011
   interrupt issue.
+- The latest ITS validation keeps VM0/VM1 free of ITS/LPI exposure and exposes
+  vITS only to VM2 Linux. This avoids perturbing RTOS guests while still
+  allowing Linux to exercise GICv3 ITS and LPI table setup.
+- vITS currently advertises a 14-bit LPI INTID space with a Linux-visible
+  hypervisor restricted LPI range of 8192 IDs, but the in-hypervisor descriptor
+  model stores only a compact 256-LPI active window. Mappings outside that
+  active window are ignored until a dynamic LPI descriptor allocator is added.
 - `dumpstat 2` in the bad state repeatedly points at the virtual timer
   lifecycle on CPU0:
   - LR0 can remain as pending-only virtual INTID 27, for example
@@ -397,6 +429,9 @@ Experiments already tried:
   large VM2 slowdown. The useful part to keep is local deadline resampling at
   LR completion/EOI boundaries; avoid arming a backup timer on every vCPU
   unload until the GICv3 LR lifecycle is simpler.
+- Expanding the vITS software model to a static 8192-LPI descriptor array
+  caused QEMU to stop producing useful shell output for more than 60 seconds.
+  Keep the compact active-window model unless dynamic allocation is added.
 - Removing the host PPI27 mask from the timer poll path kept VM0/VM1 passing
   but did not fix VM2 and raised host virtual-timer IRQ counts, so it was
   reverted.
@@ -456,10 +491,15 @@ The ARM64 port is now capable of booting Zephyr, LK, and VM2 Linux on QEMU, but
 it is still a bring-up target rather than a complete architectural
 virtualization port.
 
-- vGICv3 is sufficient for the current Zephyr, LK, and 4-vCPU VM2 Linux
-  boot path, but it is not a complete GICv3 model yet. Active-state stress
-  cases, deeper redistributor behavior, MSI/LPI paths, and richer distributor
+- vGICv3 is sufficient for the current Zephyr, LK, and 4-vCPU VM2 Linux boot
+  path, and now has initial VM2-only vITS/LPI support for Linux ITS
+  enumeration. It is not a complete GICv3/ITS model yet: active-state stress
+  cases, deeper redistributor behavior, PCI/MSI requester identity plumbing,
+  physical ITS passthrough, dynamic LPI allocation, and richer distributor
   coverage still need work.
+- `GITS_TRANSLATER` direct MMIO injection currently uses device ID 0 as a local
+  test path. Real passthrough/MSI code should call `arm64_vgicv3_inject_msi()`
+  after requester identity and event mapping are plumbed.
 - QEMU VM layout is still statically configured in `vm_config.c`;
   QEMU FDT parsing is not yet used to derive VM layout.
 - Zephyr and LK are RTOS raw images and boot with `GUEST_FLAG_NO_FW`. VM2 Linux

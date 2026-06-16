@@ -76,7 +76,7 @@ def main():
     qemu_cmd = [
         args.qemu,
         "-machine",
-        "virt,virtualization=on,gic-version=3",
+        "virt,virtualization=on,gic-version=3,its=on",
         "-cpu",
         "cortex-a57",
         "-smp",

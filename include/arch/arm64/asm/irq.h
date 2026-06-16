@@ -61,6 +61,7 @@ void arm64_gicv3_eoi_irq(uint32_t intid);
 void arm64_gicv3_enable_irq(uint32_t intid);
 void arm64_gicv3_disable_irq(uint32_t intid);
 void arm64_gicv3_clear_irq(uint32_t intid);
+bool arm64_gicv3_has_its(void);
 void arm64_gicv3_get_local_irq_state(uint16_t pcpu_id, uint32_t intid,
 	struct arm64_gicv3_local_irq_state *state);
 void arm64_gicv3_send_sgi(uint16_t pcpu_id, uint32_t sgi_id);

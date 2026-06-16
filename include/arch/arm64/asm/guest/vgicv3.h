@@ -19,6 +19,14 @@
 #define ARM64_VGIC_IRQ_NUM		IRQ_NUM_GIC_DOMAIN
 #define ARM64_VGIC_WORDS		(ARM64_VGIC_IRQ_NUM / 32U)
 #define ARM64_VGIC_MAX_VCPUS		MAX_PCPU_NUM
+#define ARM64_VGIC_LPI_BASE		8192U
+#define ARM64_VGIC_LPI_NUM		256U
+#define ARM64_VGIC_LPI_IDBITS		14U
+#define ARM64_VGIC_LPI_WORDS		(ARM64_VGIC_LPI_NUM / 32U)
+#define ARM64_VGIC_ITS_DEVICE_NUM	16U
+#define ARM64_VGIC_ITS_EVENT_NUM	32U
+#define ARM64_VGIC_ITS_COLLECTION_NUM	ARM64_VGIC_MAX_VCPUS
+#define ARM64_VGIC_ITS_BASER_NUM	8U
 
 #define ARM64_VGIC_MAINTENANCE_INTID	ARM64_GIC_PPI_VGIC_MAINTENANCE
 
@@ -69,6 +77,39 @@ struct arm64_vgic_irq {
 	bool hw;
 };
 
+struct arm64_vits_collection {
+	uint16_t collection_id;
+	uint16_t target_vcpu;
+	bool valid;
+};
+
+struct arm64_vits_device {
+	uint32_t device_id;
+	uint64_t itt_addr;
+	uint16_t event_count;
+	bool valid;
+};
+
+struct arm64_vits_event {
+	uint32_t device_id;
+	uint32_t event_id;
+	uint32_t lpi;
+	uint16_t collection_id;
+	bool valid;
+};
+
+struct arm64_vits {
+	uint32_t ctlr;
+	uint64_t typer;
+	uint64_t cbaser;
+	uint64_t cwriter;
+	uint64_t creadr;
+	uint64_t baser[ARM64_VGIC_ITS_BASER_NUM];
+	struct arm64_vits_collection collection[ARM64_VGIC_ITS_COLLECTION_NUM];
+	struct arm64_vits_device device[ARM64_VGIC_ITS_DEVICE_NUM];
+	struct arm64_vits_event event[ARM64_VGIC_ITS_DEVICE_NUM][ARM64_VGIC_ITS_EVENT_NUM];
+};
+
 /*
  * Per-VM vGIC state. Guest MMIO updates this model, physical events mark IRQs
  * pending here, and flush/sync operations reconcile it with the hardware list
@@ -77,6 +118,7 @@ struct arm64_vgic_irq {
 struct arm64_vgicv3 {
 	spinlock_t lock;
 	bool initialized;
+	bool its_enabled;
 	uint16_t vcpu_count;
 	uint16_t rdist_count;
 	uint32_t lr_count;
@@ -88,7 +130,13 @@ struct arm64_vgicv3 {
 	uint32_t gicr_waker[ARM64_VGIC_MAX_VCPUS];
 	uint64_t spi_router[ARM64_VGIC_SPI_NUM];
 	uint32_t pending_bitmap[ARM64_VGIC_MAX_VCPUS][ARM64_VGIC_WORDS];
+	uint32_t lpi_pending_bitmap[ARM64_VGIC_MAX_VCPUS][ARM64_VGIC_LPI_WORDS];
 	struct arm64_vgic_irq irq[ARM64_VGIC_MAX_VCPUS][ARM64_VGIC_IRQ_NUM];
+	struct arm64_vgic_irq lpi[ARM64_VGIC_MAX_VCPUS][ARM64_VGIC_LPI_NUM];
+	uint32_t gicr_ctlr[ARM64_VGIC_MAX_VCPUS];
+	uint64_t gicr_propbaser[ARM64_VGIC_MAX_VCPUS];
+	uint64_t gicr_pendbaser[ARM64_VGIC_MAX_VCPUS];
+	struct arm64_vits its;
 };
 
 void arm64_vgicv3_global_init(void);
@@ -99,6 +147,7 @@ void arm64_vgicv3_cancel_vtimer_backup(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_load_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_save_vcpu(struct acrn_vcpu *vcpu);
 int32_t arm64_vgicv3_inject_irq(struct acrn_vcpu *vcpu, uint32_t virq, bool level);
+int32_t arm64_vgicv3_inject_msi(struct acrn_vm *vm, uint32_t device_id, uint32_t event_id);
 int32_t arm64_vgicv3_clear_irq(struct acrn_vcpu *vcpu, uint32_t virq);
 int32_t arm64_vgicv3_deassert_irq(struct acrn_vcpu *vcpu, uint32_t virq);
 int32_t arm64_vgicv3_handle_cpuif_sysreg(struct acrn_vcpu *vcpu, uint32_t sysreg,

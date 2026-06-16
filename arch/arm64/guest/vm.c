@@ -174,9 +174,13 @@ static void init_stage2_identity_map(struct acrn_vm *vm)
 		arm64_platform_guest_gicd_size(vm->vm_id));
 	log_stage2_vio(vm, "vgicr", arm64_platform_guest_gicr_base(vm->vm_id),
 		arm64_platform_guest_gicr_size(vm->vm_id));
+	if (arm64_platform_guest_its_size(vm->vm_id) != 0UL) {
+		log_stage2_vio(vm, "vits", arm64_platform_guest_its_base(vm->vm_id),
+			arm64_platform_guest_its_size(vm->vm_id));
+	}
 	log_stage2_vio(vm, "vpl011", arm64_platform_guest_uart_base(vm->vm_id),
 		arm64_platform_guest_uart_size(vm->vm_id));
-	pr_info("vm-%u stage-2 protect writable map is vm ram only; zero page is read-only; vgic and vpl011 are vio mmio",
+	pr_info("vm-%u stage-2 protect writable map is vm ram only; zero page is read-only; vgic/vits/vpl011 are vio mmio",
 		vm->vm_id);
 }
 
@@ -184,6 +188,8 @@ static void register_arm64_vio_mmio(struct acrn_vm *vm)
 {
 	uint64_t gicd_base = arm64_platform_guest_gicd_base(vm->vm_id);
 	uint64_t gicr_base = arm64_platform_guest_gicr_base(vm->vm_id);
+	uint64_t its_base = arm64_platform_guest_its_base(vm->vm_id);
+	uint64_t its_size = arm64_platform_guest_its_size(vm->vm_id);
 	uint64_t uart_base = arm64_platform_guest_uart_base(vm->vm_id);
 
 	/*
@@ -197,6 +203,10 @@ static void register_arm64_vio_mmio(struct acrn_vm *vm)
 	register_mmio_emulation_handler(vm, arm64_vgicv3_mmio_handler,
 		gicr_base, gicr_base + arm64_platform_guest_gicr_size(vm->vm_id),
 		&vm->arch_vm.vgic, false);
+	if (its_size != 0UL) {
+		register_mmio_emulation_handler(vm, arm64_vgicv3_mmio_handler,
+			its_base, its_base + its_size, &vm->arch_vm.vgic, false);
+	}
 	register_mmio_emulation_handler(vm, arm64_vpl011_mmio_handler,
 		uart_base, uart_base + arm64_platform_guest_uart_size(vm->vm_id),
 		vm, false);

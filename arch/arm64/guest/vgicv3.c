@@ -13,6 +13,7 @@
 #include <irq.h>
 #include <logmsg.h>
 #include <rtl.h>
+#include <guest_memory.h>
 #include <ticks.h>
 #include <timer.h>
 #include <asm/platform.h>
@@ -52,14 +53,25 @@
 #define VGICR_IIDR			0x0004U
 #define VGICR_TYPER			0x0008U
 #define VGICR_WAKER			0x0014U
+#define VGICR_PROPBASER		0x0070U
+#define VGICR_PENDBASER		0x0078U
+#define VGICR_INVLPIR			0x00A0U
+#define VGICR_INVALLR			0x00B0U
+#define VGICR_SYNCR			0x00C0U
 #define VGICR_PIDR2			0xFFE8U
 #define VGICR_SGI_BASE			0x10000U
 #define VGICR_SGI_END			(VGICR_SGI_BASE + 0x10000U)
 
+#define VGICR_CTLR_ENABLE_LPIS	BIT32(0U)
+#define VGICR_CTLR_RWP		BIT32(3U)
 #define VGIC_CTLR_ENABLE_G1		BIT32(1U)
 #define VGIC_CTLR_ARE_NS		BIT32(5U)
 #define VGICD_CTLR_RWP		BIT32(31U)
+#define VGICD_TYPER_LPIS		BIT32(17U)
+#define VGICD_TYPER_NUM_LPIS_SHIFT	11U
+#define VGICD_TYPER_IDBITS_SHIFT	19U
 #define VGICR_TYPER_LAST		(1UL << 4U)
+#define VGICR_TYPER_PLPIS		(1UL << 0U)
 #define VGICR_TYPER_PROCNUM_SHIFT	8U
 #define VGICR_TYPER_AFF_SHIFT		32U
 #define VGICR_WAKER_PROCESSOR_SLEEP	BIT32(1U)
@@ -90,6 +102,52 @@
 #define VGIC_INVALID_VCPU_ID		0xffffU
 #define VGIC_INVALID_AFFINITY		0xffUL
 
+#define GITS_CTLR			0x0000U
+#define GITS_IIDR			0x0004U
+#define GITS_TYPER			0x0008U
+#define GITS_MPIDR			0x0018U
+#define GITS_CBASER			0x0080U
+#define GITS_CWRITER			0x0088U
+#define GITS_CREADR			0x0090U
+#define GITS_BASER			0x0100U
+#define GITS_TRANSLATER		0x10040U
+#define GITS_PIDR2			0xFFE8U
+#define GITS_CIDR0			0xFFF0U
+#define GITS_CIDR1			0xFFF4U
+#define GITS_CIDR2			0xFFF8U
+#define GITS_CIDR3			0xFFFCU
+
+#define GITS_CTLR_ENABLE		BIT32(0U)
+#define GITS_CTLR_QUIESCENT		BIT32(31U)
+#define GITS_CBASER_VALID		(1UL << 63U)
+#define GITS_CBASER_ADDRESS_MASK	0x0000fffffffff000UL
+#define GITS_CBASER_SIZE_MASK		0xffUL
+#define GITS_BASER_VALID		(1UL << 63U)
+#define GITS_CMD_ITT_ADDRESS_MASK	0x000fffffffffff00UL
+#define GITS_BASER_TYPE_SHIFT		56U
+#define GITS_BASER_ENTRY_SIZE_SHIFT	48U
+#define GITS_BASER_TYPE_DEVICE	1U
+#define GITS_BASER_TYPE_COLLECTION	4U
+#define GITS_TYPER_PLPIS		(1UL << 0U)
+#define GITS_TYPER_ITT_ENTRY_SIZE_SHIFT	4U
+#define GITS_TYPER_IDBITS_SHIFT	8U
+#define GITS_TYPER_DEVBITS_SHIFT	13U
+#define GITS_CMD_SIZE			32U
+#define GITS_CMD_MAPD			0x08U
+#define GITS_CMD_MAPC			0x09U
+#define GITS_CMD_MAPTI			0x0aU
+#define GITS_CMD_MAPI			0x0bU
+#define GITS_CMD_MOVI			0x01U
+#define GITS_CMD_INT			0x03U
+#define GITS_CMD_CLEAR			0x04U
+#define GITS_CMD_SYNC			0x05U
+#define GITS_CMD_INV			0x0cU
+#define GITS_CMD_INVALL		0x0dU
+#define GITS_CMD_MOVALL		0x0eU
+#define GITS_CMD_DISCARD		0x0fU
+#define GITS_DEVBITS			15U
+#define GITS_ITT_ENTRY_SIZE		16U
+
 static uint32_t vgic_lr_count;
 static bool vgic_global_initialized;
 
@@ -97,6 +155,14 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current);
 static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current);
 static int32_t vgicv3_inject_current_timer(struct acrn_vcpu *vcpu, uint32_t virq,
 	uint32_t guest_ctl, uint64_t guest_cval);
+static int32_t vgic_inject_locked(struct arm64_vgicv3 *vgic,
+	struct acrn_vcpu *target_vcpu, uint32_t virq, bool level);
+static struct arm64_vits_event *vits_find_event(struct arm64_vits *its,
+	uint32_t device_id, uint32_t event_id);
+static void vits_inject_event_locked(struct acrn_vm *vm, struct arm64_vgicv3 *vgic,
+	struct arm64_vits_event *event);
+static uint32_t vgic_lpi_index(uint32_t lpi);
+static bool vgic_irq_is_lpi(uint32_t virq);
 
 static uint32_t min_u32(uint32_t a, uint32_t b)
 {
@@ -125,11 +191,14 @@ static struct arm64_vgic_irq *vgic_irq_desc(struct acrn_vcpu *vcpu, uint32_t vir
 	struct arm64_vgic_irq *desc = NULL;
 	struct arm64_vgicv3 *vgic;
 
-	if ((vcpu != NULL) && (vcpu->vm != NULL) && (virq < ARM64_VGIC_IRQ_NUM) &&
-		(vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
+	if ((vcpu != NULL) && (vcpu->vm != NULL) && (vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
 		vgic = &vcpu->vm->arch_vm.vgic;
 		if (vgic->initialized) {
-			desc = &vgic->irq[vcpu->vcpu_id][virq];
+			if (virq < ARM64_VGIC_IRQ_NUM) {
+				desc = &vgic->irq[vcpu->vcpu_id][virq];
+			} else if (vgic->its_enabled && vgic_irq_is_lpi(virq)) {
+				desc = &vgic->lpi[vcpu->vcpu_id][vgic_lpi_index(virq)];
+			}
 		}
 	}
 
@@ -163,18 +232,44 @@ static uint32_t vgic_irq_bit(uint32_t virq)
 	return virq % 32U;
 }
 
+static uint32_t vgic_lpi_index(uint32_t lpi)
+{
+	return lpi - ARM64_VGIC_LPI_BASE;
+}
+
 static bool vgic_irq_is_spi(uint32_t virq)
 {
 	return (virq >= ARM64_VGIC_LOCAL_IRQ_NUM) && (virq < ARM64_VGIC_IRQ_NUM);
 }
 
+static bool vgic_irq_is_lpi(uint32_t virq)
+{
+	return (virq >= ARM64_VGIC_LPI_BASE) &&
+		(virq < (ARM64_VGIC_LPI_BASE + ARM64_VGIC_LPI_NUM));
+}
+
 static void vgic_set_pending(struct arm64_vgicv3 *vgic, uint16_t vcpu_id,
 	struct arm64_vgic_irq *desc, bool pending)
 {
-	uint32_t word = vgic_irq_word(desc->virq);
-	uint32_t mask = BIT32(vgic_irq_bit(desc->virq));
+	uint32_t virq = desc->virq;
+	uint32_t word;
+	uint32_t mask;
 
 	desc->pending = pending;
+	if (vgic_irq_is_lpi(virq)) {
+		virq -= ARM64_VGIC_LPI_BASE;
+		word = vgic_irq_word(virq);
+		mask = BIT32(vgic_irq_bit(virq));
+		if (pending) {
+			vgic->lpi_pending_bitmap[vcpu_id][word] |= mask;
+		} else {
+			vgic->lpi_pending_bitmap[vcpu_id][word] &= ~mask;
+		}
+		return;
+	}
+
+	word = vgic_irq_word(virq);
+	mask = BIT32(vgic_irq_bit(virq));
 	if (pending) {
 		vgic->pending_bitmap[vcpu_id][word] |= mask;
 	} else {
@@ -244,6 +339,40 @@ static uint64_t vgic_vtimer_guest_cval(const struct arm64_vcpu_guest_ctx *gctx)
 static uint64_t vgic_vtimer_host_deadline(const struct arm64_vcpu_guest_ctx *gctx)
 {
 	return vgic_vtimer_guest_cval(gctx) - gctx->cntvoff_el2;
+}
+
+static uint64_t vgic_its_baser_type(uint32_t type, uint32_t entry_size)
+{
+	return ((uint64_t)type << GITS_BASER_TYPE_SHIFT) |
+		((uint64_t)(entry_size - 1U) << GITS_BASER_ENTRY_SIZE_SHIFT);
+}
+
+static void vgic_its_init(struct arm64_vgicv3 *vgic)
+{
+	struct arm64_vits *its = &vgic->its;
+	uint32_t idx;
+
+	(void)memset(its, 0U, sizeof(*its));
+	/*
+	 * Advertise a conservative ITS: physical LPIs only, 14-bit INTID space
+	 * starting at 8192, 16-bit device IDs, and 16-byte ITT entries. vGICv4
+	 * VLPIs are deliberately not exposed in this first model. The software
+	 * vITS stores only a small active event window; it does not preallocate
+	 * descriptors for the whole advertised LPI space.
+	 */
+	its->ctlr = GITS_CTLR_QUIESCENT;
+	its->typer = GITS_TYPER_PLPIS |
+		((uint64_t)(GITS_ITT_ENTRY_SIZE - 1U) << GITS_TYPER_ITT_ENTRY_SIZE_SHIFT) |
+		((uint64_t)(ARM64_VGIC_LPI_IDBITS - 1U) << GITS_TYPER_IDBITS_SHIFT) |
+		((uint64_t)(GITS_DEVBITS - 1U) << GITS_TYPER_DEVBITS_SHIFT);
+	its->baser[0U] = vgic_its_baser_type(GITS_BASER_TYPE_DEVICE, 8U);
+	its->baser[1U] = vgic_its_baser_type(GITS_BASER_TYPE_COLLECTION, 8U);
+
+	for (idx = 0U; idx < ARM64_VGIC_ITS_COLLECTION_NUM; idx++) {
+		its->collection[idx].collection_id = (uint16_t)idx;
+		its->collection[idx].target_vcpu = (uint16_t)idx;
+		its->collection[idx].valid = (idx < vgic->vcpu_count);
+	}
 }
 
 static void vgicv3_disarm_vtimer_backup(struct acrn_vcpu *vcpu)
@@ -363,9 +492,15 @@ static uint64_t make_lr_state(const struct arm64_vgic_irq *desc, bool pending, b
 static bool vgic_irq_deliverable(const struct arm64_vgicv3 *vgic,
 	const struct acrn_vcpu *vcpu, const struct arm64_vgic_irq *desc)
 {
-	return ((vgic->gicd_ctlr & VGIC_CTLR_ENABLE_G1) != 0U) &&
-		((vcpu->arch.vgic.vmcr & ICH_VMCR_VENG1) != 0UL) &&
-		desc->enabled;
+	bool enabled = ((vgic->gicd_ctlr & VGIC_CTLR_ENABLE_G1) != 0U) &&
+		((vcpu->arch.vgic.vmcr & ICH_VMCR_VENG1) != 0UL) && desc->enabled;
+
+	if (enabled && vgic_irq_is_lpi(desc->virq)) {
+		enabled = (vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS) &&
+			((vgic->gicr_ctlr[vcpu->vcpu_id] & VGICR_CTLR_ENABLE_LPIS) != 0U);
+	}
+
+	return enabled;
 }
 
 static uint64_t make_lr(const struct arm64_vgic_irq *desc)
@@ -756,8 +891,14 @@ void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity)
 	vgic->lr_count = vgic_lr_count;
 	vgic->vmcr = (uint32_t)(VGIC_VMCR_GROUP_ENABLES | ICH_VMCR_DEFAULT_MASK);
 	vgic->gicd_ctlr = VGIC_CTLR_ARE_NS | VGIC_CTLR_ENABLE_G1;
+	vgic->its_enabled = (arm64_platform_guest_its_size(vm->vm_id) != 0UL);
 	vgic->gicd_typer = (((ARM64_VGIC_IRQ_NUM / 32U) - 1U) & 0x1fU) |
 		(((uint32_t)(vgic->vcpu_count - 1U) & 0x7U) << 5U);
+	if (vgic->its_enabled) {
+		vgic->gicd_typer |= (12U << VGICD_TYPER_NUM_LPIS_SHIFT) |
+			VGICD_TYPER_LPIS |
+			((ARM64_VGIC_LPI_IDBITS - 1U) << VGICD_TYPER_IDBITS_SHIFT);
+	}
 	vgic->gicd_pidr2 = GIC_PIDR2_ARCH_GICV3;
 
 	for (idx = 0U; idx < ARM64_VGIC_MAX_VCPUS; idx++) {
@@ -775,12 +916,27 @@ void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity)
 			desc->group1 = true;
 			desc->groupmod = false;
 		}
+		for (virq = 0U; virq < ARM64_VGIC_LPI_NUM; virq++) {
+			struct arm64_vgic_irq *desc = &vgic->lpi[idx][virq];
+
+			desc->virq = (uint16_t)(ARM64_VGIC_LPI_BASE + virq);
+			desc->pirq = 0xffffU;
+			desc->priority = GIC_PRIORITY_DEFAULT;
+			desc->target_vcpu = (uint8_t)idx;
+			desc->enabled = true;
+			desc->level = false;
+			desc->group1 = true;
+			desc->groupmod = false;
+		}
 	}
 
 	for (spi = 0U; spi < ARM64_VGIC_SPI_NUM; spi++) {
 		vgic->spi_router[spi] = 0UL;
 	}
 
+	if (vgic->its_enabled) {
+		vgic_its_init(vgic);
+	}
 	vgic->initialized = true;
 }
 
@@ -1270,6 +1426,21 @@ bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu)
 			}
 		}
 	}
+	for (word = 0U; vgic->its_enabled && !pending && (word < ARM64_VGIC_LPI_WORDS); word++) {
+		uint32_t bits = vgic->lpi_pending_bitmap[vcpu->vcpu_id][word];
+
+		while (bits != 0U) {
+			uint32_t bit = (uint32_t)ffs64((uint64_t)bits);
+			uint32_t lpi = ARM64_VGIC_LPI_BASE + (word * 32U) + bit;
+			struct arm64_vgic_irq *desc = &vgic->lpi[vcpu->vcpu_id][lpi - ARM64_VGIC_LPI_BASE];
+
+			bits &= ~BIT32(bit);
+			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc)) {
+				pending = true;
+				break;
+			}
+		}
+	}
 	spinlock_irqrestore_release(&vgic->lock, flags);
 
 	return pending;
@@ -1326,6 +1497,45 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				continue;
 			}
 
+			if (ctx->used_lrs >= vgic->lr_count) {
+				ctx->hcr |= ICH_HCR_UIE;
+				break;
+			}
+
+			ctx->lr[ctx->used_lrs] = make_lr(desc);
+			ctx->used_lrs++;
+			vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
+		}
+
+		if ((ctx->hcr & ICH_HCR_UIE) != 0UL) {
+			break;
+		}
+	}
+
+	for (word = 0U; vgic->its_enabled && (word < ARM64_VGIC_LPI_WORDS); word++) {
+		uint32_t bits = vgic->lpi_pending_bitmap[vcpu->vcpu_id][word];
+
+		while (bits != 0U) {
+			uint32_t bit = (uint32_t)ffs64((uint64_t)bits);
+			uint32_t lpi = ARM64_VGIC_LPI_BASE + (word * 32U) + bit;
+			struct arm64_vgic_irq *desc = &vgic->lpi[vcpu->vcpu_id][lpi - ARM64_VGIC_LPI_BASE];
+			int32_t lr_idx;
+
+			bits &= ~BIT32(bit);
+			if (!desc->pending) {
+				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
+				continue;
+			}
+			if (!vgic_irq_deliverable(vgic, vcpu, desc)) {
+				continue;
+			}
+
+			lr_idx = find_lr_for_virq(vcpu, lpi);
+			if (lr_idx >= 0) {
+				ctx->lr[lr_idx] = make_lr(desc);
+				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
+				continue;
+			}
 			if (ctx->used_lrs >= vgic->lr_count) {
 				ctx->hcr |= ICH_HCR_UIE;
 				break;
@@ -1442,6 +1652,27 @@ int32_t arm64_vgicv3_inject_irq(struct acrn_vcpu *vcpu, uint32_t virq, bool leve
 				signal_event(&target_vcpu->events[ARM64_VCPU_EVENT_VIRTUAL_INTERRUPT]);
 			}
 		}
+	}
+
+	return ret;
+}
+
+int32_t arm64_vgicv3_inject_msi(struct acrn_vm *vm, uint32_t device_id, uint32_t event_id)
+{
+	struct arm64_vgicv3 *vgic;
+	struct arm64_vits_event *event;
+	uint64_t flags;
+	int32_t ret = -EINVAL;
+
+	if ((vm != NULL) && vm->arch_vm.vgic.initialized && vm->arch_vm.vgic.its_enabled) {
+		vgic = &vm->arch_vm.vgic;
+		spinlock_irqsave_obtain(&vgic->lock, &flags);
+		event = vits_find_event(&vgic->its, device_id, event_id);
+		if (event != NULL) {
+			vits_inject_event_locked(vm, vgic, event);
+			ret = 0;
+		}
+		spinlock_irqrestore_release(&vgic->lock, flags);
 	}
 
 	return ret;
@@ -2305,6 +2536,309 @@ static void vgic_write_irouter_word(struct acrn_vm *vm, struct arm64_vgicv3 *vgi
 	vgic_set_spi_target(vm, reg->virq, target_vcpu_id);
 }
 
+static struct arm64_vits_collection *vits_find_collection(struct arm64_vits *its,
+	uint16_t collection_id)
+{
+	uint32_t idx;
+
+	for (idx = 0U; idx < ARM64_VGIC_ITS_COLLECTION_NUM; idx++) {
+		if (its->collection[idx].collection_id == collection_id) {
+			return &its->collection[idx];
+		}
+	}
+
+	return NULL;
+}
+
+static struct arm64_vits_device *vits_find_device(struct arm64_vits *its, uint32_t device_id)
+{
+	uint32_t idx;
+
+	for (idx = 0U; idx < ARM64_VGIC_ITS_DEVICE_NUM; idx++) {
+		if (its->device[idx].valid && (its->device[idx].device_id == device_id)) {
+			return &its->device[idx];
+		}
+	}
+
+	return NULL;
+}
+
+static struct arm64_vits_device *vits_alloc_device(struct arm64_vits *its, uint32_t device_id)
+{
+	uint32_t idx;
+
+	for (idx = 0U; idx < ARM64_VGIC_ITS_DEVICE_NUM; idx++) {
+		if (!its->device[idx].valid) {
+			its->device[idx].device_id = device_id;
+			its->device[idx].valid = true;
+			return &its->device[idx];
+		}
+	}
+
+	return NULL;
+}
+
+static struct arm64_vits_event *vits_find_event(struct arm64_vits *its,
+	uint32_t device_id, uint32_t event_id)
+{
+	uint32_t dev_idx;
+	uint32_t evt_idx;
+
+	for (dev_idx = 0U; dev_idx < ARM64_VGIC_ITS_DEVICE_NUM; dev_idx++) {
+		if (!its->device[dev_idx].valid || (its->device[dev_idx].device_id != device_id)) {
+			continue;
+		}
+		for (evt_idx = 0U; evt_idx < ARM64_VGIC_ITS_EVENT_NUM; evt_idx++) {
+			if (its->event[dev_idx][evt_idx].valid &&
+				(its->event[dev_idx][evt_idx].event_id == event_id)) {
+				return &its->event[dev_idx][evt_idx];
+			}
+		}
+	}
+
+	return NULL;
+}
+
+static struct arm64_vits_event *vits_alloc_event(struct arm64_vits *its,
+	uint32_t device_id, uint32_t event_id)
+{
+	uint32_t dev_idx;
+	uint32_t evt_idx;
+
+	for (dev_idx = 0U; dev_idx < ARM64_VGIC_ITS_DEVICE_NUM; dev_idx++) {
+		if (!its->device[dev_idx].valid || (its->device[dev_idx].device_id != device_id)) {
+			continue;
+		}
+		for (evt_idx = 0U; evt_idx < ARM64_VGIC_ITS_EVENT_NUM; evt_idx++) {
+			if (!its->event[dev_idx][evt_idx].valid) {
+				its->event[dev_idx][evt_idx].device_id = device_id;
+				its->event[dev_idx][evt_idx].event_id = event_id;
+				its->event[dev_idx][evt_idx].valid = true;
+				return &its->event[dev_idx][evt_idx];
+			}
+		}
+	}
+
+	return NULL;
+}
+
+static uint16_t vits_target_vcpu_id(struct arm64_vgicv3 *vgic, uint16_t collection_id)
+{
+	struct arm64_vits_collection *collection = vits_find_collection(&vgic->its, collection_id);
+	uint16_t target = 0U;
+
+	if ((collection != NULL) && collection->valid) {
+		target = vgic_valid_target_vcpu(vgic, collection->target_vcpu);
+	}
+
+	return target;
+}
+
+static void vits_inject_event_locked(struct acrn_vm *vm, struct arm64_vgicv3 *vgic,
+	struct arm64_vits_event *event)
+{
+	struct acrn_vcpu *target_vcpu;
+	struct arm64_vgic_irq *desc;
+	uint16_t target_vcpu_id;
+
+	if ((event == NULL) || !event->valid || !vgic_irq_is_lpi(event->lpi)) {
+		return;
+	}
+
+	target_vcpu_id = vits_target_vcpu_id(vgic, event->collection_id);
+	target_vcpu = vcpu_from_vid(vm, target_vcpu_id);
+	desc = vgic_irq_desc(target_vcpu, event->lpi);
+	if (desc != NULL) {
+		desc->target_vcpu = (uint8_t)target_vcpu_id;
+		desc->level = false;
+		vgic_inject_locked(vgic, target_vcpu, event->lpi, false);
+		if (target_vcpu->state != VCPU_OFFLINE) {
+			vcpu_make_request(target_vcpu, ARM64_VCPU_REQUEST_EVENT);
+			signal_event(&target_vcpu->events[ARM64_VCPU_EVENT_VIRTUAL_INTERRUPT]);
+			if (target_vcpu->state == VCPU_RUNNING) {
+				kick_vcpu(target_vcpu);
+			}
+		}
+	}
+}
+
+static void vits_drop_device(struct arm64_vits *its, uint32_t device_id)
+{
+	uint32_t dev_idx;
+	uint32_t evt_idx;
+
+	for (dev_idx = 0U; dev_idx < ARM64_VGIC_ITS_DEVICE_NUM; dev_idx++) {
+		if (!its->device[dev_idx].valid || (its->device[dev_idx].device_id != device_id)) {
+			continue;
+		}
+		for (evt_idx = 0U; evt_idx < ARM64_VGIC_ITS_EVENT_NUM; evt_idx++) {
+			its->event[dev_idx][evt_idx].valid = false;
+		}
+		(void)memset(&its->device[dev_idx], 0U, sizeof(its->device[dev_idx]));
+		break;
+	}
+}
+
+static void vits_execute_cmd(struct acrn_vm *vm, struct arm64_vgicv3 *vgic,
+	const uint64_t cmd[4])
+{
+	struct arm64_vits *its = &vgic->its;
+	uint32_t opcode = (uint32_t)(cmd[0] & 0xffUL);
+	uint32_t device_id = (uint32_t)(cmd[0] >> 32U);
+	uint32_t event_id = (uint32_t)(cmd[1] & UINT32_MAX);
+	uint32_t lpi = (uint32_t)(cmd[1] >> 32U);
+	uint16_t collection_id = (uint16_t)(cmd[2] & 0xffffUL);
+	bool valid = ((cmd[2] & (1UL << 63U)) != 0UL);
+	struct arm64_vits_device *device;
+	struct arm64_vits_event *event;
+	struct arm64_vits_collection *collection;
+
+	switch (opcode) {
+	case GITS_CMD_MAPD:
+		if (!valid) {
+			vits_drop_device(its, device_id);
+			break;
+		}
+		device = vits_find_device(its, device_id);
+		if (device == NULL) {
+			device = vits_alloc_device(its, device_id);
+		}
+		if (device != NULL) {
+			uint32_t size = (uint32_t)(cmd[1] & 0x1fUL) + 1U;
+
+			device->itt_addr = cmd[2] & GITS_CMD_ITT_ADDRESS_MASK;
+			device->event_count = (size < 16U) ? (uint16_t)(1U << size) :
+				ARM64_VGIC_ITS_EVENT_NUM;
+			if (device->event_count > ARM64_VGIC_ITS_EVENT_NUM) {
+				device->event_count = ARM64_VGIC_ITS_EVENT_NUM;
+			}
+		}
+		break;
+	case GITS_CMD_MAPC:
+		collection = vits_find_collection(its, collection_id);
+		if (collection != NULL) {
+			collection->valid = valid;
+			collection->target_vcpu =
+				vgic_valid_target_vcpu(vgic, (uint16_t)((cmd[2] >> 16U) & 0xffffU));
+		}
+		break;
+	case GITS_CMD_MAPI:
+		lpi = ARM64_VGIC_LPI_BASE + event_id;
+		/* fall through */
+	case GITS_CMD_MAPTI:
+		if (!vgic_irq_is_lpi(lpi) || (vits_find_device(its, device_id) == NULL)) {
+			break;
+		}
+		event = vits_find_event(its, device_id, event_id);
+		if (event == NULL) {
+			event = vits_alloc_event(its, device_id, event_id);
+		}
+		if (event != NULL) {
+			event->lpi = lpi;
+			event->collection_id = collection_id;
+			if (vgic_irq_is_lpi(lpi)) {
+				uint32_t lpi_idx = vgic_lpi_index(lpi);
+				uint16_t target;
+
+				for (target = 0U; target < vgic->vcpu_count; target++) {
+					vgic->lpi[target][lpi_idx].enabled = true;
+					vgic->lpi[target][lpi_idx].priority = GIC_PRIORITY_DEFAULT;
+				}
+			}
+		}
+		break;
+	case GITS_CMD_MOVI:
+		event = vits_find_event(its, device_id, event_id);
+		if (event != NULL) {
+			event->collection_id = collection_id;
+		}
+		break;
+	case GITS_CMD_DISCARD:
+		event = vits_find_event(its, device_id, event_id);
+		if (event != NULL) {
+			event->valid = false;
+		}
+		break;
+	case GITS_CMD_INT:
+		vits_inject_event_locked(vm, vgic, vits_find_event(its, device_id, event_id));
+		break;
+	case GITS_CMD_CLEAR:
+		event = vits_find_event(its, device_id, event_id);
+		if ((event != NULL) && vgic_irq_is_lpi(event->lpi)) {
+			uint16_t target = vits_target_vcpu_id(vgic, event->collection_id);
+			struct arm64_vgic_irq *desc = &vgic->lpi[target][vgic_lpi_index(event->lpi)];
+
+			vgic_set_pending(vgic, target, desc, false);
+			desc->active = false;
+			vgic_update_irq_row_lr(vm, target, desc);
+		}
+		break;
+	case GITS_CMD_INV:
+	case GITS_CMD_INVALL:
+	case GITS_CMD_SYNC:
+	case GITS_CMD_MOVALL:
+		break;
+	default:
+		break;
+	}
+}
+
+static uint64_t vits_cmd_queue_base(const struct arm64_vits *its)
+{
+	return its->cbaser & GITS_CBASER_ADDRESS_MASK;
+}
+
+static uint64_t vits_cmd_queue_size(const struct arm64_vits *its)
+{
+	return (((its->cbaser & GITS_CBASER_SIZE_MASK) + 1UL) * PAGE_SIZE);
+}
+
+static void vits_process_command_queue(struct acrn_vm *vm, struct arm64_vgicv3 *vgic)
+{
+	struct arm64_vits *its = &vgic->its;
+	uint64_t base = vits_cmd_queue_base(its);
+	uint64_t size = vits_cmd_queue_size(its);
+	uint64_t reader = its->creadr;
+	uint64_t writer = its->cwriter;
+
+	if (((its->ctlr & GITS_CTLR_ENABLE) == 0U) ||
+		((its->cbaser & GITS_CBASER_VALID) == 0UL) ||
+		(size < GITS_CMD_SIZE)) {
+		its->creadr = writer;
+		return;
+	}
+
+	reader %= size;
+	writer %= size;
+	while (reader != writer) {
+		uint64_t cmd[4];
+
+		if (copy_from_gpa(vm, cmd, base + reader, sizeof(cmd)) != 0) {
+			break;
+		}
+		vits_execute_cmd(vm, vgic, cmd);
+		reader += GITS_CMD_SIZE;
+		if (reader >= size) {
+			reader = 0UL;
+		}
+	}
+
+	its->creadr = reader;
+}
+
+static void vits_write_translater(struct acrn_vm *vm, struct arm64_vgicv3 *vgic,
+	uint32_t event_id)
+{
+	/*
+	 * A real MSI write carries the requester/device identity in the bus
+	 * transaction. The current QEMU SDK path has no PCI requester plumbing yet,
+	 * so direct writes to the vITS doorbell use DeviceID 0 as a deterministic
+	 * local test path. Passthrough/MSI code should call arm64_vgicv3_inject_msi()
+	 * with the real DeviceID once that layer exists.
+	 */
+	vits_inject_event_locked(vm, vgic, vits_find_event(&vgic->its, 0U, event_id));
+}
+
 static void vgicd_mmio_read(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 	struct acrn_mmio_request *mmio, uint32_t offset)
 {
@@ -2498,6 +3032,9 @@ static uint64_t vgicr_typer_value(const struct arm64_vgicv3 *vgic, const struct 
 	uint64_t typer = ((uint64_t)frame->pcpu_id << VGICR_TYPER_PROCNUM_SHIFT) |
 		(affinity << VGICR_TYPER_AFF_SHIFT);
 
+	if (vgic->its_enabled) {
+		typer |= VGICR_TYPER_PLPIS;
+	}
 	if (frame->pcpu_id == (vgic->rdist_count - 1U)) {
 		typer |= VGICR_TYPER_LAST;
 	}
@@ -2588,7 +3125,7 @@ static void vgicr_mmio_read(struct arm64_vgicv3 *vgic,
 	 */
 	switch (offset) {
 	case VGICR_CTLR:
-		mmio->value = 0UL;
+		mmio->value = vgic->gicr_ctlr[frame->pcpu_id] & ~VGICR_CTLR_RWP;
 		break;
 	case VGICR_IIDR:
 		mmio->value = arm64_platform_gic_iidr();
@@ -2603,6 +3140,21 @@ static void vgicr_mmio_read(struct arm64_vgicv3 *vgic,
 		break;
 	case VGICR_WAKER:
 		mmio->value = vgic->gicr_waker[frame->pcpu_id] & VGICR_WAKER_READ_MASK;
+		break;
+	case VGICR_PROPBASER:
+		mmio->value = vgic->gicr_propbaser[frame->pcpu_id] & UINT32_MAX;
+		break;
+	case VGICR_PROPBASER + 4U:
+		mmio->value = vgic->gicr_propbaser[frame->pcpu_id] >> 32U;
+		break;
+	case VGICR_PENDBASER:
+		mmio->value = vgic->gicr_pendbaser[frame->pcpu_id] & UINT32_MAX;
+		break;
+	case VGICR_PENDBASER + 4U:
+		mmio->value = vgic->gicr_pendbaser[frame->pcpu_id] >> 32U;
+		break;
+	case VGICR_SYNCR:
+		mmio->value = 0UL;
 		break;
 	case VGICR_PIDR2:
 		mmio->value = GIC_PIDR2_ARCH_GICV3;
@@ -2626,8 +3178,48 @@ static bool vgicr_mmio_write(struct arm64_vgicv3 *vgic, struct acrn_vcpu *target
 	bool flush = false;
 
 	switch (frame->offset) {
+	case VGICR_CTLR:
+		if (vgic->its_enabled) {
+			vgic->gicr_ctlr[frame->pcpu_id] =
+				(uint32_t)mmio->value & VGICR_CTLR_ENABLE_LPIS;
+			flush = (target_vcpu != NULL);
+		}
+		break;
 	case VGICR_WAKER:
 		vgicr_write_waker(vgic, frame->pcpu_id, (uint32_t)mmio->value);
+		break;
+	case VGICR_PROPBASER:
+		if (vgic->its_enabled) {
+			vgic->gicr_propbaser[frame->pcpu_id] =
+				(vgic->gicr_propbaser[frame->pcpu_id] & 0xffffffff00000000UL) |
+				(mmio->value & UINT32_MAX);
+		}
+		break;
+	case VGICR_PROPBASER + 4U:
+		if (vgic->its_enabled) {
+			vgic->gicr_propbaser[frame->pcpu_id] =
+				(vgic->gicr_propbaser[frame->pcpu_id] & UINT32_MAX) |
+				((mmio->value & UINT32_MAX) << 32U);
+		}
+		break;
+	case VGICR_PENDBASER:
+		if (vgic->its_enabled) {
+			vgic->gicr_pendbaser[frame->pcpu_id] =
+				(vgic->gicr_pendbaser[frame->pcpu_id] & 0xffffffff00000000UL) |
+				(mmio->value & UINT32_MAX);
+		}
+		break;
+	case VGICR_PENDBASER + 4U:
+		if (vgic->its_enabled) {
+			vgic->gicr_pendbaser[frame->pcpu_id] =
+				(vgic->gicr_pendbaser[frame->pcpu_id] & UINT32_MAX) |
+				((mmio->value & UINT32_MAX) << 32U);
+		}
+		break;
+	case VGICR_INVLPIR:
+	case VGICR_INVLPIR + 4U:
+	case VGICR_INVALLR:
+	case VGICR_INVALLR + 4U:
 		break;
 	case VGICR_SGI_BASE ... (VGICR_SGI_END - 1U):
 		if (target_vcpu != NULL) {
@@ -2703,6 +3295,168 @@ static int32_t vgicr_mmio_access(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vg
 	return ret;
 }
 
+static uint32_t vits_baser_index(uint32_t offset)
+{
+	return (offset - GITS_BASER) / 8U;
+}
+
+static void vits_mmio_read(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
+	struct acrn_mmio_request *mmio, uint32_t offset)
+{
+	struct arm64_vits *its = &vgic->its;
+	uint64_t value64 = 0UL;
+
+	if ((offset >= GITS_BASER) &&
+		(offset < (GITS_BASER + (ARM64_VGIC_ITS_BASER_NUM * 8U)))) {
+		uint32_t idx = vits_baser_index(offset);
+
+		value64 = its->baser[idx];
+		mmio->value = ((offset & 0x4U) == 0U) ?
+			(value64 & UINT32_MAX) : (value64 >> 32U);
+		return;
+	}
+
+	switch (offset) {
+	case GITS_CTLR:
+		mmio->value = its->ctlr;
+		break;
+	case GITS_IIDR:
+		mmio->value = arm64_platform_gic_iidr();
+		break;
+	case GITS_TYPER:
+		mmio->value = its->typer & UINT32_MAX;
+		break;
+	case GITS_TYPER + 4U:
+		mmio->value = its->typer >> 32U;
+		break;
+	case GITS_MPIDR:
+		mmio->value = vcpu_get_vmpidr(vcpu_from_vid(vcpu->vm, BSP_CPU_ID));
+		break;
+	case GITS_CBASER:
+		mmio->value = its->cbaser & UINT32_MAX;
+		break;
+	case GITS_CBASER + 4U:
+		mmio->value = its->cbaser >> 32U;
+		break;
+	case GITS_CWRITER:
+		mmio->value = its->cwriter & UINT32_MAX;
+		break;
+	case GITS_CWRITER + 4U:
+		mmio->value = its->cwriter >> 32U;
+		break;
+	case GITS_CREADR:
+		mmio->value = its->creadr & UINT32_MAX;
+		break;
+	case GITS_CREADR + 4U:
+		mmio->value = its->creadr >> 32U;
+		break;
+	case GITS_PIDR2:
+		mmio->value = GIC_PIDR2_ARCH_GICV3;
+		break;
+	case GITS_CIDR0:
+		mmio->value = 0x0dU;
+		break;
+	case GITS_CIDR1:
+		mmio->value = 0xf0U;
+		break;
+	case GITS_CIDR2:
+		mmio->value = 0x05U;
+		break;
+	case GITS_CIDR3:
+		mmio->value = 0xb1U;
+		break;
+	default:
+		mmio->value = 0UL;
+		break;
+	}
+}
+
+static bool vits_mmio_write(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
+	const struct acrn_mmio_request *mmio, uint32_t offset)
+{
+	struct arm64_vits *its = &vgic->its;
+	uint64_t value = mmio->value & UINT32_MAX;
+	bool flush = false;
+
+	if ((offset >= GITS_BASER) &&
+		(offset < (GITS_BASER + (ARM64_VGIC_ITS_BASER_NUM * 8U)))) {
+		uint32_t idx = vits_baser_index(offset);
+
+		if ((offset & 0x4U) == 0U) {
+			its->baser[idx] = (its->baser[idx] & 0xffffffff00000000UL) | value;
+		} else {
+			its->baser[idx] = (its->baser[idx] & UINT32_MAX) | (value << 32U);
+		}
+		return false;
+	}
+
+	switch (offset) {
+	case GITS_CTLR:
+		its->ctlr = ((uint32_t)value & GITS_CTLR_ENABLE) |
+			(((value & GITS_CTLR_ENABLE) == 0U) ? GITS_CTLR_QUIESCENT : 0U);
+		if ((its->ctlr & GITS_CTLR_ENABLE) != 0U) {
+			vits_process_command_queue(vcpu->vm, vgic);
+			flush = true;
+		}
+		break;
+	case GITS_CBASER:
+		its->cbaser = (its->cbaser & 0xffffffff00000000UL) | value;
+		its->creadr = 0UL;
+		its->cwriter = 0UL;
+		break;
+	case GITS_CBASER + 4U:
+		its->cbaser = (its->cbaser & UINT32_MAX) | (value << 32U);
+		its->creadr = 0UL;
+		its->cwriter = 0UL;
+		break;
+	case GITS_CWRITER:
+		its->cwriter = (its->cwriter & 0xffffffff00000000UL) | value;
+		vits_process_command_queue(vcpu->vm, vgic);
+		flush = true;
+		break;
+	case GITS_CWRITER + 4U:
+		its->cwriter = (its->cwriter & UINT32_MAX) | (value << 32U);
+		vits_process_command_queue(vcpu->vm, vgic);
+		flush = true;
+		break;
+	case GITS_TRANSLATER:
+		vits_write_translater(vcpu->vm, vgic, (uint32_t)value);
+		flush = true;
+		break;
+	default:
+		break;
+	}
+
+	return flush;
+}
+
+static int32_t vits_mmio_access(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
+	struct acrn_mmio_request *mmio)
+{
+	uint32_t offset = (uint32_t)(mmio->address - arm64_platform_guest_its_base(vcpu->vm->vm_id));
+	int32_t ret = 0;
+
+	if (!vgic_word_access(offset, mmio->size)) {
+		ret = -EINVAL;
+	} else {
+		switch (mmio->direction) {
+		case ACRN_IOREQ_DIR_READ:
+			vits_mmio_read(vcpu, vgic, mmio, offset);
+			break;
+		case ACRN_IOREQ_DIR_WRITE:
+			if (vits_mmio_write(vcpu, vgic, mmio, offset)) {
+				vgicv3_flush_vm(vcpu);
+			}
+			break;
+		default:
+			ret = -EINVAL;
+			break;
+		}
+	}
+
+	return ret;
+}
+
 static int32_t vgicv3_mmio_dispatch(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 	struct acrn_mmio_request *mmio)
 {
@@ -2714,6 +3468,10 @@ static int32_t vgicv3_mmio_dispatch(struct acrn_vcpu *vcpu, struct arm64_vgicv3 
 	} else if (addr_in_range(mmio->address, arm64_platform_guest_gicr_base(vcpu->vm->vm_id),
 		arm64_platform_guest_gicr_size(vcpu->vm->vm_id))) {
 		ret = vgicr_mmio_access(vcpu, vgic, mmio);
+	} else if (vgic->its_enabled &&
+		addr_in_range(mmio->address, arm64_platform_guest_its_base(vcpu->vm->vm_id),
+		arm64_platform_guest_its_size(vcpu->vm->vm_id))) {
+		ret = vits_mmio_access(vcpu, vgic, mmio);
 	}
 
 	return ret;

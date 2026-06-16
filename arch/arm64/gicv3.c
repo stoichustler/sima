@@ -52,6 +52,11 @@
 #define GICR_WAKER_PROCESSOR_SLEEP	BIT32(1U)
 #define GICR_WAKER_CHILDREN_ASLEEP	BIT32(2U)
 
+#define GITS_CTLR			0x0000U
+#define GITS_TYPER			0x0008U
+#define GITS_CTLR_ENABLE		BIT32(0U)
+#define GITS_CTLR_QUIESCENT		BIT32(31U)
+
 #define GIC_INTIDS_PER_REG		32U
 #define GIC_PRI_PER_REG		4U
 #define GIC_CFG_PER_REG		16U
@@ -62,6 +67,7 @@
 static uint64_t gicr_base_by_pcpu[MAX_PCPU_NUM];
 static uint32_t gic_line_count;
 static bool gicv3_global_initialized;
+static bool gicv3_its_present;
 
 static inline void *gicd_addr(uint32_t off)
 {
@@ -101,6 +107,26 @@ static inline uint64_t gicr_read64(uint64_t base, uint32_t off)
 static inline void gicr_write32(uint64_t base, uint32_t off, uint32_t val)
 {
 	mmio_write32(val, gicr_addr(base, off));
+}
+
+static inline void *gits_addr(uint32_t off)
+{
+	return (void *)(arm64_platform_gits_base() + off);
+}
+
+static inline uint32_t gits_read32(uint32_t off)
+{
+	return mmio_read32(gits_addr(off));
+}
+
+static inline uint64_t gits_read64(uint32_t off)
+{
+	return mmio_read64(gits_addr(off));
+}
+
+static inline void gits_write32(uint32_t off, uint32_t val)
+{
+	mmio_write32(val, gits_addr(off));
 }
 
 static uint32_t gic_intid_reg(uint32_t intid)
@@ -259,6 +285,27 @@ static void gicd_init(void)
 	gicd_wait_rwp();
 }
 
+static void gits_init(void)
+{
+	uint64_t base = arm64_platform_gits_base();
+	uint64_t size = arm64_platform_gits_size();
+	uint32_t ctlr;
+
+	if ((base == 0UL) || (size == 0UL)) {
+		gicv3_its_present = false;
+		return;
+	}
+
+	gits_write32(GITS_CTLR, 0U);
+	do {
+		ctlr = gits_read32(GITS_CTLR);
+	} while ((ctlr & GITS_CTLR_QUIESCENT) == 0U);
+
+	gicv3_its_present = true;
+	pr_info("gicv3 its: base=0x%lx size=0x%lx typer=0x%lx",
+		base, size, gits_read64(GITS_TYPER));
+}
+
 static void gicr_wake(uint64_t rdist)
 {
 	uint32_t val = gicr_read32(rdist, GICR_WAKER);
@@ -318,8 +365,14 @@ void arm64_gicv3_init_early(void)
 	if (!gicv3_global_initialized) {
 		gic_discover_rdists();
 		gicd_init();
+		gits_init();
 		gicv3_global_initialized = true;
 	}
+}
+
+bool arm64_gicv3_has_its(void)
+{
+	return gicv3_its_present;
 }
 
 void arm64_gicv3_init(uint16_t pcpu_id)

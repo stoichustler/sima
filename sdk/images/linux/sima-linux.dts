@@ -73,6 +73,13 @@
 		      <0x0 0x080a0000 0x0 0x00100000>;
 	};
 
+	its: msi-controller@8080000 {
+		compatible = "arm,gic-v3-its";
+		msi-controller;
+		#msi-cells = <1>;
+		reg = <0x0 0x08080000 0x0 0x00020000>;
+	};
+
 	timer {
 		compatible = "arm,armv8-timer", "arm,armv7-timer";
 		always-on;
