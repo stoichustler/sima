@@ -66,6 +66,13 @@ def main():
         f"CROSS_COMPILE={args.cross_prefix}",
         f"-j{os.cpu_count() or 1}",
     ]
+    clean_cmd = [
+        "make",
+        "ARCH=arm64",
+        "PLATFORM=qemu",
+        f"CROSS_COMPILE={args.cross_prefix}",
+        "clean",
+    ]
     qemu_cmd = [
         args.qemu,
         "-machine",
@@ -90,6 +97,7 @@ def main():
 
     if args.dry_run:
         if args.build:
+            print(render(clean_cmd, args.toolchains))
             print(render(build_cmd, args.toolchains))
         print(render(qemu_cmd))
         return
@@ -100,6 +108,7 @@ def main():
         compiler = f"{args.cross_prefix}gcc"
         if shutil.which(compiler, path=env.get("PATH")) is None:
             raise SystemExit(f"Compiler not found: {compiler}")
+        subprocess.run(clean_cmd, cwd=ROOT, env=env, check=True)
         subprocess.run(build_cmd, cwd=ROOT, env=env, check=True)
 
     if not args.kernel.is_file():

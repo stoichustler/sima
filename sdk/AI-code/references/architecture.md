@@ -110,10 +110,12 @@ qemu-system-aarch64 \
   - Initrd load: `0x4c000000`
   - DTB: `sdk/images/linux/sima-linux.dtb`
   - RAM identity window: `0x48000000-0x50000000`
-  - pCPUs: 1, 2, 4, 6
+  - pCPUs: 1, 4, 6, 7
   - Boot console: `console=ttyAMA0 earlycon=pl011,0x09000000`
   - Login: `root` / `root`
 - pCPU3 is intentionally shared by VM0 and VM1 AP vCPUs.
+  Each VM's vCPU0/BSP pCPU is private: VM0 uses pCPU2, VM1 uses pCPU5,
+  and VM2 uses pCPU1.
 
 QEMU and rk356x both keep guest images under `sdk/images`. LK and Zephyr are
 embedded RTOS raw images. Linux `Image`, `Initrd`, `sima-linux.dts`, and
@@ -122,8 +124,8 @@ by a loader and copied by SIMA, while `sima-linux.dtb` is embedded as the
 Linux-on-SIMA DTB module.
 
 The first `create_vcpu()` call creates vCPU0/BSP. The ARM64 creation order keeps
-the service VM BSP away from pCPU0 and keeps the pre-launched VM BSP away from
-the pCPU shared with the service VM.
+the service VM BSP away from pCPU0 and keeps every VM BSP on a pCPU that is not
+used by another VM.
 
 ## Design Invariants
 
@@ -176,7 +178,7 @@ For VM/scheduler/console changes, validate:
 
 1. QEMU finishes boot logs; pressing Enter prints `console:\>`.
 2. VM0, VM1, and VM2 autostart.
-3. `vcpus` shows VM0 on pCPU0,2,3,4 and VM1 on pCPU3,5,6,7.
+3. `vcpus` shows VM0 on pCPU0,2,3,4, VM1 on pCPU3,5,6,7, and VM2 on pCPU1,4,6,7.
 4. `schedstat` shows `sched_iorr`; pCPU3 context switches grow when VM0 and VM1 run.
 5. `vsh 0` reaches `zero ~>` and the switch banner appears before replayed VM0
    logs.

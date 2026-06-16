@@ -122,8 +122,8 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 	[2] = {
 		CONFIG_PRE_STD_VM,
 		.name = "linux",
-		.cpu_affinity = AFFINITY_CPU(1) | AFFINITY_CPU(2) |
-			AFFINITY_CPU(4) | AFFINITY_CPU(6),
+		.cpu_affinity = AFFINITY_CPU(1) | AFFINITY_CPU(4) |
+			AFFINITY_CPU(6) | AFFINITY_CPU(7),
 		.guest_flags = GUEST_FLAG_STATIC_VM,
 		.memory = {
 			.size = QEMU_LINUX_RAM_SIZE,

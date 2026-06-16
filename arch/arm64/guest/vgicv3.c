@@ -646,17 +646,17 @@ static void vgicv3_complete_eoi_lrs(struct acrn_vcpu *vcpu, uint64_t eoi_lrs,
 			if ((virq == vcpu->arch.gctx.timer_virq) && vgicv3_vcpu_is_loaded(vcpu)) {
 				/*
 				 * The timer source is the live CNTV line. Once the guest
-				 * completes a timer LR, keep the software queue empty and let
-				 * the host PPI recreate any still-asserted deadline.
+				 * completes a timer LR, immediately resample the line. If the
+				 * deadline is still due, keep the virtual line asserted instead
+				 * of depending on another host PPI edge to recreate it.
 				 */
-				(void)vgic_sample_current_vtimer(vcpu);
-				keep_pending = false;
+				keep_pending = vgic_sample_current_vtimer(vcpu);
 			}
 
 			vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, keep_pending);
 			desc->active = false;
 			if (virq == vcpu->arch.gctx.timer_virq) {
-				vgic_timer_set_host_mask(vcpu, false);
+				vgic_timer_set_host_mask(vcpu, keep_pending);
 			}
 		}
 		if (lr_idx < ctx->used_lrs) {
@@ -699,8 +699,8 @@ static void vgicv3_deactivate_irq_locked(struct acrn_vcpu *vcpu, uint32_t virq)
 	}
 	desc->active = false;
 	vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, keep_pending);
-	if ((virq == vcpu->arch.gctx.timer_virq) && !keep_pending) {
-		vgic_timer_set_host_mask(vcpu, false);
+	if (virq == vcpu->arch.gctx.timer_virq) {
+		vgic_timer_set_host_mask(vcpu, keep_pending);
 	}
 }
 
@@ -984,6 +984,8 @@ static bool vgicv3_active_priority_empty(void)
 static bool vgicv3_complete_timer_lr(struct acrn_vcpu *vcpu,
 	struct arm64_vgic_irq *desc, uint32_t lr_idx, bool *removed)
 {
+	bool line_asserted;
+
 	if (removed != NULL) {
 		*removed = false;
 	}
@@ -993,17 +995,17 @@ static bool vgicv3_complete_timer_lr(struct acrn_vcpu *vcpu,
 
 	/*
 	 * CNTV is the level source for the guest timer. Once AP state is empty the
-	 * consumed LR no longer owns redelivery; remove it and let the host PPI
-	 * recreate any still-asserted deadline.
+	 * consumed LR no longer owns redelivery; remove it and immediately
+	 * resample CNTV so an already-expired deadline stays asserted in the vGIC.
 	 */
-	(void)vgic_sample_current_vtimer(vcpu);
+	line_asserted = vgic_sample_current_vtimer(vcpu);
 	desc->active = false;
-	vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, false);
+	vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, line_asserted);
 	remove_lr(vcpu, lr_idx);
 	if (removed != NULL) {
 		*removed = true;
 	}
-	vgic_timer_set_host_mask(vcpu, false);
+	vgic_timer_set_host_mask(vcpu, line_asserted);
 
 	return true;
 }

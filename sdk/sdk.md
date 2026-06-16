@@ -80,12 +80,14 @@ Current QEMU VM layout:
   - DTB module tag: `sima-linux-dtb`
   - Boot console: `console=ttyAMA0 earlycon=pl011,0x09000000`
   - Identity RAM window: `0x48000000-0x50000000`
-  - vCPUs: 4, running on pCPU1, pCPU2, pCPU4, and pCPU6
+  - vCPUs: 4, running on pCPU1, pCPU4, pCPU6, and pCPU7
   - Login: `root` / `root`
 - pCPU0-pCPU5 model ordinary cores.
 - pCPU6-pCPU7 model performance cores.
 - VM0 uses ordinary cores only. VM1 may mix ordinary and performance cores; the
   static QEMU scenario uses pCPU3 as the shared ordinary core plus pCPU5-pCPU7.
+  Each VM's vCPU0/BSP is kept on a pCPU that no other VM uses: VM0 on pCPU2,
+  VM1 on pCPU5, and VM2 on pCPU1.
 
 The generated `out/qemu_out/sima.debug.out` has been boot-tested on QEMU. The
 build also emits `out/qemu_out/sima.out` as the base link image and
@@ -145,13 +147,18 @@ boot logs settle to show the `console:\>` prompt.
 - PSCI-based host secondary CPU bring-up with `MAX_PCPU_NUM=8`.
 - VM0 and VM1 vCPUs share pCPU3 through the existing `sched_iorr` scheduler.
   VM0 uses ordinary-core pCPU0, pCPU2, pCPU3, and pCPU4; VM1 uses mixed pCPU3,
-  pCPU5, pCPU6, and pCPU7.
+  pCPU5, pCPU6, and pCPU7. VM2 uses pCPU1, pCPU4, pCPU6, and pCPU7. The
+  vCPU0/BSP pCPUs are private to each VM.
 - ARM64 vCPU switch-in/out now saves and restores guest EL1 translation,
   exception, timer, TPIDR, and vGIC state, so two VMs can time-share one pCPU
   without inheriting each other's EL1 address-space context.
 - ARM64 local physical timer setup enables the scheduler tick PPI on every pCPU.
   Guest timer state is kept on the virtual timer path so guest timer activity
   does not overwrite the host scheduler's physical timer deadline.
+- ARM64 WFI/WFE trapping is disabled in the default QEMU scenario. Guest WFI/WFE
+  stays on the virtual CPU interface so idle/spin paths do not exit to EL2 on
+  every instruction; the trapped handler remains only as non-default debug
+  plumbing.
 - Shell running as a scheduler thread and VM launch gated to host BSP after all
   APs are running.
 - ARM64 HVC dispatch recognizes ACRN hypercall IDs separately from PSCI HVC
@@ -191,6 +198,8 @@ boot logs settle to show the `console:\>` prompt.
   entries are raw addresses because SIMA does not embed guest symbol tables. The
   debug image embeds the SIMA symbol table, so host stack return addresses are
   printed as `function+offset`. Offline vCPUs skip stack output.
+- ARM64 host exception call traces resolve return addresses through the
+  embedded SIMA symbol table and print `function+offset` beside the raw LR.
 - VM vPL011 TX output from the currently selected `vsh` VM is written into a
   Xen-style per-VM async console ring buffer, using monotonic producer/consumer
   indexes and a 4KB power-of-two data area with 4095 bytes of usable capacity.
@@ -244,6 +253,7 @@ The following have been verified on QEMU with `-smp 8`:
 - VM0 Zephyr vCPU0-vCPU3 bind to ordinary-core pCPU2, pCPU0, pCPU3, and pCPU4.
 - VM1 LK vCPU0-vCPU3 bind to mixed pCPU5, pCPU3, pCPU6, and pCPU7, sharing
   pCPU3 with VM0.
+- VM2 Linux vCPU0-vCPU3 bind to pCPU1, pCPU4, pCPU6, and pCPU7.
 - VM0 Zephyr enters EL1 at `0x42000000`.
 - VM1 LK enters EL1 at `0x40100000`.
 - Boot logs show each VM stage-2 RAM map as identity mapped:
@@ -253,7 +263,7 @@ The following have been verified on QEMU with `-smp 8`:
   reschedule requests, runnable-thread counts, and context switch counters.
 - `vcpus` reports all three VMs and nine guest vCPUs. VM0 uses pCPU0, pCPU2,
   pCPU3, and pCPU4; VM1 uses pCPU3, pCPU5, pCPU6, and pCPU7; VM2 Linux uses
-  pCPU1.
+  pCPU1, pCPU4, pCPU6, and pCPU7.
 - `vsh 0` enters the Zephyr console and reaches `zero ~>`.
 - `vsh 1` enters the LK console and reaches `beau ~>`.
 - `vsh 2` enters the Linux console. During the 2026-06-16 VM2 debug session,
@@ -268,7 +278,8 @@ The following have been verified on QEMU with `-smp 8`:
   VM console.
 - Ctrl-D returns from VM console mode to `console:\>`.
 - The `crash` command prints an ARM64 exception stack with `[cut here]` and
-  `[end here]` markers, then cold reboots SIMA automatically.
+  `[end here]` markers, including a symbolized host call trace, then cold
+  reboots SIMA automatically.
 - Five repeated QEMU cold boots reached VM0/VM1/VM2 guest entry without
   `[cut here]` or `unexpected arm64 trap`, covering the prior `SP_EL2`/`SPSel`
   boot race.
@@ -294,6 +305,9 @@ The following have been verified on QEMU with `-smp 8`:
 
 Status as of 2026-06-16:
 
+- Development hygiene: avoid broad, low-signal local `rg` searches over large
+  source trees. Prefer known relevant files in this repository and targeted
+  reads from explicitly named external sources, such as `~/linux-7.1`.
 - Latest cleaned validation:
   `SIMA_TOOLCHAINS=$HOME/sima-cc/bin ./scripts/regress.py --timeout 180
   --log out/qemu_out/regress-gate-cleaned.log`.
@@ -310,10 +324,26 @@ Status as of 2026-06-16:
 - Timer DT interrupt IDs remain unchanged. The virtual timer still uses
   PPI/INTID 27 from `<1 13 4>`; current evidence does not require changing
   PPI27.
-- WFI/WFE are currently left to hardware, matching the simpler ARMv8 reference
-  path in `~/nebula/bloc/raan/prot`. Re-enabling WFI-only trapping kept VM0/VM1
-  passing but slowed VM2 and left host PPI27 masked in the bad state, so that
-  experiment was reverted.
+- WFI/WFE trapping is kept disabled by default. Reference checks:
+  `~/nebula/bloc/raan/croc` traps WFE as yield and WFI as block, while
+  `~/nebula/bloc/raan/anoa` traps WFE as yield and uses an IRQ-wait path for
+  WFI with a yield threshold plus timeout. In SIMA QEMU, enabling TWI/TWE makes
+  VM0/VM1/VM2 noticeably slower, so the default relies on hardware/vGIC wakeup.
+- A clean QEMU run after restoring native WFI/WFE reached the VM2 PL011 console
+  handoff at about Linux timestamp `1.83s`; trapped WFI/WFE variants pushed the
+  same area to about `31s` or later. VM0/VM1 still pass the regression gate.
+  VM2 Linux login timeout remains a separate post-console issue.
+- vtimer experiment `regress-vtimer-backup.log`: arming a software backup timer
+  on every vCPU unload, modeled after anoa's full generic-timer context path,
+  regressed VM2 heavily (`smp: Brought up` around `46.42s`, PL011 console around
+  `52.19s`). Do not keep this in the QEMU 3OS path.
+- vtimer experiment `regress-vtimer-line-resample.log`: resampling the live CNTV
+  line when a timer LR is completed keeps early boot speed acceptable (`smp:
+  Brought up` around `0.29s`, PL011 console around `2.07s`) and VM0/VM1 pass,
+  but VM2 still times out before login. The timeout snapshot still shows an
+  expired vtimer deadline on VM2/vCPU0 with host PPI27 enabled, so the next
+  timer work should focus on active/pending LR lifecycle rather than WFI/WFE or
+  broad backup timers.
 - Linux CPU1/CPU2/CPU3 reach the guest secondary entry path. The remaining VM2
   instability is now after secondary CPU bring-up and before a stable root
   shell.
@@ -358,6 +388,15 @@ Experiments already tried:
 - Removing WFI/WFE traps and letting hardware wake guest idle, as in the
   reference `prot` path, keeps VM0/VM1 passing and speeds VM2 boot, but does
   not fix the VM2 login timeout by itself.
+- Re-enabling WFI/WFE traps with WFI as a pure yield slowed VM2 badly and could
+  leave host PPI27 masked. Reworking WFI to block, based on the croc/anoa
+  direction, still slowed the QEMU 3OS scenario and affected VM0/VM1 as well.
+  Keep HCR_EL2.TWI/TWE clear unless a specific diagnostic run requires trapped
+  idle instructions.
+- Porting anoa's full switch-out backup timer model directly to SIMA caused a
+  large VM2 slowdown. The useful part to keep is local deadline resampling at
+  LR completion/EOI boundaries; avoid arming a backup timer on every vCPU
+  unload until the GICv3 LR lifecycle is simpler.
 - Removing the host PPI27 mask from the timer poll path kept VM0/VM1 passing
   but did not fix VM2 and raised host virtual-timer IRQ counts, so it was
   reverted.
@@ -375,7 +414,7 @@ Recommended resume point:
 1. Before any VM2 experiment, run the full regression and require VM0/VM1 to
    pass (`dumpstat 0`, `vsh 0`, `vsh 1`).
 2. Start from the current `arch/arm64/guest/vgicv3.c` timer completion change
-   and keep WFI/WFE trapping disabled.
+   with WFI/WFE trapping disabled in HCR_EL2.
 3. Confirm VM2 CPU1/CPU2/CPU3 still boot.
 4. Switch with `vsh 2`, wait for `clou login:`, then immediately input
    `root`, password `root`, and run `help`.

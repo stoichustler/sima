@@ -709,11 +709,10 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 	last->tsc = cpu_ticks();
 
 	/*
-	 * WFI can resume immediately only when a pending virtual IRQ can be taken
-	 * by EL1. If DAIF.I is still set, returning with the same pending LR just
-	 * re-enters the idle trap path; yield until a host tick or event lets the
-	 * guest reach the point where it unmasks interrupts. WFE has event-register
-	 * semantics that are not modeled yet, so yielding one slice is conservative.
+	 * This handler is non-default diagnostic plumbing because QEMU 3OS leaves
+	 * HCR_EL2.TWI/TWE clear. If a diagnostic mode enables the traps, keep the
+	 * behavior lightweight: WFE yields, and WFI yields only when no immediately
+	 * useful virtual event is visible.
 	 */
 	if (should_yield) {
 		yield_current();

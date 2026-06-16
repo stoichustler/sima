@@ -235,10 +235,9 @@ int32_t arch_init_vcpu(struct acrn_vcpu *vcpu)
 	/*
 	 * Each vCPU points at the VM's stage-2 root and starts with EL1 AArch64
 	 * enabled. HCR routes guest physical interrupts to EL2 and traps PSCI.
-	 * WFI/WFE are left to hardware, matching the simple ARMv8 vGIC model where
-	 * guest idle waits are woken by the virtual CPU interface instead of being
-	 * turned into an EL2 timer polling loop. CNTVOFF gives the guest a
-	 * VM-relative virtual counter.
+	 * WFI/WFE are left to the virtual CPU interface by default; trapping them
+	 * on every guest idle/spin instruction is too expensive for the QEMU 3OS
+	 * scenario and is only kept as a handler for future diagnostic modes.
 	 */
 	reset_vcpu(vcpu);
 	gctx->vttbr_el2 = hva2hpa(vcpu->vm->root_stg2ptp);

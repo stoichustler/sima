@@ -9,6 +9,7 @@
 #include <asm/page.h>
 #include <logmsg.h>
 #include <dump.h>
+#include <debug/symbol.h>
 
 #define CALL_TRACE_HIERARCHY_MAX	0x10U
 #define DUMP_STACK_SIZE			0x800U
@@ -39,7 +40,11 @@ static void show_host_call_trace(uint64_t stack_phy, uint64_t fp_arg, uint16_t p
 
 	printf("\r\nhost call trace:\r\n");
 	while (cb_hierarchy < CALL_TRACE_HIERARCHY_MAX) {
-		printf(" ✘  0x%016lx\r\n", *(uint64_t *)(fp + 1));
+		uint64_t lr = *(uint64_t *)(fp + 1);
+		char sym[96U];
+
+		dbg_format_symbol(lr, sym, sizeof(sym));
+		printf(" ✘  0x%016lx  %s\r\n", lr, sym);
 
 		if (*fp == SP_BOTTOM_MAGIC) {
 			break;
