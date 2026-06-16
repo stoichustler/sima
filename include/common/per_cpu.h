@@ -19,7 +19,7 @@
 #include <asm/security.h>
 #include <notify.h>
 #include <cpu.h>
-#ifndef CONFIG_STATIC_QEMU_PLATFORM
+#ifndef CONFIG_STATIC_ARM64_PLATFORM
 #include <board_info.h>
 #endif
 

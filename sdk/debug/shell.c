@@ -617,7 +617,7 @@ void shell_kick(void)
 
 		/*
 		 * Guest APs can still be brought up by PSCI after shell_start() because
-		 * only VM BSPs are launched by the host autostart path. Keep the CLAN
+		 * only VM BSPs are launched by the host autostart path. Keep the SIMA
 		 * shell quiet until the user presses Enter so the first prompt does not
 		 * appear in the middle of late vCPU scheduling logs.
 		 */
@@ -1206,14 +1206,13 @@ static int32_t shell_to_vm_console(int32_t argc, char **argv)
 	}
 
 	/*
-	 * Print the ownership marker before replaying buffered VM output. The ring
-	 * may already contain boot logs produced while CLAN shell owned the UART;
-	 * draining it first makes the marker appear in the middle of guest logs.
+	 * Switch ownership first and let the periodic console path drain the VM ring.
+	 * Replaying a large boot buffer synchronously in the shell thread can block
+	 * the command path long enough to hide whether the VM console itself works.
 	 */
 	snprintf(temp_str, TEMP_STR_SIZE, "\r\n──────── [switch to vm-%d shell] ────────\r\n", vm_id);
 	shell_puts(temp_str);
 	console_vmid = vm_id;
-	console_vm_ring_drain(vm_id);
 
 	return 0;
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -9,6 +9,7 @@
 #include <per_cpu.h>
 #include <io.h>
 #include <logmsg.h>
+#include <rtl.h>
 #include <barrier.h>
 #include <asm/irq.h>
 #include <asm/platform.h>
@@ -27,7 +28,9 @@
 #define GICD_IGROUPR			0x0080U
 #define GICD_ISENABLER			0x0100U
 #define GICD_ICENABLER			0x0180U
+#define GICD_ISPENDR			0x0200U
 #define GICD_ICPENDR			0x0280U
+#define GICD_ISACTIVER			0x0300U
 #define GICD_ICACTIVER			0x0380U
 #define GICD_IPRIORITYR		0x0400U
 #define GICD_ICFGR			0x0C00U
@@ -197,6 +200,18 @@ static void gicr_enable_irq(uint64_t rdist, uint32_t intid)
 		gic_intid_mask(intid));
 }
 
+static void gicr_disable_irq(uint64_t rdist, uint32_t intid)
+{
+	gicr_write32(rdist, GICR_SGI_BASE + GICD_ICENABLER + gic_intid_reg(intid),
+		gic_intid_mask(intid));
+}
+
+static void gicr_clear_pending(uint64_t rdist, uint32_t intid)
+{
+	gicr_write32(rdist, GICR_SGI_BASE + GICD_ICPENDR + gic_intid_reg(intid),
+		gic_intid_mask(intid));
+}
+
 static void gicr_clear_pending_active(uint64_t rdist, uint32_t intid)
 {
 	gicr_write32(rdist, GICR_SGI_BASE + GICD_ICPENDR + gic_intid_reg(intid),
@@ -359,6 +374,65 @@ void arm64_gicv3_enable_irq(uint32_t intid)
 		gicd_write32(GICD_ISENABLER + gic_intid_reg(intid), gic_intid_mask(intid));
 		gicd_wait_rwp();
 	}
+}
+
+void arm64_gicv3_disable_irq(uint32_t intid)
+{
+	uint64_t rdist;
+
+	if (intid < GIC_SPI_BASE) {
+		rdist = gic_current_rdist();
+		gicr_disable_irq(rdist, intid);
+		gicr_wait_rwp(rdist);
+	} else if (intid < gic_line_count) {
+		gicd_write32(GICD_ICENABLER + gic_intid_reg(intid), gic_intid_mask(intid));
+		gicd_wait_rwp();
+	}
+}
+
+void arm64_gicv3_clear_irq(uint32_t intid)
+{
+	uint64_t rdist;
+
+	if (intid < GIC_SPI_BASE) {
+		rdist = gic_current_rdist();
+		gicr_clear_pending(rdist, intid);
+		gicr_write32(rdist, GICR_SGI_BASE + GICD_ICACTIVER + gic_intid_reg(intid),
+			gic_intid_mask(intid));
+	} else if (intid < gic_line_count) {
+		gicd_clear_pending_active(intid);
+	}
+}
+
+void arm64_gicv3_get_local_irq_state(uint16_t pcpu_id, uint32_t intid,
+	struct arm64_gicv3_local_irq_state *state)
+{
+	uint64_t rdist;
+	uint32_t reg;
+	uint32_t mask;
+
+	if (state == NULL) {
+		return;
+	}
+
+	(void)memset(state, 0U, sizeof(*state));
+	if ((pcpu_id >= MAX_PCPU_NUM) || (intid >= GIC_SPI_BASE)) {
+		return;
+	}
+
+	rdist = gicr_base_by_pcpu[pcpu_id];
+	if (rdist == 0UL) {
+		return;
+	}
+
+	reg = gic_intid_reg(intid);
+	mask = gic_intid_mask(intid);
+	state->enabled = gicr_read32(rdist, GICR_SGI_BASE + GICD_ISENABLER + reg) & mask;
+	state->pending = gicr_read32(rdist, GICR_SGI_BASE + GICD_ISPENDR + reg) & mask;
+	state->active = gicr_read32(rdist, GICR_SGI_BASE + GICD_ISACTIVER + reg) & mask;
+	state->group = gicr_read32(rdist, GICR_SGI_BASE + GICD_IGROUPR + reg) & mask;
+	state->priority = mmio_read8(gicr_addr(rdist, GICR_SGI_BASE + GICD_IPRIORITYR + intid));
+	state->valid = true;
 }
 
 void arm64_gicv3_send_sgi(uint16_t pcpu_id, uint32_t sgi_id)

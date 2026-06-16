@@ -9,6 +9,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CWD = Path.cwd()
+LINUX_IMAGE_STAGE_ADDR = "0x70000000"
+LINUX_INITRD_STAGE_ADDR = "0x74000000"
 
 
 def relpath(path):
@@ -21,18 +23,27 @@ def render(cmd, toolchains=None):
     return f"PATH={shlex.quote(str(toolchains))}:$PATH {cmd}" if toolchains else cmd
 
 
+def getenv(name, default=None):
+    value = os.getenv(name)
+    return default if value is None else value
+
+
 def parse_args():
-    kernel = relpath(os.environ["CLAN_KERNEL"]) if "CLAN_KERNEL" in os.environ else ROOT / "build/clan.debug.out"
-    toolchains = os.getenv("CLAN_TOOLCHAINS", os.getenv("CLAN_TOOLCHAIN"))
+    kernel_env = getenv("SIMA_KERNEL")
+    kernel = relpath(kernel_env) if kernel_env else ROOT / "out/qemu_out/sima.debug.out"
+    toolchains = getenv("SIMA_TOOLCHAINS")
+    toolchains = getenv("SIMA_TOOLCHAIN", toolchains)
     toolchains = relpath(toolchains) if toolchains else None
 
     parser = argparse.ArgumentParser(description="Build and launch the ARM64 QEMU image.")
     parser.add_argument("-k", "--kernel", default=kernel, type=relpath)
     parser.add_argument("--qemu", default=os.getenv("QEMU_SYSTEM_AARCH64", "qemu-system-aarch64"))
-    parser.add_argument("--smp", default=os.getenv("CLAN_QEMU_SMP", "8"))
-    parser.add_argument("-m", "--memory", default=os.getenv("CLAN_QEMU_MEM", "1024M"))
+    parser.add_argument("--smp", default=getenv("SIMA_QEMU_SMP", "8"))
+    parser.add_argument("-m", "--memory", default=getenv("SIMA_QEMU_MEM", "1024M"))
+    parser.add_argument("--linux-image", default=ROOT / "sdk/images/linux/Image", type=relpath)
+    parser.add_argument("--linux-initrd", default=ROOT / "sdk/images/linux/Initrd", type=relpath)
     parser.add_argument("--toolchains", "--toolchain", default=toolchains, type=relpath)
-    parser.add_argument("--cross-prefix", default=os.getenv("CLAN_CROSS_COMPILE", "aarch64-none-elf-"))
+    parser.add_argument("--cross-prefix", default=getenv("SIMA_CROSS_COMPILE", "aarch64-none-elf-"))
     parser.add_argument("--build", action="store_true")
     parser.add_argument("-n", "--dry-run", action="store_true")
     args, extra = parser.parse_known_args()
@@ -70,6 +81,10 @@ def main():
         "mon:stdio",
         "-kernel",
         str(args.kernel),
+        "-device",
+        f"loader,file={args.linux_image},addr={LINUX_IMAGE_STAGE_ADDR},force-raw=on",
+        "-device",
+        f"loader,file={args.linux_initrd},addr={LINUX_INITRD_STAGE_ADDR},force-raw=on",
         *args.extra,
     ]
 
@@ -92,6 +107,10 @@ def main():
         print("Build it with:")
         print(f"  {render(build_cmd, args.toolchains)}")
         raise SystemExit(1)
+    if not args.linux_image.is_file():
+        raise SystemExit(f"Linux Image not found: {args.linux_image}")
+    if not args.linux_initrd.is_file():
+        raise SystemExit(f"Linux Initrd not found: {args.linux_initrd}")
 
     qemu = shutil.which(args.qemu)
     if qemu is None:

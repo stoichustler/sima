@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -15,8 +15,10 @@
 #include <io_req.h>
 #include <acrn_common.h>
 #include <softirq.h>
+#include <ticks.h>
 #include <asm/platform.h>
 #include <asm/cpu.h>
+#include <asm/irq.h>
 #include <asm/sysreg.h>
 #include <asm/trap.h>
 #include <asm/guest/vcpu_priv.h>
@@ -32,13 +34,19 @@
 #define FAR_EL2_PAGE_MASK	0xfffUL
 
 #define PSCI_0_2_FN_PSCI_VERSION	0x84000000U
+#define PSCI_0_2_FN_CPU_SUSPEND	0x84000001U
 #define PSCI_0_2_FN_CPU_OFF		0x84000002U
 #define PSCI_0_2_FN_CPU_ON		0x84000003U
 #define PSCI_0_2_FN_AFFINITY_INFO	0x84000004U
+#define PSCI_0_2_FN_MIGRATE_INFO_TYPE	0x84000006U
 #define PSCI_0_2_FN_SYSTEM_OFF		0x84000008U
 #define PSCI_0_2_FN_SYSTEM_RESET	0x84000009U
+#define PSCI_1_0_FN_PSCI_FEATURES	0x8400000aU
+#define PSCI_1_1_FN_SYSTEM_RESET2	0x84000012U
+#define ARM_SMCCC_VERSION_FUNC_ID	0x80000000U
 #define PSCI_0_2_FN64_CPU_ON		0xc4000003U
 #define PSCI_0_2_FN64_AFFINITY_INFO	0xc4000004U
+#define PSCI_0_2_TOS_MP		2L
 
 #define PSCI_RET_SUCCESS		0L
 #define PSCI_RET_NOT_SUPPORTED		(-1L)
@@ -63,7 +71,15 @@
 
 #define SYSREG_ENC(op0, op1, crn, crm, op2) \
 	(((op0) << 20U) | ((op2) << 17U) | ((op1) << 14U) | ((crn) << 10U) | ((crm) << 1U))
+#define SYSREG_ICC_PMR_EL1		SYSREG_ENC(3UL, 0UL, 4UL, 6UL, 0UL)
+#define SYSREG_ICC_DIR_EL1		SYSREG_ENC(3UL, 0UL, 12UL, 11UL, 1UL)
+#define SYSREG_ICC_RPR_EL1		SYSREG_ENC(3UL, 0UL, 12UL, 11UL, 3UL)
+#define SYSREG_ICC_CTLR_EL1		SYSREG_ENC(3UL, 0UL, 12UL, 12UL, 4UL)
+#define SYSREG_ICC_SRE_EL1		SYSREG_ENC(3UL, 0UL, 12UL, 12UL, 5UL)
+#define SYSREG_ICC_IGRPEN1_EL1		SYSREG_ENC(3UL, 0UL, 12UL, 12UL, 7UL)
 #define SYSREG_ICC_SGI1R_EL1		SYSREG_ENC(3UL, 0UL, 12UL, 11UL, 5UL)
+#define SYSREG_ICC_ASGI1R_EL1		SYSREG_ENC(3UL, 0UL, 12UL, 11UL, 6UL)
+#define SYSREG_ICC_SGI0R_EL1		SYSREG_ENC(3UL, 0UL, 12UL, 11UL, 7UL)
 #define SYSREG_CNTP_CTL_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 2UL, 1UL)
 #define SYSREG_CNTP_CVAL_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 2UL, 2UL)
 #define SYSREG_CNTP_TVAL_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 2UL, 0UL)
@@ -72,6 +88,19 @@
 #define SYSREG_CNTV_CVAL_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 3UL, 2UL)
 #define SYSREG_CNTV_TVAL_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 3UL, 0UL)
 #define SYSREG_CNTVCT_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 0UL, 2UL)
+
+static uint32_t guest_timer_ctl_value(uint32_t ctl, uint64_t cval, uint64_t now)
+{
+	uint32_t value = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+
+	if (((value & CNTV_CTL_ENABLE) != 0U) &&
+		((value & CNTV_CTL_IMASK) == 0U) &&
+		((int64_t)(cval - now) <= 0L)) {
+		value |= CNTV_CTL_ISTATUS;
+	}
+
+	return value;
+}
 
 static uint64_t arm64_fault_ipa(const struct cpu_regs *regs)
 {
@@ -111,9 +140,93 @@ static void restore_exit_regs(struct cpu_regs *regs, const struct acrn_vcpu *vcp
 		&vcpu->arch.regs, sizeof(vcpu->arch.regs));
 }
 
+static void record_vcpu_exit(struct acrn_vcpu *vcpu, uint32_t source, int32_t status)
+{
+	struct arm64_vcpu_last_exit *last = &vcpu->arch.debug.last_exit;
+	const struct cpu_regs *regs = &vcpu->arch.regs;
+
+	last->esr = regs->esr;
+	last->elr = regs->elr;
+	last->far = regs->far;
+	last->hpfar = regs->hpfar;
+	last->ec = (source == ARM64_VCPU_DEBUG_EXIT_SYNC) ?
+		(uint32_t)ESR_EL2_EC(regs->esr) : ARM64_VCPU_DEBUG_EXIT_EC_INVALID;
+	last->source = source;
+	last->status = status;
+	last->tsc = cpu_ticks();
+}
+
+static void record_vcpu_return(struct acrn_vcpu *vcpu, uint32_t source)
+{
+	struct arm64_vcpu_last_guest_return *last = &vcpu->arch.debug.last_return;
+	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
+	struct arm64_gicv3_local_irq_state host_irq;
+	uint32_t virq = (gctx->timer_virq == 0U) ?
+		ARM64_GIC_PPI_VIRTUAL_TIMER : gctx->timer_virq;
+	uint64_t now = read_cntvct_el0();
+	uint64_t cval = read_cntv_cval_el0();
+	uint32_t ctl = read_cntv_ctl_el0() &
+		(CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
+
+	(void)memset(&host_irq, 0U, sizeof(host_irq));
+	arm64_gicv3_get_local_irq_state(get_pcpu_id(), ARM64_GIC_PPI_VIRTUAL_TIMER, &host_irq);
+
+	last->tsc = cpu_ticks();
+	last->elr = vcpu->arch.regs.elr;
+	last->spsr = vcpu->arch.regs.spsr;
+	last->cntvct = now;
+	last->cntv_cval = cval;
+	last->hcr = read_ich_hcr_el2();
+	last->vmcr = read_ich_vmcr_el2();
+	last->misr = read_ich_misr_el2();
+	last->eisr = read_ich_eisr_el2();
+	last->elrsr = read_ich_elrsr_el2();
+	last->ap0r0 = read_ich_ap0r0_el2();
+	last->ap1r0 = read_ich_ap1r0_el2();
+	last->sw_lr0 = (vcpu->arch.vgic.used_lrs > 0U) ? vcpu->arch.vgic.lr[0U] : 0UL;
+	last->sw_lr1 = (vcpu->arch.vgic.used_lrs > 1U) ? vcpu->arch.vgic.lr[1U] : 0UL;
+	last->live_lr0 = read_ich_lr_el2(0U);
+	last->live_lr1 = read_ich_lr_el2(1U);
+	last->cntv_ctl = ctl;
+	last->source = source;
+	last->timer_virq = virq;
+	last->used_lrs = vcpu->arch.vgic.used_lrs;
+	last->cntv_expired = ((ctl & CNTV_CTL_ENABLE) != 0U) &&
+		((ctl & CNTV_CTL_IMASK) == 0U) && ((int64_t)(cval - now) <= 0L);
+	last->cntv_el2_masked = gctx->cntv_el2_masked;
+	last->timer_enabled = false;
+	last->timer_pending = false;
+	last->timer_active = false;
+	last->timer_level = false;
+	if ((vcpu->vm != NULL) && (vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS) &&
+		(virq < ARM64_VGIC_IRQ_NUM)) {
+		const struct arm64_vgic_irq *desc =
+			&vcpu->vm->arch_vm.vgic.irq[vcpu->vcpu_id][virq];
+
+		last->timer_enabled = desc->enabled;
+		last->timer_pending = desc->pending;
+		last->timer_active = desc->active;
+		last->timer_level = desc->level;
+	}
+	last->host_valid = host_irq.valid;
+	last->host_enabled = host_irq.enabled != 0U;
+	last->host_pending = host_irq.pending != 0U;
+	last->host_active = host_irq.active != 0U;
+}
+
 static uint64_t *arm64_gpr(struct cpu_regs *regs, uint32_t idx)
 {
 	return (idx < 31U) ? (&regs->x0 + idx) : NULL;
+}
+
+static bool arm64_sysreg_zero_rt(uint32_t rt, bool read)
+{
+	/*
+	 * AArch64 system-register traps encode Rt=31 when the guest uses XZR/WZR.
+	 * Writes with Rt=31 supply a zero value; reads discard the result, so the
+	 * emulator can complete them without trying to write back a GPR.
+	 */
+	return (rt == 31U) && !read;
 }
 
 static uint64_t mmio_size_mask(uint64_t size)
@@ -214,6 +327,22 @@ static struct acrn_vcpu *psci_target_vcpu(struct acrn_vm *vm, uint64_t mpidr)
 	return NULL;
 }
 
+static void record_psci_call(struct acrn_vcpu *vcpu, uint32_t fn,
+	const struct acrn_vcpu *target, int64_t ret)
+{
+	struct arm64_vcpu_last_psci *last = &vcpu->arch.debug.last_psci;
+
+	last->fn = fn;
+	last->target_mpidr = vcpu->arch.regs.x1;
+	last->entry = vcpu->arch.regs.x2;
+	last->context = vcpu->arch.regs.x3;
+	last->ret = ret;
+	last->source_vcpu_id = vcpu->vcpu_id;
+	last->target_vcpu_id = (target != NULL) ?
+		target->vcpu_id : ARM64_VCPU_DEBUG_INVALID_VCPU_ID;
+	last->tsc = cpu_ticks();
+}
+
 static int64_t handle_psci_cpu_on(struct acrn_vcpu *vcpu)
 {
 	struct acrn_vcpu *target = psci_target_vcpu(vcpu->vm, vcpu->arch.regs.x1);
@@ -230,8 +359,28 @@ static int64_t handle_psci_cpu_on(struct acrn_vcpu *vcpu)
 			ret = PSCI_RET_SUCCESS;
 		}
 	}
+	record_psci_call(vcpu, (uint32_t)vcpu->arch.regs.x0, target, ret);
 
 	return ret;
+}
+
+static int64_t handle_psci_features(uint32_t fn)
+{
+	switch (fn) {
+	case PSCI_0_2_FN_PSCI_VERSION:
+	case PSCI_0_2_FN_CPU_OFF:
+	case PSCI_0_2_FN_CPU_ON:
+	case PSCI_0_2_FN_AFFINITY_INFO:
+	case PSCI_0_2_FN_MIGRATE_INFO_TYPE:
+	case PSCI_0_2_FN_SYSTEM_OFF:
+	case PSCI_0_2_FN_SYSTEM_RESET:
+	case PSCI_1_0_FN_PSCI_FEATURES:
+	case PSCI_0_2_FN64_CPU_ON:
+	case PSCI_0_2_FN64_AFFINITY_INFO:
+		return PSCI_RET_SUCCESS;
+	default:
+		return PSCI_RET_NOT_SUPPORTED;
+	}
 }
 
 static int32_t handle_psci64(struct acrn_vcpu *vcpu, bool advance_elr)
@@ -249,6 +398,12 @@ static int32_t handle_psci64(struct acrn_vcpu *vcpu, bool advance_elr)
 	case PSCI_0_2_FN_PSCI_VERSION:
 		ret = 0x00010000L;
 		break;
+	case PSCI_1_0_FN_PSCI_FEATURES:
+		ret = handle_psci_features((uint32_t)vcpu->arch.regs.x1);
+		break;
+	case PSCI_0_2_FN_MIGRATE_INFO_TYPE:
+		ret = PSCI_0_2_TOS_MP;
+		break;
 	case PSCI_0_2_FN_CPU_ON:
 	case PSCI_0_2_FN64_CPU_ON:
 		ret = handle_psci_cpu_on(vcpu);
@@ -262,17 +417,20 @@ static int32_t handle_psci64(struct acrn_vcpu *vcpu, bool advance_elr)
 		target = psci_target_vcpu(vcpu->vm, vcpu->arch.regs.x1);
 		ret = ((target != NULL) && (target->state == VCPU_RUNNING)) ?
 			PSCI_AFFINITY_LEVEL_ON : PSCI_AFFINITY_LEVEL_OFF;
+		record_psci_call(vcpu, fn, target, ret);
 		break;
 	case PSCI_0_2_FN_SYSTEM_OFF:
 	case PSCI_0_2_FN_SYSTEM_RESET:
 		pr_info("vm%u psci system request 0x%x", vcpu->vm->vm_id, fn);
 		zombie_vcpu(vcpu);
 		ret = PSCI_RET_SUCCESS;
+		record_psci_call(vcpu, fn, vcpu, ret);
 		break;
 	default:
 		pr_warn("vm%u-vcpu%u unsupported psci call 0x%x",
 			vcpu->vm->vm_id, vcpu->vcpu_id, fn);
 		ret = PSCI_RET_NOT_SUPPORTED;
+		record_psci_call(vcpu, fn, NULL, ret);
 		break;
 	}
 
@@ -307,8 +465,10 @@ static int32_t handle_hvc64(struct acrn_vcpu *vcpu)
 static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool read, uint64_t *reg)
 {
 	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
+	struct arm64_vcpu_last_timer *last = &vcpu->arch.debug.last_timer;
 	uint64_t now = read_cntvct_el0();
 	uint64_t write_value = (reg != NULL) ? *reg : 0UL;
+	uint32_t write_ctl = (uint32_t)(write_value & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
 	uint64_t val;
 	int32_t ret = 0;
 
@@ -337,21 +497,23 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
-				*reg = read_cntv_ctl_el0();
+				*reg = guest_timer_ctl_value(gctx->cntp_ctl_el0,
+					gctx->cntp_cval_el0, now);
 			}
 		} else {
-			gctx->cntv_ctl_el0 = (uint32_t)write_value;
-			write_cntv_ctl_el0(gctx->cntv_ctl_el0);
+			gctx->cntp_ctl_el0 = write_ctl;
+			write_cntv_ctl_el0(gctx->cntp_ctl_el0);
 		}
 		break;
 	case SYSREG_CNTV_CTL_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
-				*reg = read_cntv_ctl_el0();
+				*reg = guest_timer_ctl_value(gctx->cntv_ctl_el0,
+					gctx->cntv_cval_el0, now);
 			}
 		} else {
-			gctx->cntv_ctl_el0 = (uint32_t)write_value;
+			gctx->cntv_ctl_el0 = write_ctl;
 			write_cntv_ctl_el0(gctx->cntv_ctl_el0);
 		}
 		break;
@@ -359,18 +521,18 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
-				*reg = read_cntv_cval_el0();
+				*reg = gctx->cntp_cval_el0;
 			}
 		} else {
-			gctx->cntv_cval_el0 = write_value;
-			write_cntv_cval_el0(gctx->cntv_cval_el0);
+			gctx->cntp_cval_el0 = write_value;
+			write_cntv_cval_el0(gctx->cntp_cval_el0);
 		}
 		break;
 	case SYSREG_CNTV_CVAL_EL0:
 		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
-				*reg = read_cntv_cval_el0();
+				*reg = gctx->cntv_cval_el0;
 			}
 		} else {
 			gctx->cntv_cval_el0 = write_value;
@@ -381,11 +543,11 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
-				*reg = read_cntv_cval_el0() - now;
+				*reg = (uint32_t)(gctx->cntp_cval_el0 - now);
 			}
 		} else {
-			val = now + (uint32_t)write_value;
-			gctx->cntv_cval_el0 = val;
+			val = now + (uint64_t)(int32_t)(uint32_t)write_value;
+			gctx->cntp_cval_el0 = val;
 			write_cntv_cval_el0(val);
 		}
 		break;
@@ -393,10 +555,10 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
-				*reg = read_cntv_cval_el0() - now;
+				*reg = (uint32_t)(gctx->cntv_cval_el0 - now);
 			}
 		} else {
-			val = now + (uint32_t)write_value;
+			val = now + (uint64_t)(int32_t)(uint32_t)write_value;
 			gctx->cntv_cval_el0 = val;
 			write_cntv_cval_el0(val);
 		}
@@ -405,6 +567,18 @@ static int32_t handle_timer_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg, bool
 		ret = -EINVAL;
 		break;
 	}
+
+	last->cval = (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
+		gctx->cntp_cval_el0 : gctx->cntv_cval_el0;
+	last->ctl = (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
+		guest_timer_ctl_value(gctx->cntp_ctl_el0, gctx->cntp_cval_el0, now) :
+		guest_timer_ctl_value(gctx->cntv_ctl_el0, gctx->cntv_cval_el0, now);
+	last->virq = gctx->timer_virq;
+	last->sysreg = (uint32_t)sysreg;
+	last->status = ret;
+	last->write = !read;
+	last->injected = false;
+	last->tsc = cpu_ticks();
 
 	return ret;
 }
@@ -417,17 +591,55 @@ static int32_t handle_sysreg(struct acrn_vcpu *vcpu)
 	uint64_t sysreg = iss & ~(ESR_SYSREG_RT_MASK << ESR_SYSREG_RT_SHIFT) &
 		~ESR_SYSREG_DIR_READ;
 	uint32_t rt = (uint32_t)((iss >> ESR_SYSREG_RT_SHIFT) & ESR_SYSREG_RT_MASK);
+	bool read = ((iss & ESR_SYSREG_DIR_READ) != 0UL);
 	uint64_t *reg = arm64_gpr(regs, rt);
+	uint64_t zero_reg = 0UL;
 	int32_t ret = -EINVAL;
+
+	if ((reg == NULL) && arm64_sysreg_zero_rt(rt, read)) {
+		reg = &zero_reg;
+	}
 
 	/*
 	 * ICC_SGI1R_EL1 is trapped so guest SGI sends become vGIC software state
 	 * updates. Other system registers are left unsupported until a guest needs
 	 * them; failing closed makes missing virtualization explicit.
 	 */
-	if (((iss & ESR_SYSREG_DIR_READ) == 0UL) && (sysreg == SYSREG_ICC_SGI1R_EL1) &&
+	if (((iss & ESR_SYSREG_DIR_READ) == 0UL) &&
+		((sysreg == SYSREG_ICC_SGI1R_EL1) || (sysreg == SYSREG_ICC_SGI0R_EL1) ||
+		(sysreg == SYSREG_ICC_ASGI1R_EL1)) &&
 		(reg != NULL)) {
 		ret = arm64_vgicv3_handle_sgi1r(vcpu, *reg);
+		if (ret == 0) {
+			advance_vcpu_elr(vcpu);
+		}
+	} else if ((sysreg == SYSREG_ICC_PMR_EL1) || (sysreg == SYSREG_ICC_CTLR_EL1) ||
+		(sysreg == SYSREG_ICC_SRE_EL1) || (sysreg == SYSREG_ICC_IGRPEN1_EL1) ||
+		(sysreg == SYSREG_ICC_DIR_EL1) || (sysreg == SYSREG_ICC_RPR_EL1)) {
+		uint32_t vgic_sysreg;
+
+		switch (sysreg) {
+		case SYSREG_ICC_PMR_EL1:
+			vgic_sysreg = ARM64_VGIC_SYSREG_ICC_PMR_EL1;
+			break;
+		case SYSREG_ICC_DIR_EL1:
+			vgic_sysreg = ARM64_VGIC_SYSREG_ICC_DIR_EL1;
+			break;
+		case SYSREG_ICC_RPR_EL1:
+			vgic_sysreg = ARM64_VGIC_SYSREG_ICC_RPR_EL1;
+			break;
+		case SYSREG_ICC_CTLR_EL1:
+			vgic_sysreg = ARM64_VGIC_SYSREG_ICC_CTLR_EL1;
+			break;
+		case SYSREG_ICC_SRE_EL1:
+			vgic_sysreg = ARM64_VGIC_SYSREG_ICC_SRE_EL1;
+			break;
+		default:
+			vgic_sysreg = ARM64_VGIC_SYSREG_ICC_IGRPEN1_EL1;
+			break;
+		}
+		ret = arm64_vgicv3_handle_cpuif_sysreg(vcpu, vgic_sysreg,
+			read, reg);
 		if (ret == 0) {
 			advance_vcpu_elr(vcpu);
 		}
@@ -435,13 +647,79 @@ static int32_t handle_sysreg(struct acrn_vcpu *vcpu)
 		(sysreg == SYSREG_CNTP_CTL_EL0) || (sysreg == SYSREG_CNTP_CVAL_EL0) ||
 		(sysreg == SYSREG_CNTP_TVAL_EL0) || (sysreg == SYSREG_CNTV_CTL_EL0) ||
 		(sysreg == SYSREG_CNTV_CVAL_EL0) || (sysreg == SYSREG_CNTV_TVAL_EL0)) {
-		ret = handle_timer_sysreg(vcpu, sysreg, ((iss & ESR_SYSREG_DIR_READ) != 0UL), reg);
+		ret = handle_timer_sysreg(vcpu, sysreg, read, reg);
 		if (ret == 0) {
 			advance_vcpu_elr(vcpu);
+			if (!read) {
+				arm64_vgicv3_update_current_vtimer(vcpu);
+			}
 		}
 	}
 
 	return ret;
+}
+
+static int32_t handle_wfx(struct acrn_vcpu *vcpu)
+{
+	bool is_wfe = ESR_WFX_IS_WFE(vcpu->arch.regs.esr);
+	bool pending_irq;
+	bool irq_masked;
+	bool request_pending;
+	bool should_yield;
+	struct arm64_vcpu_last_wfx *last = &vcpu->arch.debug.last_wfx;
+
+	advance_vcpu_elr(vcpu);
+
+	/*
+	 * WFI observes pending interrupts at the instruction boundary. Sample the
+	 * loaded CNTV state before deciding whether this trapped WFI can yield;
+	 * otherwise an expired guest timer could be missed until another exit.
+	 */
+	arm64_vgicv3_poll_current_vtimer(vcpu);
+	arm64_vgicv3_update_current_vtimer(vcpu);
+	arm64_vgicv3_complete_wfi_irqs(vcpu);
+	pending_irq = arm64_vgicv3_has_pending_irq(vcpu);
+	irq_masked = ((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL);
+	request_pending = vcpu_has_pending_request(vcpu);
+	should_yield = is_wfe || (!request_pending && (!pending_irq || irq_masked));
+
+	last->esr = vcpu->arch.regs.esr;
+	last->elr = vcpu->arch.regs.elr;
+	last->cntvct = read_cntvct_el0();
+	last->cntv_cval = read_cntv_cval_el0();
+	last->cntv_ctl = read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
+	last->hcr = read_ich_hcr_el2();
+	last->misr = read_ich_misr_el2();
+	last->ap0r0 = read_ich_ap0r0_el2();
+	last->ap1r0 = read_ich_ap1r0_el2();
+	last->lr0 = (vcpu->arch.vgic.used_lrs > 0U) ? vcpu->arch.vgic.lr[0U] : 0UL;
+	last->lr1 = (vcpu->arch.vgic.used_lrs > 1U) ? vcpu->arch.vgic.lr[1U] : 0UL;
+	last->live_lr0 = read_ich_lr_el2(0U);
+	last->live_lr1 = read_ich_lr_el2(1U);
+	last->used_lrs = vcpu->arch.vgic.used_lrs;
+	last->is_wfe = is_wfe;
+	last->pending_irq = pending_irq;
+	last->irq_masked = irq_masked;
+	last->request_pending = request_pending;
+	last->yielded = should_yield;
+	last->cntv_expired = ((last->cntv_ctl & CNTV_CTL_ENABLE) != 0U) &&
+		((last->cntv_ctl & CNTV_CTL_IMASK) == 0U) &&
+		((int64_t)(last->cntv_cval - last->cntvct) <= 0L);
+	last->cntv_el2_masked = vcpu->arch.gctx.cntv_el2_masked;
+	last->tsc = cpu_ticks();
+
+	/*
+	 * WFI can resume immediately only when a pending virtual IRQ can be taken
+	 * by EL1. If DAIF.I is still set, returning with the same pending LR just
+	 * re-enters the idle trap path; yield until a host tick or event lets the
+	 * guest reach the point where it unmasks interrupts. WFE has event-register
+	 * semantics that are not modeled yet, so yielding one slice is conservative.
+	 */
+	if (should_yield) {
+		yield_current();
+	}
+
+	return 0;
 }
 
 int32_t vcpu_exit_handler(struct acrn_vcpu *vcpu)
@@ -468,12 +746,13 @@ int32_t vcpu_exit_handler(struct acrn_vcpu *vcpu)
 		ret = handle_sysreg(vcpu);
 		break;
 	case ESR_EL2_EC_WFI_WFE:
-		advance_vcpu_elr(vcpu);
-		ret = 0;
+		ret = handle_wfx(vcpu);
 		break;
 	default:
 		break;
 	}
+
+	record_vcpu_exit(vcpu, ARM64_VCPU_DEBUG_EXIT_SYNC, ret);
 
 	if (ret == 0) {
 		return 0;
@@ -510,8 +789,11 @@ void dispatch_vcpu_trap(struct cpu_regs *regs)
 
 	if (need_reschedule(pcpu_id)) {
 		schedule();
+		vcpu = get_exit_vcpu(pcpu_id);
 	}
 
+	arm64_vgicv3_poll_current_vtimer(vcpu);
+	arm64_vgicv3_update_current_vtimer(vcpu);
 	ret = arm64_process_vcpu_requests(vcpu);
 	if (ret < 0) {
 		pr_fatal("failed to process arm64 vcpu requests");
@@ -521,6 +803,7 @@ void dispatch_vcpu_trap(struct cpu_regs *regs)
 		schedule();
 	}
 
+	record_vcpu_return(vcpu, ARM64_VCPU_DEBUG_EXIT_SYNC);
 	restore_exit_regs(regs, vcpu);
 }
 
@@ -540,6 +823,7 @@ void dispatch_vcpu_irq(struct cpu_regs *regs)
 	 * possible context switch and before returning to EL1.
 	 */
 	save_exit_regs(vcpu, regs);
+	record_vcpu_exit(vcpu, ARM64_VCPU_DEBUG_EXIT_IRQ, 0);
 
 	dispatch_interrupt_no_softirq((const struct intr_excp_ctx *)regs);
 	local_irq_disable();
@@ -547,8 +831,11 @@ void dispatch_vcpu_irq(struct cpu_regs *regs)
 
 	if (need_reschedule(pcpu_id)) {
 		schedule();
+		vcpu = get_exit_vcpu(pcpu_id);
 	}
 
+	arm64_vgicv3_poll_current_vtimer(vcpu);
+	arm64_vgicv3_update_current_vtimer(vcpu);
 	ret = arm64_process_vcpu_requests(vcpu);
 	if (ret < 0) {
 		pr_fatal("failed to process arm64 vcpu requests");
@@ -558,5 +845,6 @@ void dispatch_vcpu_irq(struct cpu_regs *regs)
 		schedule();
 	}
 
+	record_vcpu_return(vcpu, ARM64_VCPU_DEBUG_EXIT_IRQ);
 	restore_exit_regs(regs, vcpu);
 }

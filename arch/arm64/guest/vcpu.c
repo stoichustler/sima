@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -61,6 +61,7 @@ static void restore_el1_sysregs(const struct arm64_vcpu_guest_ctx *gctx)
 	write_afsr0_el1(gctx->afsr0_el1);
 	write_afsr1_el1(gctx->afsr1_el1);
 	write_par_el1(gctx->par_el1);
+	write_cntkctl_el1(gctx->cntkctl_el1);
 	write_sctlr_el1(gctx->sctlr_el1);
 	flush_tlb_local();
 }
@@ -93,6 +94,49 @@ static void save_el1_sysregs(struct arm64_vcpu_guest_ctx *gctx)
 	gctx->afsr0_el1 = read_afsr0_el1();
 	gctx->afsr1_el1 = read_afsr1_el1();
 	gctx->par_el1 = read_par_el1();
+	gctx->cntkctl_el1 = read_cntkctl_el1();
+}
+
+static void load_guest_timer(struct arm64_vcpu_guest_ctx *gctx)
+{
+	uint32_t ctl;
+
+	if (gctx->cntv_el2_masked) {
+		arm64_gicv3_disable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+		arm64_gicv3_clear_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+	} else {
+		arm64_gicv3_enable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+	}
+
+	write_cntv_ctl_el0(0U);
+	if (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+		write_cntv_cval_el0(gctx->cntp_cval_el0);
+		ctl = gctx->cntp_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+	} else {
+		write_cntv_cval_el0(gctx->cntv_cval_el0);
+		ctl = gctx->cntv_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+	}
+	write_cntv_ctl_el0(ctl);
+}
+
+static void save_guest_timer(struct arm64_vcpu_guest_ctx *gctx)
+{
+	uint32_t ctl;
+
+	/*
+	 * Linux may access the EL1 virtual timer directly when the trap is not
+	 * taken by the CPU model. Keep the guest shadow synchronized on vCPU
+	 * switch-out. EL2's anti-storm state is tracked through the host GIC PPI,
+	 * so CNTV_CTL remains the guest-programmed value.
+	 */
+	ctl = read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+	if (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+		gctx->cntp_cval_el0 = read_cntv_cval_el0();
+		gctx->cntp_ctl_el0 = ctl;
+	} else {
+		gctx->cntv_cval_el0 = read_cntv_cval_el0();
+		gctx->cntv_ctl_el0 = ctl;
+	}
 }
 
 void load_vcpu(__unused struct acrn_vcpu *vcpu)
@@ -101,9 +145,10 @@ void load_vcpu(__unused struct acrn_vcpu *vcpu)
 
 	/*
 	 * VTTBR/VTCR select the VM's stage-2 table, VMPIDR gives the guest its
-	 * virtual CPU identity, and CNTHCTL exposes only the virtual counter/timer
-	 * to EL1. The host keeps the physical timer for scheduler ticks, while
-	 * guest timer programming is carried in the vCPU's CNTV state.
+	 * virtual CPU identity, and CNTHCTL keeps guest timer programming trapped
+	 * while allowing EL1 counter reads to stay direct. The host keeps the
+	 * physical timer for scheduler ticks, while guest timer programming is
+	 * carried in the vCPU's CNTV state and reconciled with the vGIC on writes.
 	 *
 	 * The EL1 register image and vGIC state must be loaded before guest entry
 	 * so address translation, exception return state, and pending virtual
@@ -113,11 +158,10 @@ void load_vcpu(__unused struct acrn_vcpu *vcpu)
 	write_vttbr_el2(gctx->vttbr_el2);
 	flush_stage2_tlb_local();
 	write_vmpidr_el2(vcpu_get_vmpidr(vcpu));
-	write_cnthctl_el2(CNTHCTL_EL2_EL1VCTEN | CNTHCTL_EL2_EL1VTEN);
+	write_cnthctl_el2(CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1TVT);
 	asm volatile ("msr cntvoff_el2, %0; isb" : : "r" (gctx->cntvoff_el2) : "memory");
 	restore_el1_sysregs(gctx);
-	write_cntv_cval_el0(gctx->cntv_cval_el0);
-	write_cntv_ctl_el0(gctx->cntv_ctl_el0);
+	load_guest_timer(gctx);
 	arm64_vgicv3_load_vcpu(vcpu);
 	write_hcr_el2(gctx->hcr_el2);
 }
@@ -134,9 +178,9 @@ void unload_vcpu(__unused struct acrn_vcpu *vcpu)
 	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
 
 	save_el1_sysregs(gctx);
-	gctx->cntv_cval_el0 = read_cntv_cval_el0();
-	gctx->cntv_ctl_el0 = read_cntv_ctl_el0();
+	save_guest_timer(gctx);
 	write_cntv_ctl_el0(0U);
+	arm64_gicv3_enable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
 	arm64_vgicv3_save_vcpu(vcpu);
 	write_hcr_el2(0UL);
 	write_vttbr_el2(0UL);
@@ -190,17 +234,24 @@ int32_t arch_init_vcpu(struct acrn_vcpu *vcpu)
 
 	/*
 	 * Each vCPU points at the VM's stage-2 root and starts with EL1 AArch64
-	 * enabled. Traps for PSCI and IRQ routing are configured through HCR, while
-	 * CNTVOFF gives the guest a VM-relative virtual counter.
+	 * enabled. HCR routes guest physical interrupts to EL2 and traps PSCI.
+	 * WFI/WFE are left to hardware, matching the simple ARMv8 vGIC model where
+	 * guest idle waits are woken by the virtual CPU interface instead of being
+	 * turned into an EL2 timer polling loop. CNTVOFF gives the guest a
+	 * VM-relative virtual counter.
 	 */
 	reset_vcpu(vcpu);
 	gctx->vttbr_el2 = hva2hpa(vcpu->vm->root_stg2ptp);
 	gctx->vtcr_el2 = VTCR_EL2_VALUE;
 	gctx->hcr_el2 = HCR_VM | HCR_RW | HCR_IMO | HCR_FMO | HCR_AMO | HCR_TSC;
 	gctx->cntvoff_el2 = (uint64_t)vcpu->vm->arch_vm.time_delta;
+	gctx->cntp_cval_el0 = 0UL;
 	gctx->cntv_cval_el0 = 0UL;
+	gctx->cntp_ctl_el0 = 0U;
 	gctx->cntv_ctl_el0 = 0U;
 	gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+	gctx->cntv_el2_masked = false;
+	gctx->cntkctl_el1 = read_cntkctl_el1();
 	gctx->sctlr_el1 = read_sctlr_el1();
 	gctx->ttbr0_el1 = read_ttbr0_el1();
 	gctx->ttbr1_el1 = read_ttbr1_el1();
@@ -227,6 +278,7 @@ int32_t arch_init_vcpu(struct acrn_vcpu *vcpu)
 
 void arch_deinit_vcpu(__unused struct acrn_vcpu *vcpu)
 {
+	arm64_vgicv3_cancel_vtimer_backup(vcpu);
 }
 
 void arch_vcpu_thread(struct thread_object *obj)
@@ -262,6 +314,7 @@ void arch_vcpu_thread(struct thread_object *obj)
 
 void arch_reset_vcpu(struct acrn_vcpu *vcpu)
 {
+	arm64_vgicv3_cancel_vtimer_backup(vcpu);
 	memset(&vcpu->arch, 0, sizeof(vcpu->arch));
 	vcpu->arch.trap.esr = EXCEPTION_INVALID;
 	vcpu->arch.regs.spsr = SPSR_EL2_MODE_EL1H | DAIF_ALL;

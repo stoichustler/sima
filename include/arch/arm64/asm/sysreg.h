@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -10,7 +10,7 @@
 #include <types.h>
 
 /*
- * ARM64 system-register quick reference for CLAN:
+ * ARM64 system-register quick reference for SIMA:
  *
  * MPIDR_EL1: CPU affinity identifier. The low affinity levels are used to map
  *            physical CPUs, redistributors, and guest vMPIDR values.
@@ -55,17 +55,25 @@
 #define CNTV_CTL_IMASK		(1U << 1U)
 #define CNTV_CTL_ISTATUS	(1U << 2U)
 
-/* CNTHCTL_EL2 grants EL1 access to physical/virtual counter and timer state. */
+/*
+ * CNTHCTL_EL2 controls EL1 timer access when HCR_EL2.E2H is clear. Bits 8/9
+ * belong to the EL1 CNTKCTL view; EL1 virtual timer trapping uses EL1TVT.
+ */
 #define CNTHCTL_EL2_EL1PCTEN	(1UL << 0U)
 #define CNTHCTL_EL2_EL1PCEN	(1UL << 1U)
-#define CNTHCTL_EL2_EL1VCTEN	(1UL << 8U)
-#define CNTHCTL_EL2_EL1VTEN	(1UL << 9U)
+#define CNTHCTL_EL2_EVNTEN	(1UL << 2U)
+#define CNTHCTL_EL2_EVNTDIR	(1UL << 3U)
+#define CNTHCTL_EL2_ECV		(1UL << 12U)
+#define CNTHCTL_EL2_EL1TVT	(1UL << 13U)
+#define CNTHCTL_EL2_EL1TVCT	(1UL << 14U)
 
 /* HCR_EL2 controls virtualization, interrupt routing, guest width, and traps. */
 #define HCR_VM			(1UL << 0U)
 #define HCR_IMO			(1UL << 4U)
 #define HCR_FMO			(1UL << 3U)
 #define HCR_AMO			(1UL << 5U)
+#define HCR_TWI			(1UL << 13U)
+#define HCR_TWE			(1UL << 14U)
 #define HCR_RW			(1UL << 31U)
 #define HCR_VI			(1UL << 7U)
 #define HCR_VF			(1UL << 6U)
@@ -76,14 +84,28 @@
 #define ICH_HCR_UIE		(1UL << 1U)
 #define ICH_HCR_LRENPIE		(1UL << 2U)
 #define ICH_HCR_NPIE		(1UL << 3U)
+#define ICH_HCR_TC		(1UL << 10U)
+#define ICH_HCR_EOICOUNT_SHIFT	27U
+/* EOIcount is hardware completion status, not control state to restore. */
+#define ICH_HCR_EOICOUNT_MASK	(0x1fUL << ICH_HCR_EOICOUNT_SHIFT)
+
+/* ICH_MISR_EL2 reports which virtual GIC maintenance conditions are asserted. */
+#define ICH_MISR_EOI		(1UL << 0U)
+#define ICH_MISR_U		(1UL << 1U)
+#define ICH_MISR_LRENP		(1UL << 2U)
+#define ICH_MISR_NP		(1UL << 3U)
+#define ICH_MISR_VGRP1E		(1UL << 6U)
+#define ICH_MISR_VGRP1D		(1UL << 7U)
 
 /* ICH_VMCR_EL2 mirrors guest-visible GIC CPU-interface control state. */
 #define ICH_VMCR_VENG1		(1UL << 1U)
+#define ICH_VMCR_EOIM		(1UL << 9U)
 #define ICH_VMCR_DEFAULT_MASK	(0xf8UL << 24U)
 
 /* ICH_LR<n> encodes one virtual interrupt presented through a list register. */
 #define ICH_LR_VINTID_MASK	0xffffffffUL
 #define ICH_LR_PINTID_SHIFT	32U
+#define ICH_LR_EOI		(1UL << 41U)
 #define ICH_LR_PRIORITY_SHIFT	48U
 #define ICH_LR_GROUP1		(1UL << 60U)
 #define ICH_LR_HW		(1UL << 61U)
@@ -178,9 +200,46 @@ static inline void write_cnthctl_el2(uint64_t val)
 	asm volatile ("msr cnthctl_el2, %0; isb" : : "r" (val) : "memory");
 }
 
+static inline uint64_t read_cntvoff_el2(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, cntvoff_el2" : "=r" (val));
+	return val;
+}
+
+static inline uint64_t read_cnthctl_el2(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, cnthctl_el2" : "=r" (val));
+	return val;
+}
+
 static inline void write_cntp_tval_el0(uint32_t val)
 {
 	asm volatile ("msr cntp_tval_el0, %0" : : "r" (val));
+}
+
+static inline uint64_t read_cntp_cval_el0(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, cntp_cval_el0" : "=r" (val));
+	return val;
+}
+
+static inline void write_cntp_cval_el0(uint64_t val)
+{
+	asm volatile ("msr cntp_cval_el0, %0" : : "r" (val));
+}
+
+static inline uint32_t read_cntp_ctl_el0(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, cntp_ctl_el0" : "=r" (val));
+	return (uint32_t)val;
 }
 
 static inline void write_cntp_ctl_el0(uint32_t val)
@@ -224,6 +283,14 @@ static inline void write_icc_ctlr_el1(uint64_t val)
 static inline void write_icc_igrpen1_el1(uint64_t val)
 {
 	asm volatile ("msr s3_0_c12_c12_7, %0; isb" : : "r" (val) : "memory");
+}
+
+static inline uint64_t read_icc_igrpen1_el1(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, s3_0_c12_c12_7" : "=r" (val));
+	return val;
 }
 
 static inline void write_icc_sre_el2(uint64_t val)
@@ -299,6 +366,14 @@ static inline uint64_t read_ich_eisr_el2(void)
 	uint64_t val;
 
 	asm volatile ("mrs %0, s3_4_c12_c11_3" : "=r" (val));
+	return val;
+}
+
+static inline uint64_t read_ich_misr_el2(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, s3_4_c12_c11_2" : "=r" (val));
 	return val;
 }
 
@@ -435,6 +510,19 @@ static inline uint64_t read_sctlr_el1(void)
 static inline void write_sctlr_el1(uint64_t val)
 {
 	asm volatile ("msr sctlr_el1, %0; isb" : : "r" (val) : "memory");
+}
+
+static inline uint64_t read_cntkctl_el1(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, cntkctl_el1" : "=r" (val));
+	return val;
+}
+
+static inline void write_cntkctl_el1(uint64_t val)
+{
+	asm volatile ("msr cntkctl_el1, %0; isb" : : "r" (val) : "memory");
 }
 
 static inline uint64_t read_ttbr0_el1(void)

@@ -1,5 +1,5 @@
 #
-# acrn-hypervisor/hypervisor/Makefile
+# SIMA hypervisor Makefile
 #
 
 API_MAJOR_VERSION=1
@@ -16,11 +16,15 @@ MAKEFLAGS += -rR --no-print-directory
 BASEDIR := $(shell pwd)
 GIT_TOPDIR := $(shell git rev-parse --show-toplevel 2>/dev/null)
 LICENSE_FILE := $(or $(firstword $(wildcard ../LICENSE $(if $(GIT_TOPDIR),$(GIT_TOPDIR)/LICENSE))),/dev/null)
-HV_OBJDIR ?= $(CURDIR)/build
+ifeq ($(strip $(PLATFORM)),)
+HV_DEFAULT_OBJDIR := $(CURDIR)/out/default_out
+else
+HV_DEFAULT_OBJDIR := $(CURDIR)/out/$(PLATFORM)_out
+endif
+HV_OBJDIR ?= $(HV_DEFAULT_OBJDIR)
 HV_MODDIR ?= $(HV_OBJDIR)/modules
-HV_FILE := clan
-HV_DEBUG_FILE := clan.debug
-HV_COMPAT_FILE := acrn
+HV_FILE := sima
+HV_DEBUG_FILE := sima.debug
 
 # initialize the flags we used
 CFLAGS :=
@@ -33,14 +37,14 @@ ARCH_ARFLAGS :=
 ARCH_LDFLAGS :=
 
 PLATFORM ?=
-STATIC_QEMU_ARM64_CONFIG := $(if $(filter arm64,$(ARCH)),$(if $(filter qemu,$(PLATFORM)),y,))
+STATIC_ARM64_PLATFORM := $(if $(filter arm64,$(ARCH)),$(if $(filter qemu rk356x,$(PLATFORM)),y,))
 
-ifeq ($(STATIC_QEMU_ARM64_CONFIG),y)
-BOARD := qemu
-SCENARIO := qemu
+ifeq ($(STATIC_ARM64_PLATFORM),y)
+BOARD := $(PLATFORM)
+SCENARIO := $(PLATFORM)
 RELEASE ?= n
-CONFIG_BOARD := qemu
-CONFIG_SCENARIO := qemu
+CONFIG_BOARD := $(PLATFORM)
+CONFIG_SCENARIO := $(PLATFORM)
 CONFIG_RELEASE := n
 CONFIG_RELOC := n
 CONFIG_MULTIBOOT2 := n
@@ -51,7 +55,12 @@ CONFIG_GUEST_KERNEL_BZIMAGE := n
 CONFIG_GUEST_KERNEL_ELF := n
 CONFIG_SCHED_IORR := y
 HV_CONFIG_DIR := $(HV_OBJDIR)/configs
-HV_CONFIG_H := arch/arm64/platform/qemu/platform_qemu.h
+HV_CONFIG_H := arch/arm64/platform/$(PLATFORM)/platform_$(PLATFORM).h
+ifeq ($(PLATFORM),qemu)
+CONFIG_HV_RAM_START := 0x50000000
+else ifeq ($(PLATFORM),rk356x)
+CONFIG_HV_RAM_START := 0x00A00000
+endif
 CFLAGS += -include $(HV_CONFIG_H)
 HV_CONFIG_MK := $(HV_CONFIG_DIR)/config.mk
 HV_CONFIG_TIMESTAMP := $(HV_CONFIG_DIR)/.configfiles.timestamp
@@ -60,10 +69,10 @@ else
 include scripts/makefile/config.mk
 endif
 
-ifeq ($(STATIC_QEMU_ARM64_CONFIG),y)
-BOARD_INFO_DIR := arch/arm64/platform/qemu
-SCENARIO_CFG_DIR := arch/arm64/platform/qemu
-BOARD_CFG_DIR := arch/arm64/platform/qemu
+ifeq ($(STATIC_ARM64_PLATFORM),y)
+BOARD_INFO_DIR := arch/arm64/platform/$(PLATFORM)
+SCENARIO_CFG_DIR := arch/arm64/platform/$(PLATFORM)
+BOARD_CFG_DIR := arch/arm64/platform/$(PLATFORM)
 else
 BOARD_INFO_DIR := $(HV_CONFIG_DIR)/boards
 SCENARIO_CFG_DIR := $(HV_CONFIG_DIR)/scenarios/$(SCENARIO)
@@ -159,6 +168,7 @@ AR ?= ar
 LD ?= ld
 OBJCOPY ?= objcopy
 NM ?= $(CROSS_COMPILE)nm
+DTC ?= dtc
 
 include arch/$(ARCH)/Makefile
 
@@ -329,17 +339,39 @@ endif
 
 DISTCLEAN_OBJS := $(shell find $(BASEDIR) -name '*.o')
 VERSION := $(HV_OBJDIR)/include/version.h
-HEADERS := $(VERSION) $(HV_CONFIG_H) $(HV_CONFIG_TIMESTAMP)
+LINUX_IMAGE_SIZE_H :=
+ifeq ($(STATIC_ARM64_PLATFORM),y)
+LINUX_IMAGE_SIZE_H := $(HV_OBJDIR)/include/linux_image_sizes.h
+endif
+HEADERS := $(VERSION) $(HV_CONFIG_H) $(HV_CONFIG_TIMESTAMP) $(LINUX_IMAGE_SIZE_H)
 
-ifeq ($(STATIC_QEMU_ARM64_CONFIG),y)
+ifeq ($(STATIC_ARM64_PLATFORM),y)
 $(HV_CONFIG_MK): | $(HV_CONFIG_DIR)
-	@echo "CONFIG_HV_RAM_START=0x50000000" > $@
+	@echo "CONFIG_HV_RAM_START=$(CONFIG_HV_RAM_START)" > $@
 
 $(HV_CONFIG_TIMESTAMP): $(HV_CONFIG_MK)
 	@touch $@
 
 $(HV_CONFIG_DIR):
 	@mkdir -p $@
+
+ifneq ($(LINUX_IMAGE_SIZE_H),)
+$(LINUX_IMAGE_SIZE_H): sdk/images/linux/Image sdk/images/linux/Initrd | $(HV_OBJDIR)/include
+	@echo "images    $(notdir $@)"
+	@{ \
+		image_size=$$(stat -c %s sdk/images/linux/Image); \
+		initrd_size=$$(stat -c %s sdk/images/linux/Initrd); \
+		echo "/* Auto-generated from sdk/images. */"; \
+		echo "#ifndef LINUX_IMAGE_SIZES_H"; \
+		echo "#define LINUX_IMAGE_SIZES_H"; \
+		echo "#define SIMA_LINUX_IMAGE_SIZE $${image_size}U"; \
+		echo "#define SIMA_LINUX_INITRD_SIZE $${initrd_size}U"; \
+		echo "#endif /* LINUX_IMAGE_SIZES_H */"; \
+	} > $@
+
+$(HV_OBJDIR)/include:
+	@mkdir -p $@
+endif
 endif
 
 .PHONY: all
@@ -363,8 +395,6 @@ $(COMMON_MOD): $(COMMON_C_OBJS)
 $(HV_OBJDIR)/$(HV_DEBUG_FILE).bin: $(HV_OBJDIR)/$(HV_DEBUG_FILE).out
 	$(Q)echo "objcopy   $(notdir $@)"
 	$(Q)$(OBJCOPY) -O binary $< $@
-	$(Q)cp $< $(HV_OBJDIR)/$(HV_COMPAT_FILE).out
-	$(Q)cp $@ $(HV_OBJDIR)/$(HV_COMPAT_FILE).bin
 	$(Q)rm -f $(UPDATE_RESULT)
 
 $(HV_OBJDIR)/$(HV_FILE).out: $(MODULES)
@@ -449,6 +479,16 @@ $(VM_CFG_C_OBJS): $(HV_OBJDIR)/%.o: %.c $(HEADERS) $(ARCH_PRE_BUILD_TARGETS)
 	$(Q)[ ! -e $@ ] && mkdir -p $(dir $@) && mkdir -p $(HV_MODDIR); \
 	echo "cc        $(notdir $@)"; \
 	$(CC) $(patsubst %, -I%, $(INCLUDE_PATH)) -I. -c $(CFLAGS) $(ARCH_CFLAGS) $< -o $@ -MMD -MT $@
+
+ifeq ($(ARCH),arm64)
+ifeq ($(PLATFORM),qemu)
+sdk/images/linux/sima-linux.dtb: sdk/images/linux/sima-linux.dts
+	$(Q)echo "dtc       $@"
+	$(Q)$(DTC) -I dts -O dtb -o $@ $<
+
+$(HV_OBJDIR)/arch/arm64/platform/qemu/platform_image.o: sdk/images/linux/sima-linux.dtb
+endif
+endif
 
 $(HV_OBJDIR)/%.o: %.S $(HEADERS) $(ARCH_PRE_BUILD_TARGETS)
 	$(Q)[ ! -e $@ ] && mkdir -p $(dir $@) && mkdir -p $(HV_MODDIR); \

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -21,6 +21,13 @@
 #define ARM64_VGIC_MAX_VCPUS		MAX_PCPU_NUM
 
 #define ARM64_VGIC_MAINTENANCE_INTID	ARM64_GIC_PPI_VGIC_MAINTENANCE
+
+#define ARM64_VGIC_SYSREG_ICC_PMR_EL1		0U
+#define ARM64_VGIC_SYSREG_ICC_CTLR_EL1		1U
+#define ARM64_VGIC_SYSREG_ICC_SRE_EL1		2U
+#define ARM64_VGIC_SYSREG_ICC_IGRPEN1_EL1	3U
+#define ARM64_VGIC_SYSREG_ICC_DIR_EL1		4U
+#define ARM64_VGIC_SYSREG_ICC_RPR_EL1		5U
 
 struct acrn_vm;
 struct acrn_vcpu;
@@ -88,15 +95,23 @@ void arm64_vgicv3_global_init(void);
 void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity);
 void arm64_vgicv3_init_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_reset_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_cancel_vtimer_backup(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_load_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_save_vcpu(struct acrn_vcpu *vcpu);
 int32_t arm64_vgicv3_inject_irq(struct acrn_vcpu *vcpu, uint32_t virq, bool level);
 int32_t arm64_vgicv3_clear_irq(struct acrn_vcpu *vcpu, uint32_t virq);
+int32_t arm64_vgicv3_deassert_irq(struct acrn_vcpu *vcpu, uint32_t virq);
+int32_t arm64_vgicv3_handle_cpuif_sysreg(struct acrn_vcpu *vcpu, uint32_t sysreg,
+	bool read, uint64_t *reg);
 int32_t arm64_vgicv3_handle_sgi1r(struct acrn_vcpu *vcpu, uint64_t value);
 void arm64_vgicv3_flush_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_sync_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_flush_current_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_sync_current_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_complete_wfi_irqs(struct acrn_vcpu *vcpu);
+bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_poll_current_vtimer(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_update_current_vtimer(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_maintenance_irq_handler(uint32_t irq, void *data);
 void arm64_vgicv3_virtual_timer_irq_handler(uint32_t irq, void *data);
 int32_t arm64_vgicv3_mmio_handler(struct io_request *io_req, void *handler_private_data);

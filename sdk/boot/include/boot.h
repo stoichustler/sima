@@ -9,7 +9,7 @@
 
 #include <multiboot_std.h>
 #include <efi.h>
-#ifndef CONFIG_STATIC_QEMU_PLATFORM
+#ifndef CONFIG_STATIC_ARM64_PLATFORM
 #include <vm_configurations.h>
 #endif
 

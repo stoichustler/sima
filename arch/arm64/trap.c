@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -36,9 +36,33 @@ static void unexpected_trap_handler(const struct intr_excp_ctx *ctx, uint64_t tr
 	reset_host(false);
 }
 
+static bool dispatch_wfi_wfe_trap(const struct intr_excp_ctx *ctx)
+{
+	struct cpu_regs *regs = (struct cpu_regs *)&ctx->regs;
+	bool handled = false;
+
+	/*
+	 * HCR_EL2.TWI/TWE can also trap WFI/WFE executed while the host is at EL1
+	 * in future configurations. WFI/WFE has no architectural side effect other
+	 * than waiting, so the safe EL2 fallback is to skip the instruction and
+	 * return. Guest WFI/WFE exits are handled in vcpu_exit.c, where vGIC/timer
+	 * synchronization is available.
+	 */
+	if (ESR_EL2_EC(regs->esr) == ESR_EL2_EC_WFI_WFE) {
+		regs->elr += ((regs->esr & ESR_EL2_IL) != 0UL) ? 4UL : 2UL;
+		handled = true;
+	}
+
+	return handled;
+}
+
 static void dispatch_exception(const struct intr_excp_ctx *ctx, uint64_t trap_type)
 {
 	uint16_t pcpu_id = get_pcpu_id();
+
+	if ((trap_type == ARM64_TRAP_SYNC) && dispatch_wfi_wfe_trap(ctx)) {
+		return;
+	}
 
 	dump_exception(ctx, pcpu_id);
 	unexpected_trap_handler(ctx, trap_type);

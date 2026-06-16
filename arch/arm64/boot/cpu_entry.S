@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -18,7 +18,7 @@ _start:
 	/* DAIF masks Debug, SError, IRQ, and FIQ while EL2 state is incomplete. */
 	msr	daifset, #0xf
 
-	/* CurrentEL must report EL2; CLAN runs as a hypervisor, not as EL1 code. */
+	/* CurrentEL must report EL2; SIMA runs as a hypervisor, not as EL1 code. */
 	mrs	x2, CurrentEL
 	cmp	x2, #CURRENTEL_EL2
 	b.ne	_start_hang

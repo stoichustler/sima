@@ -1,7 +1,8 @@
 ## ARM64 Development Status
 
-The ARM64 bring-up currently targets `qemu-system-aarch64` with the `virt`
-machine, GICv3, EL2 virtualization enabled, and 8 physical CPUs. Use the
+The ARM64 bring-up currently targets QEMU `virt` for automated validation and
+rk356x for hardware-platform bring-up. QEMU uses `qemu-system-aarch64` with the
+`virt` machine, GICv3, EL2 virtualization enabled, and 8 physical CPUs. Use the
 wrapper script for the default QEMU launch:
 
 ```bash
@@ -18,15 +19,39 @@ qemu-system-aarch64 \
   -m 1024M \
   -nographic \
   -serial mon:stdio \
-  -kernel build/clan.debug.out
+  -kernel out/qemu_out/sima.debug.out \
+  -device loader,file=sdk/images/linux/Image,addr=0x70000000,force-raw=on \
+  -device loader,file=sdk/images/linux/Initrd,addr=0x74000000,force-raw=on
 ```
 
-Build with the local bare-metal toolchain:
+Set `SIMA_TOOLCHAINS` to the bare-metal toolchain bin directory, then build:
 
 ```bash
-./scripts/kick.py --toolchains /path/to/clan-arm64-none-elf/bin --build --dry-run
-./scripts/kick.py --toolchains /path/to/clan-arm64-none-elf/bin --build
+./scripts/kick.py --build --dry-run
+./scripts/kick.py --build
 ```
+
+The rk356x hardware-platform skeleton builds with the same toolchain:
+
+```bash
+PATH=${SIMA_TOOLCHAINS}:$PATH \
+make ARCH=arm64 PLATFORM=rk356x CROSS_COMPILE=aarch64-none-elf- -j$(nproc)
+```
+
+The default build output directories are platform-scoped:
+`out/qemu_out` for `PLATFORM=qemu` and `out/rk356x_out` for
+`PLATFORM=rk356x`.
+
+Hardware validation for rk356x is manual for now: flash the generated SIMA
+image with the board workflow and inspect serial logs for EL2 boot, MMU setup,
+GIC init, the SIMA shell prompt, and VM launch logs.
+
+LK and Zephyr stay as `.incbin` RTOS images under `sdk/images`:
+`sdk/images/lk.bin` and `sdk/images/zephyr.bin`. VM2 Linux uses
+`sdk/images/linux/Image` and `sdk/images/linux/Initrd`; QEMU stages them with
+`-device loader` at `0x70000000` and `0x74000000`, then SIMA copies them into
+VM2 guest RAM. The Linux DTB is `sdk/images/linux/sima-linux.dtb` and remains embedded
+as a small `.incbin` module because it describes Linux running on SIMA.
 
 Current QEMU VM layout:
 
@@ -42,16 +67,32 @@ Current QEMU VM layout:
   - Load address and entry: `0x40100000`
   - Identity RAM window: `0x40000000-0x42000000`
   - vCPUs: 4, using mixed pCPUs 3, 5, 6, and 7
+- VM2 is the Linux pre-launched VM.
+  - Kernel image: `sdk/images/linux/Image`
+  - Kernel module tag: `linux`
+  - QEMU kernel stage address: `0x70000000`
+  - Kernel load address and entry: `0x48080000`
+  - Initrd image: `sdk/images/linux/Initrd`
+  - Initrd module tag: `linux-initrd`
+  - QEMU initrd stage address: `0x74000000`
+  - Initrd load address: `0x4c000000`
+  - DTB image: `sdk/images/linux/sima-linux.dtb`
+  - DTB module tag: `sima-linux-dtb`
+  - Boot console: `console=ttyAMA0 earlycon=pl011,0x09000000`
+  - Identity RAM window: `0x48000000-0x50000000`
+  - vCPUs: 4, running on pCPU1, pCPU2, pCPU4, and pCPU6
+  - Login: `root` / `root`
 - pCPU0-pCPU5 model ordinary cores.
 - pCPU6-pCPU7 model performance cores.
 - VM0 uses ordinary cores only. VM1 may mix ordinary and performance cores; the
   static QEMU scenario uses pCPU3 as the shared ordinary core plus pCPU5-pCPU7.
 
-The generated `build/clan.debug.out` has been boot-tested on QEMU. The build
-also emits `build/clan.out` as the base link image, `build/clan.debug.bin` as
-the raw debug image, and compatibility copies at `build/acrn.out` and
-`build/acrn.bin`. Both RTOS guests autostart without external ACPI/FDT modules.
-The CLAN shell stays quiet during late guest AP bring-up; press Enter after the
+The generated `out/qemu_out/sima.debug.out` has been boot-tested on QEMU. The
+build also emits `out/qemu_out/sima.out` as the base link image and
+`out/qemu_out/sima.debug.bin` as the raw debug image. Zephyr and LK autostart
+from embedded RTOS images. VM2 Linux autostarts when QEMU stages `Image` and
+`Initrd`; SIMA supplies the embedded `sima-linux.dtb`.
+The SIMA shell stays quiet during late guest AP bring-up; press Enter after the
 boot logs settle to show the `console:\>` prompt.
 
 ## Implemented
@@ -60,13 +101,15 @@ boot logs settle to show the `console:\>` prompt.
 - `scripts/kick.py` QEMU launcher with `--kernel`, `--qemu`, `--smp`,
   `--memory`, `--toolchains`, `--cross-prefix`, `--build`, `--dry-run`, and
   extra QEMU argument support.
-- `scripts/regress.py` boot regression harness for build, QEMU launch, CLAN
+- `scripts/regress.py` boot regression harness for build, QEMU launch, SIMA
   shell commands, VM console switching, and fatal boot-log checks.
 - QEMU platform code and static board/scenario configuration under
   `arch/arm64/platform/qemu`.
-- Bare-boot image embedding for both LK and Zephyr raw images.
-- Static QEMU VM configuration for Zephyr as the service VM and LK as a
-  pre-launched VM.
+- Bare-boot image embedding for LK and Zephyr raw images from `sdk/images`.
+- Linux VM2 loader tags for externally staged `Image` and `Initrd`, plus the
+  embedded `sima-linux.dtb` module.
+- Static QEMU VM configuration for Zephyr as the service VM and LK/Linux as
+  pre-launched VMs.
 - QEMU guest RAM, GIC, and PL011 layout is centralized in each VM's
   `vm_configs[].arch` entry, following the ACRN-style `vm_configurations.c`
   source-of-truth pattern. Generic ARM64 code gets those values through the
@@ -78,10 +121,9 @@ boot logs settle to show the `console:\>` prompt.
 - Stage-2 initialization validates the 1:1 RAM invariant. The shared guest vGIC
   and vPL011 IPA windows are registered as vio MMIO instead of RAM mappings.
 - Zephyr and LK are marked with `GUEST_FLAG_NO_FW`, so the boot-info path does
-  not require external ACPI/FDT modules for the current RTOS images. Static
-  ARM64 raw images still receive the synthetic QEMU vFDT boot ABI. Linux
-  bring-up should clear that flag and use a loader/module path instead of
-  platform `.incbin` image embedding.
+  not require external ACPI/FDT modules for the current RTOS images. VM2 Linux
+  clears that flag, receives `sima-linux.dtb`, and uses the loader/module path
+  instead of platform `.incbin` image embedding for `Image` and `Initrd`.
 - EL2 entry, exception vector setup, MMU enablement, and 1:1 host mappings.
   The primary and secondary EL2 entry paths explicitly select `SP_EL2` with
   `SPSel=1`, so host scheduling, guest entry, and guest exit use the same EL2
@@ -97,8 +139,8 @@ boot logs settle to show the `console:\>` prompt.
 - Raw-image loader support for ARM64 guest RAM start and FDT placement.
 - PSCI virtualization for guest `CPU_ON`, `CPU_OFF`, `AFFINITY_INFO`,
   `SYSTEM_OFF`, and `SYSTEM_RESET`.
-- CLAN shell `reboot` command wired to host PSCI system reset.
-- CLAN shell `crash` command for intentionally triggering an ARM64 host data
+- SIMA shell `reboot` command wired to host PSCI system reset.
+- SIMA shell `crash` command for intentionally triggering an ARM64 host data
   abort, printing the exception stack, and cold rebooting automatically.
 - PSCI-based host secondary CPU bring-up with `MAX_PCPU_NUM=8`.
 - VM0 and VM1 vCPUs share pCPU3 through the existing `sched_iorr` scheduler.
@@ -125,7 +167,7 @@ boot logs settle to show the `console:\>` prompt.
   - `dumpstat [vm id]`
   - `vsh <vm id>`
 - `vsh <vm id>` switches the serial console to a VM vPL011/vUART console.
-  Ctrl-D switches back to the CLAN shell.
+  Ctrl-D switches back to the SIMA shell.
 - `schedstat` prints the scheduler algorithm and one physical-CPU row with
   `pcpu`, scheduler `timer` callbacks, context `switches`, `resched` requests,
   runnable-thread count, and current `thread`.
@@ -141,12 +183,14 @@ boot logs settle to show the `console:\>` prompt.
   interrupts. Per-pCPU counts use aligned `cpuN:count` fields, and `active`
   shows whether the IRQ is allocated in the common IRQ table.
 - `dumpstat [vm id]` prints all created vCPUs in the VM, including the saved
-  ARM64 register image, scheduler state, current-thread status, a raw guest
-  stack trace from the VM register image, and the host stack saved by the vCPU
-  thread on its bound pCPU. Guest stack entries are raw addresses because CLAN
-  does not embed guest symbol tables. The debug image embeds the CLAN symbol
-  table, so host stack return addresses are printed as `function+offset`.
-  Offline vCPUs skip stack output.
+  ARM64 register image, scheduler state, current-thread status, recent vCPU
+  exit reason, recent virtual IRQ injection, recent guest timer programming or
+  injection, a raw guest stack trace from the VM register image, and the host
+  stack saved by the vCPU thread on its bound pCPU. IRQ exits report `ec:n/a`
+  because `ESR_EL2.EC` is only meaningful for synchronous exits. Guest stack
+  entries are raw addresses because SIMA does not embed guest symbol tables. The
+  debug image embeds the SIMA symbol table, so host stack return addresses are
+  printed as `function+offset`. Offline vCPUs skip stack output.
 - VM vPL011 TX output from the currently selected `vsh` VM is written into a
   Xen-style per-VM async console ring buffer, using monotonic producer/consumer
   indexes and a 4KB power-of-two data area with 4095 bytes of usable capacity.
@@ -154,10 +198,10 @@ boot logs settle to show the `console:\>` prompt.
   console in bounded batches, so guest PL011 writes no longer wait for host
   serial output. The ring is internal only; there is no shell command for
   changing console output mode or reading normal console-ring stats.
-- Non-selected VM console output is not replayed into the CLAN shell.
+- Non-selected VM console output is not replayed into the SIMA shell.
 - VM exception logs have a separate 4KB/4095-byte per-VM ring reserved for VM
   trap/oops capture. The ring is internal debug plumbing and is no longer
-  exposed as a CLAN shell command.
+  exposed as a SIMA shell command.
 - vUART/vPL011 layering:
   - `vuart` owns the upper VM console interface and host console integration.
   - `vpl011` is the ARM64 PL011 backend implementation.
@@ -172,8 +216,8 @@ boot logs settle to show the `console:\>` prompt.
   - Maintenance IRQ handler.
   - SGI system-register trap handling through `ICC_SGI1R_EL1`.
   - GICD/GICR MMIO vio and 64-bit MMIO split handling.
-  - Redistributor frames are addressed by pCPU slot and mapped to the VM's
-    bound vCPU local IRQ bank.
+  - Redistributor frames are addressed by guest vCPU slot and mapped to the
+    VM's local IRQ bank.
   - GICD/GICR `IPRIORITYR` byte/halfword/word access support.
   - GICD/GICR `ICFGR` read/write support for SGI/PPI/SPI trigger type state.
   - GICD `IROUTER` low/high word access and SPI target-vCPU delivery.
@@ -182,7 +226,7 @@ boot logs settle to show the `console:\>` prompt.
 - ARM64 memory logging for host stage-1 and VM stage-2 mappings.
 - ARM64 exception stack dumps print directly to the console without per-line
   log prefixes.
-- CLAN log and shell/console strings are lowercase source literals; there is no
+- SIMA log and shell/console strings are lowercase source literals; there is no
   output-layer lowercase conversion.
 - ARM64 memory virtualization, interrupt virtualization, and vCPU
   virtualization code now includes English comments for module responsibilities,
@@ -196,6 +240,7 @@ The following have been verified on QEMU with `-smp 8`:
   prompt.
 - VM0 Zephyr autostarts as the service VM.
 - VM1 LK autostarts as a pre-launched VM.
+- VM2 Linux autostarts as a pre-launched VM.
 - VM0 Zephyr vCPU0-vCPU3 bind to ordinary-core pCPU2, pCPU0, pCPU3, and pCPU4.
 - VM1 LK vCPU0-vCPU3 bind to mixed pCPU5, pCPU3, pCPU6, and pCPU7, sharing
   pCPU3 with VM0.
@@ -206,34 +251,138 @@ The following have been verified on QEMU with `-smp 8`:
   `ipa[0x40000000-0x42000000]:pa[0x40000000-0x42000000]`.
 - `schedstat` reports `sched_iorr`, per-pCPU scheduler timer callbacks,
   reschedule requests, runnable-thread counts, and context switch counters.
-- `vcpus` reports both VMs and all 8 guest vCPUs. VM0 uses pCPU0, pCPU2,
-  pCPU3, and pCPU4; VM1 uses pCPU3, pCPU5, pCPU6, and pCPU7.
+- `vcpus` reports all three VMs and nine guest vCPUs. VM0 uses pCPU0, pCPU2,
+  pCPU3, and pCPU4; VM1 uses pCPU3, pCPU5, pCPU6, and pCPU7; VM2 Linux uses
+  pCPU1.
 - `vsh 0` enters the Zephyr console and reaches `zero ~>`.
 - `vsh 1` enters the LK console and reaches `beau ~>`.
-- VM0 Zephyr `help` and VM1 LK `help` both complete through the async VM
-  console path.
+- `vsh 2` enters the Linux console. During the 2026-06-16 VM2 debug session,
+  4-vCPU Linux progressed through secondary CPU bring-up and reached
+  `clou login:` in at least one run, but root-shell login is not yet stable.
+- VM0 Zephyr `help` and VM1 LK `help` complete through the async VM console
+  path. VM2 Linux root login and `help` are still part of the active
+  timer/vGIC stability investigation.
 - VM0 Zephyr `symtab list` completes through `vsh 0` and returns to the
   `zero ~>` prompt with async batched VM console output.
 - VM console output bypasses vUART TX FIFO forwarding for the selected `vsh`
   VM console.
 - Ctrl-D returns from VM console mode to `console:\>`.
 - The `crash` command prints an ARM64 exception stack with `[cut here]` and
-  `[end here]` markers, then cold reboots CLAN automatically.
-- Five repeated QEMU cold boots reached VM0/VM1 AP vCPU guest entry without
+  `[end here]` markers, then cold reboots SIMA automatically.
+- Five repeated QEMU cold boots reached VM0/VM1/VM2 guest entry without
   `[cut here]` or `unexpected arm64 trap`, covering the prior `SP_EL2`/`SPSel`
   boot race.
 - Five repeated QEMU cold boots also covered the later `vcpu_exit_return`
   restore-frame issue where EL2 `sp` could drift to guest RAM and fault at
   `far:0x80000000`.
-- `vmap` shows VM0/VM1 stage-2 RAM identity mappings plus vGICD, vGICR, and
-  vPL011 vio windows.
+- `vmap` shows VM0/VM1/VM2 stage-2 RAM identity mappings plus vGICD, vGICR,
+  and vPL011 vio windows.
 - Boot logs show each VM image copied to 1:1 RAM.
 - `irqs` uses a narrow-screen-friendly format and shows the virtual timer PPI
   handler receiving counts on Zephyr AP pCPUs.
 - Zephyr no longer traps on `GICD_IPRIORITYR` byte writes.
 - Zephyr AP virtual timer interrupts no longer hit the host unexpected IRQ path.
 - LK still boots with 4 CPUs after Zephyr became the service VM.
-- The `reboot` shell command resets QEMU and restarts CLAN.
+- The `reboot` shell command resets QEMU and restarts SIMA.
+- `PLATFORM=rk356x` builds a hardware image. Boot correctness is pending manual
+  flashing and serial-log validation.
+- VM2 Linux no longer stops at `smp: Bringing up secondary CPUs ...` in the
+  current 4-vCPU path: logs show CPU1, CPU2, and CPU3 entering EL1 and Linux
+  reporting `smp: Brought up 1 node, 4 CPUs`.
+
+## VM2 Linux Debug Snapshot
+
+Status as of 2026-06-16:
+
+- Latest cleaned validation:
+  `SIMA_TOOLCHAINS=$HOME/sima-cc/bin ./scripts/regress.py --timeout 180
+  --log out/qemu_out/regress-gate-cleaned.log`.
+  VM0 Zephyr and VM1 LK passed the regression gate (`dumpstat 0`, `vsh 0`,
+  and `vsh 1`). VM2 Linux still timed out waiting for `clou login:`.
+- Keep VM2 Linux at 4 vCPUs; no single-vCPU fallback validation is being used.
+- Keep Linux assets under `sdk/images/linux`; the active Linux DT source is
+  `sdk/images/linux/sima-linux.dts`.
+- `sdk/images/linux/sima-linux.dts` currently keeps the base Linux bootargs and
+  adds an `initcall_blacklist` for ACPI/Xen/TPM/ATA initcalls that are not
+  useful on the SIMA virtual platform. Do not re-add earlier diagnostic
+  bootargs such as `nokaslr`, `cma=0`, or
+  `clocksource.arm_arch_timer.evtstrm=0`.
+- Timer DT interrupt IDs remain unchanged. The virtual timer still uses
+  PPI/INTID 27 from `<1 13 4>`; current evidence does not require changing
+  PPI27.
+- WFI/WFE are currently left to hardware, matching the simpler ARMv8 reference
+  path in `~/nebula/bloc/raan/prot`. Re-enabling WFI-only trapping kept VM0/VM1
+  passing but slowed VM2 and left host PPI27 masked in the bad state, so that
+  experiment was reverted.
+- Linux CPU1/CPU2/CPU3 reach the guest secondary entry path. The remaining VM2
+  instability is now after secondary CPU bring-up and before a stable root
+  shell.
+- The useful VM2 progress marker is that `vsh 2` can show Linux reaching
+  `clou login:`. In the same run, delayed input allowed BusyBox login to time
+  out and Linux later printed RCU stall diagnostics, so this is not yet a
+  completed `root` / `root` / `help` validation.
+- The latest cleaned run does not reach PL011 login before timeout. Earlier
+  runs reached `console [ttyAMA0] enabled`; in both cases the VM2 diagnostic
+  state remains centered on virtual timer PPI27 rather than a proven PL011
+  interrupt issue.
+- `dumpstat 2` in the bad state repeatedly points at the virtual timer
+  lifecycle on CPU0:
+  - LR0 can remain as pending-only virtual INTID 27, for example
+    `0x508000000000001b`.
+  - The software vGIC descriptor for virq 27 can be `pending:no active:no
+    level:yes`.
+  - In the latest cleaned run, host PPI27 is enabled/unmasked and CNTV is still
+    expired on vCPU0, but the pending-only LR remains.
+  - Linux reports `Possible timer handling issue on cpu=0 timer-softirq=0`
+    when the stall reproduces.
+- `dumpstat` should remain focused on vCPU/timer/vGIC state and must not grow
+  vPL011 statistics again.
+
+Experiments already tried:
+
+- Marking pending-only software timer LRs with EOI caused maintenance storms
+  and broke AP bring-up. Do not repeat that change.
+- Keeping host PPI27 globally unmasked in the virtual timer handler or poll
+  path regressed secondary CPU bring-up. Do not repeat that broad change.
+- Dropping stale pending-only timer LRs from the general vGIC sync path also
+  regressed secondary CPU bring-up.
+- Removing the WFI `DAIF.I` guard did not solve the post-console stall and was
+  reverted.
+- Re-arming the host virtual-timer PPI only from the WFI timer-LR cleanup path
+  is conservative and allowed VM2 to reach `clou login:` in one run, but it did
+  not eliminate the CPU0 timer-softirq stall.
+- Extending that re-arm into the general vGIC sync path regressed AP bring-up
+  and was reverted.
+- Rewriting the WFI pending-only timer LR as Active+Pending made forward
+  progress worse and was reverted.
+- Removing WFI/WFE traps and letting hardware wake guest idle, as in the
+  reference `prot` path, keeps VM0/VM1 passing and speeds VM2 boot, but does
+  not fix the VM2 login timeout by itself.
+- Removing the host PPI27 mask from the timer poll path kept VM0/VM1 passing
+  but did not fix VM2 and raised host virtual-timer IRQ counts, so it was
+  reverted.
+- Expanding the generated QEMU vFDT PL011 clocks to include both `uartclk` and
+  `apb_pclk` kept VM0/VM1 passing but did not affect VM2. VM2 uses the embedded
+  `sdk/images/linux/sima-linux.dtb`, whose DTS already has both clocks, so the
+  generated-vFDT experiment was reverted.
+- The current in-tree timer completion change removes a completed active timer
+  LR and re-enables the host PPI so the hardware level source can create a
+  fresh virtual timer injection instead of preserving stale active state. It
+  keeps VM0/VM1 passing, but VM2 still times out before stable login.
+
+Recommended resume point:
+
+1. Before any VM2 experiment, run the full regression and require VM0/VM1 to
+   pass (`dumpstat 0`, `vsh 0`, `vsh 1`).
+2. Start from the current `arch/arm64/guest/vgicv3.c` timer completion change
+   and keep WFI/WFE trapping disabled.
+3. Confirm VM2 CPU1/CPU2/CPU3 still boot.
+4. Switch with `vsh 2`, wait for `clou login:`, then immediately input
+   `root`, password `root`, and run `help`.
+5. If Linux stalls before login or emits RCU timer warnings, return with Ctrl-D
+   and capture `dumpstat 2`, `vcpus`, `schedstat`, and `irqs`.
+6. Treat a VM2 fix as complete only after `root` / `root` / `help` succeeds
+   without RCU timer-softirq warnings while VM0 and VM1 remain responsive.
 
 ## Code Commenting Guidelines
 
@@ -264,18 +413,24 @@ auditable when memory, interrupt, and CPU state crosses an EL2/EL1 boundary.
 
 ## Current Limitations
 
-The ARM64 port is now capable of booting the current Zephyr and LK raw images on
-QEMU, but it is still a bring-up target rather than a complete architectural
+The ARM64 port is now capable of booting Zephyr, LK, and VM2 Linux on QEMU, but
+it is still a bring-up target rather than a complete architectural
 virtualization port.
 
-- vGICv3 is sufficient for the current Zephyr and LK boot path, but it is not a
-  complete GICv3 model yet. Active-state stress cases, deeper redistributor
-  behavior, MSI/LPI paths, and richer distributor coverage still need work.
-- QEMU VM layout is still statically configured in `vm_configurations.c`;
+- vGICv3 is sufficient for the current Zephyr, LK, and 4-vCPU VM2 Linux
+  boot path, but it is not a complete GICv3 model yet. Active-state stress
+  cases, deeper redistributor behavior, MSI/LPI paths, and richer distributor
+  coverage still need work.
+- QEMU VM layout is still statically configured in `vm_config.c`;
   QEMU FDT parsing is not yet used to derive VM layout.
-- The current Zephyr and LK VMs are RTOS raw images and boot with
-  `GUEST_FLAG_NO_FW`; Linux boot support still needs a non-`.incbin` image
-  delivery path plus FDT/ACPI handoff.
+- Zephyr and LK are RTOS raw images and boot with `GUEST_FLAG_NO_FW`. VM2 Linux
+  uses a loader/module path for `Image` and `Initrd`, while its Linux-on-SIMA
+  DTB remains embedded.
+- VM2 Linux runs as a 4-vCPU guest. The path has reached the Linux login prompt
+  during QEMU validation; repeated cold-boot coverage is still needed before
+  calling the 4-vCPU path stable.
+- VM2 Linux keeps `earlycon=pl011,0x09000000` so `vsh 2` can show Linux logs
+  before the normal PL011 console driver is registered.
 - VM console output from SMP guests can interleave because multiple guest CPUs
   write concurrently to the same PL011 console.
 - Stage-2 mapping is still static for the QEMU `virt` platform.
@@ -284,13 +439,13 @@ virtualization port.
 
 ## Next Steps
 
-1. Add a Linux-oriented loader/module path that does not rely on platform
-   `.incbin` image embedding, then clear `GUEST_FLAG_NO_FW` for Linux guests.
-2. Extend vGICv3 coverage for active-state stress, deeper redistributor state,
-   MSI/LPI paths, and remaining distributor registers used by richer guests.
-3. Extend `scripts/regress.py` with richer stress coverage and log artifacts
-   suitable for CI.
+1. Add repeated cold-boot and root-shell coverage for VM2 Linux 4-vCPU/SMP,
+   with diagnostics for timer, SGI, and pending/active LR state on failures.
+2. Harden PL011 RX/TX interrupt behavior for Linux after the real console
+   driver takes over.
+3. Extend `scripts/regress.py` with more VM2 Linux root-shell commands, reboot
+   coverage, repeated cold boots, and saved log artifacts suitable for CI.
 4. Move QEMU platform memory and device discovery toward host-FDT-derived data
    where it helps reduce static board assumptions.
-5. Add a repeatable automated console regression for async per-VM output,
-   Ctrl-D switching, and long-output overflow behavior.
+5. Bring up rk356x hardware manually, then capture the validated RAM, UART,
+   GIC, and boot-image placement assumptions back into the platform files.

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -232,7 +232,7 @@ int32_t arch_init_vm(struct acrn_vm *vm, struct acrn_vm_config *vm_config)
 	arm64_vpl011_init_vm(vm);
 	register_arm64_vio_mmio(vm);
 
-	if (is_static_configured_vm(vm)) {
+	if (is_static_configured_vm(vm) && (vm_config->fdt_config.fdt_mod_tag[0] == '\0')) {
 		init_service_vm_vfdt(vm);
 	}
 
@@ -289,7 +289,7 @@ void arch_trigger_level_intr(struct acrn_vm *vm, uint32_t irq, bool assert)
 		}
 	} else {
 		foreach_vcpu(idx, vm, vcpu) {
-			(void)arm64_vgicv3_clear_irq(vcpu, irq);
+			(void)arm64_vgicv3_deassert_irq(vcpu, irq);
 		}
 	}
 }

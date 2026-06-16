@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -8,7 +8,7 @@
 #define ARM64_VM_CONFIG_H
 
 #include <types.h>
-#ifndef CONFIG_STATIC_QEMU_PLATFORM
+#ifndef CONFIG_STATIC_ARM64_PLATFORM
 #include <board_info.h>
 #endif
 

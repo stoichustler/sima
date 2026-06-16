@@ -19,6 +19,7 @@
 #include <boot.h>
 #include <dbg_cmd.h>
 #include <rtl.h>
+#include <sprintf.h>
 #include <spinlock.h>
 #include <asm/guest/vm.h>
 
@@ -40,6 +41,7 @@ struct hv_timer console_timer;
 #define VM_CONSOLE_RINGBUF_MASK     (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_RINGBUF_CAPACITY (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_DRAIN_BUF_SIZE 1024U
+#define VM_CONSOLE_PREFIX_MAX_SIZE 16U
 #define VM_CONSOLE_EXCEPTION_RINGBUF_SIZE 4096U
 #define VM_CONSOLE_EXCEPTION_RINGBUF_MASK (VM_CONSOLE_EXCEPTION_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_EXCEPTION_RINGBUF_CAPACITY (VM_CONSOLE_EXCEPTION_RINGBUF_SIZE - 1U)
@@ -63,6 +65,8 @@ struct vm_console_ringbuf {
 	uint64_t last_overflow_tsc;
 	bool pending;
 	bool draining;
+	bool line_start;
+	bool last_cr;
 	char buf[CONFIG_VM_CONSOLE_RINGBUF_SIZE];
 };
 
@@ -83,6 +87,7 @@ struct vm_exception_ringbuf {
 static struct vm_console_ringbuf vm_console_ringbufs[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
 static struct vm_exception_ringbuf vm_exception_ringbufs[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
 static char vm_console_drain_buf[VM_CONSOLE_DRAIN_BUF_SIZE];
+static char vm_console_output_buf[VM_CONSOLE_DRAIN_BUF_SIZE + 128U];
 
 static void console_vm_ring_put(uint16_t vmid, char ch);
 static void console_vm_ring_drain_internal(uint16_t vmid);
@@ -98,6 +103,7 @@ void console_init(void)
 	spinlock_init(&console_log_lock);
 	for (uint16_t i = 0U; i < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM; i++) {
 		spinlock_init(&vm_console_ringbufs[i].lock);
+		vm_console_ringbufs[i].line_start = true;
 		spinlock_init(&vm_exception_ringbufs[i].lock);
 	}
 }
@@ -332,7 +338,7 @@ static void vuart_console_rx_chars(struct acrn_vuart *vu)
 		if (ch == GUEST_CONSOLE_TO_HV_SWITCH_KEY) {
 			console_vm_ring_drain_internal(target_vmid);
 			console_vmid = ACRN_INVALID_VMID;
-			printf("\r\n\r\n──────── [switch to clan shell] ────────\r\n");
+			printf("\r\n\r\n──────── [switch to SIMA shell] ────────\r\n");
 			goto exit;
 		} else if (vu != NULL) {
 			vuart_putchar(vu, ch);
@@ -423,6 +429,67 @@ static uint32_t console_vm_ring_claim(struct vm_console_ringbuf *rb, char *buf, 
 	return count;
 }
 
+static void console_vm_prefixed_write_flush(char *out, uint32_t *out_len)
+{
+	if (*out_len > 0U) {
+		(void)console_write(out, *out_len);
+		*out_len = 0U;
+	}
+}
+
+static void console_vm_prefixed_write_byte(char *out, uint32_t *out_len, char ch)
+{
+	if (*out_len == ARRAY_SIZE(vm_console_output_buf)) {
+		console_vm_prefixed_write_flush(out, out_len);
+	}
+	out[*out_len] = ch;
+	(*out_len)++;
+}
+
+static void console_vm_prefixed_write_bytes(char *out, uint32_t *out_len,
+	const char *buf, uint32_t len)
+{
+	for (uint32_t idx = 0U; idx < len; idx++) {
+		console_vm_prefixed_write_byte(out, out_len, buf[idx]);
+	}
+}
+
+static void console_vm_ring_write_prefixed(uint16_t vmid, struct vm_console_ringbuf *rb,
+	const char *buf, uint32_t len)
+{
+	char prefix[VM_CONSOLE_PREFIX_MAX_SIZE];
+	uint32_t out_len = 0U;
+	size_t prefix_len;
+
+	(void)snprintf(prefix, sizeof(prefix), "[vmid %u] ", vmid);
+	prefix_len = strnlen_s(prefix, sizeof(prefix));
+
+	for (uint32_t idx = 0U; idx < len; idx++) {
+		char ch = buf[idx];
+
+		if (rb->line_start) {
+			if (!rb->last_cr || (ch != '\n')) {
+				console_vm_prefixed_write_bytes(vm_console_output_buf, &out_len,
+					prefix, (uint32_t)prefix_len);
+				rb->line_start = false;
+			}
+		}
+
+		console_vm_prefixed_write_byte(vm_console_output_buf, &out_len, ch);
+		if (ch == '\r') {
+			rb->line_start = true;
+			rb->last_cr = true;
+		} else if (ch == '\n') {
+			rb->line_start = true;
+			rb->last_cr = false;
+		} else {
+			rb->last_cr = false;
+		}
+	}
+
+	console_vm_prefixed_write_flush(vm_console_output_buf, &out_len);
+}
+
 static void console_vm_ring_drain_internal(uint16_t vmid)
 {
 	struct vm_console_ringbuf *rb;
@@ -441,7 +508,7 @@ static void console_vm_ring_drain_internal(uint16_t vmid)
 				}
 				count = console_vm_ring_claim(rb, vm_console_drain_buf, chunk);
 				if (count > 0U) {
-					(void)console_write(vm_console_drain_buf, count);
+					console_vm_ring_write_prefixed(vmid, rb, vm_console_drain_buf, count);
 					budget -= count;
 				}
 			} while ((count == chunk) && (budget > 0U));

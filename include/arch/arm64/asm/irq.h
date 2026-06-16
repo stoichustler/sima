@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -35,6 +35,15 @@ struct arm64_irq_data {
 	uint32_t acrn_irq;
 };
 
+struct arm64_gicv3_local_irq_state {
+	uint32_t enabled;
+	uint32_t pending;
+	uint32_t active;
+	uint32_t group;
+	uint32_t priority;
+	bool valid;
+};
+
 struct intr_excp_ctx {
 	struct cpu_regs regs;
 };
@@ -50,6 +59,10 @@ void arm64_gicv3_init(uint16_t pcpu_id);
 uint32_t arm64_gicv3_ack_irq(void);
 void arm64_gicv3_eoi_irq(uint32_t intid);
 void arm64_gicv3_enable_irq(uint32_t intid);
+void arm64_gicv3_disable_irq(uint32_t intid);
+void arm64_gicv3_clear_irq(uint32_t intid);
+void arm64_gicv3_get_local_irq_state(uint16_t pcpu_id, uint32_t intid,
+	struct arm64_gicv3_local_irq_state *state);
 void arm64_gicv3_send_sgi(uint16_t pcpu_id, uint32_t sgi_id);
 
 #endif /* ARM64_IRQ_H */

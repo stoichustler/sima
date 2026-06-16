@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -7,11 +7,13 @@
 #ifndef ARM64_CPU_H
 #define ARM64_CPU_H
 
+#include <asm/offset.h>
+
 #ifndef ASSEMBLER
 #include <types.h>
 #include <lib/util.h>
 #include <logmsg.h>
-#ifndef CONFIG_STATIC_QEMU_PLATFORM
+#ifndef CONFIG_STATIC_ARM64_PLATFORM
 #include <board_info.h>
 #endif
 #include <barrier.h>
@@ -67,7 +69,53 @@ struct cpu_regs {
 	uint64_t hpfar;
 	uint64_t host_tpidr;
 	uint64_t exc_sp;
+	uint64_t reserved;
 };
+
+_Static_assert(offsetof(struct cpu_regs, x0) == CPU_REGS_OFFSET_X0, "cpu_regs.x0 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x1) == CPU_REGS_OFFSET_X1, "cpu_regs.x1 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x2) == CPU_REGS_OFFSET_X2, "cpu_regs.x2 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x3) == CPU_REGS_OFFSET_X3, "cpu_regs.x3 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x4) == CPU_REGS_OFFSET_X4, "cpu_regs.x4 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x5) == CPU_REGS_OFFSET_X5, "cpu_regs.x5 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x6) == CPU_REGS_OFFSET_X6, "cpu_regs.x6 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x7) == CPU_REGS_OFFSET_X7, "cpu_regs.x7 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x8) == CPU_REGS_OFFSET_X8, "cpu_regs.x8 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x9) == CPU_REGS_OFFSET_X9, "cpu_regs.x9 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x10) == CPU_REGS_OFFSET_X10, "cpu_regs.x10 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x11) == CPU_REGS_OFFSET_X11, "cpu_regs.x11 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x12) == CPU_REGS_OFFSET_X12, "cpu_regs.x12 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x13) == CPU_REGS_OFFSET_X13, "cpu_regs.x13 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x14) == CPU_REGS_OFFSET_X14, "cpu_regs.x14 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x15) == CPU_REGS_OFFSET_X15, "cpu_regs.x15 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x16) == CPU_REGS_OFFSET_X16, "cpu_regs.x16 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x17) == CPU_REGS_OFFSET_X17, "cpu_regs.x17 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x18) == CPU_REGS_OFFSET_X18, "cpu_regs.x18 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x19) == CPU_REGS_OFFSET_X19, "cpu_regs.x19 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x20) == CPU_REGS_OFFSET_X20, "cpu_regs.x20 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x21) == CPU_REGS_OFFSET_X21, "cpu_regs.x21 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x22) == CPU_REGS_OFFSET_X22, "cpu_regs.x22 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x23) == CPU_REGS_OFFSET_X23, "cpu_regs.x23 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x24) == CPU_REGS_OFFSET_X24, "cpu_regs.x24 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x25) == CPU_REGS_OFFSET_X25, "cpu_regs.x25 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x26) == CPU_REGS_OFFSET_X26, "cpu_regs.x26 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x27) == CPU_REGS_OFFSET_X27, "cpu_regs.x27 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x28) == CPU_REGS_OFFSET_X28, "cpu_regs.x28 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, x29) == CPU_REGS_OFFSET_X29, "cpu_regs.x29 offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, lr) == CPU_REGS_OFFSET_LR, "cpu_regs.lr offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, sp) == CPU_REGS_OFFSET_SP, "cpu_regs.sp offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, elr) == CPU_REGS_OFFSET_ELR, "cpu_regs.elr offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, spsr) == CPU_REGS_OFFSET_SPSR, "cpu_regs.spsr offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, esr) == CPU_REGS_OFFSET_ESR, "cpu_regs.esr offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, far) == CPU_REGS_OFFSET_FAR, "cpu_regs.far offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, hpfar) == CPU_REGS_OFFSET_HPFAR, "cpu_regs.hpfar offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, host_tpidr) == CPU_REGS_OFFSET_HOST_TPIDR,
+	"cpu_regs.host_tpidr offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, exc_sp) == CPU_REGS_OFFSET_EXC_SP,
+	"cpu_regs.exc_sp offset mismatch");
+_Static_assert(offsetof(struct cpu_regs, reserved) == CPU_REGS_OFFSET_RESERVED,
+	"cpu_regs.reserved offset mismatch");
+_Static_assert(sizeof(struct cpu_regs) == CPU_REGS_OFFSET_LAST, "cpu_regs size mismatch");
 
 #define STACK_FRAME_OFFSET_X19		0x0
 #define STACK_FRAME_OFFSET_X20		0x8
@@ -187,8 +235,6 @@ void wait_sync_change(volatile const uint64_t *sync, uint64_t wake_sync);
 void init_percpu_mpidr(uint64_t bsp_mpidr);
 uint16_t get_pcpu_id_from_mpidr(uint64_t mpidr);
 
-#else /* ASSEMBLER */
-#include <asm/offset.h>
 #endif /* ASSEMBLER */
 
 #endif /* ARM64_CPU_H */

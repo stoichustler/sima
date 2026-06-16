@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -7,7 +7,7 @@
 #include <asm/cpu.h>
 #include <asm/trap.h>
 
-#define VCPU_RUN_STACK_SIZE	(CPU_REGS_OFFSET_LAST + 8)
+#define VCPU_RUN_STACK_SIZE	CPU_REGS_OFFSET_LAST
 
 	.text
 	.align 4

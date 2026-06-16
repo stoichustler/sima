@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -8,6 +8,7 @@
 #define ARM64_GUEST_VCPU_H
 
 #include <types.h>
+#include <timer.h>
 #include <asm/page.h>
 #include <cpu.h>
 #include <asm/guest/vgicv3.h>
@@ -18,6 +19,14 @@
 #define ARM64_VCPU_REQUEST_EVENT		1U
 
 #define ARM64_VCPU_EVENT_VIRTUAL_INTERRUPT	0U
+
+#define ARM64_VCPU_DEBUG_EXIT_NONE		0U
+#define ARM64_VCPU_DEBUG_EXIT_SYNC		1U
+#define ARM64_VCPU_DEBUG_EXIT_IRQ		2U
+#define ARM64_VCPU_DEBUG_EXIT_EC_INVALID	UINT32_MAX
+#define ARM64_VCPU_DEBUG_INVALID_VCPU_ID	0xffffU
+#define ARM64_VCPU_DEBUG_VGIC_SYNC		1U
+#define ARM64_VCPU_DEBUG_VGIC_MAINTENANCE	2U
 
 /*
  * EL2 control state that is programmed around vCPU scheduling. The guest GPRs
@@ -37,9 +46,13 @@ struct arm64_vcpu_guest_ctx {
 	uint64_t vtcr_el2;
 	uint64_t hcr_el2;
 	uint64_t cntvoff_el2;
+	uint64_t cntp_cval_el0;
 	uint64_t cntv_cval_el0;
+	uint32_t cntp_ctl_el0;
 	uint32_t cntv_ctl_el0;
 	uint32_t timer_virq;
+	bool cntv_el2_masked;
+	uint64_t cntkctl_el1;
 	uint64_t sctlr_el1;
 	uint64_t ttbr0_el1;
 	uint64_t ttbr1_el1;
@@ -74,6 +87,175 @@ struct arm64_vcpu_trap_info {
 	uint64_t far;
 };
 
+struct arm64_vcpu_last_exit {
+	uint64_t tsc;
+	uint64_t esr;
+	uint64_t elr;
+	uint64_t far;
+	uint64_t hpfar;
+	uint32_t ec;
+	uint32_t source;
+	int32_t status;
+};
+
+struct arm64_vcpu_last_irq {
+	uint64_t tsc;
+	uint32_t virq;
+	int32_t status;
+	uint16_t source_vcpu_id;
+	uint16_t target_vcpu_id;
+	bool level;
+};
+
+struct arm64_vcpu_last_timer {
+	uint64_t tsc;
+	uint64_t cval;
+	uint32_t ctl;
+	uint32_t virq;
+	uint32_t sysreg;
+	int32_t status;
+	bool write;
+	bool injected;
+};
+
+struct arm64_vcpu_last_sgi {
+	uint64_t tsc;
+	uint64_t value;
+	uint32_t intid;
+	int32_t status;
+	uint16_t source_vcpu_id;
+	uint16_t target_mask;
+	uint16_t delivered_mask;
+};
+
+struct arm64_vcpu_last_psci {
+	uint64_t tsc;
+	uint64_t target_mpidr;
+	uint64_t entry;
+	uint64_t context;
+	uint32_t fn;
+	int64_t ret;
+	uint16_t source_vcpu_id;
+	uint16_t target_vcpu_id;
+};
+
+/*
+ * CPU-interface sysreg traps show the guest's view of interrupt lifecycle
+ * control. Keeping the last access lets dumpstat correlate ICC_DIR/CTL/enable
+ * writes with stuck LR active/pending state without enabling noisy tracing.
+ */
+struct arm64_vcpu_last_cpuif {
+	uint64_t tsc;
+	uint64_t value;
+	uint32_t sysreg;
+	int32_t status;
+	bool read;
+};
+
+/*
+ * A vGIC maintenance snapshot captures live EL2 CPU-interface state at the
+ * boundary where hardware LR state is reconciled with SIMA's software IRQ
+ * model. This lets dumpstat distinguish "maintenance never fired" from
+ * "maintenance fired but the LR lifecycle was not consumed".
+ */
+struct arm64_vcpu_last_vgic {
+	uint64_t tsc;
+	uint64_t misr;
+	uint64_t eisr;
+	uint64_t elrsr;
+	uint64_t hcr;
+	uint64_t vmcr;
+	uint64_t ap0r0;
+	uint64_t ap1r0;
+	uint64_t lr0;
+	uint64_t lr1;
+	uint32_t source;
+	uint32_t count;
+	uint8_t used_lrs;
+};
+
+/*
+ * WFI/WFE debug state records the final decision made by the trapped idle path.
+ * It is intentionally a single snapshot so dumpstat can explain a stalled vCPU
+ * without adding noisy per-exit logs to guest console output.
+ */
+struct arm64_vcpu_last_wfx {
+	uint64_t tsc;
+	uint64_t esr;
+	uint64_t elr;
+	uint64_t cntvct;
+	uint64_t cntv_cval;
+	uint64_t hcr;
+	uint64_t misr;
+	uint64_t ap0r0;
+	uint64_t ap1r0;
+	uint64_t lr0;
+	uint64_t lr1;
+	uint64_t live_lr0;
+	uint64_t live_lr1;
+	uint32_t cntv_ctl;
+	uint8_t used_lrs;
+	bool is_wfe;
+	bool pending_irq;
+	bool irq_masked;
+	bool request_pending;
+	bool yielded;
+	bool cntv_expired;
+	bool cntv_el2_masked;
+};
+
+/*
+ * The guest-return snapshot is recorded after exit handling has synchronized
+ * vtimer/vGIC state and immediately before EL2 restores the frame for ERET.
+ * It shows what the guest was actually about to observe, which can differ from
+ * the state captured at the earlier physical IRQ entry point.
+ */
+struct arm64_vcpu_last_guest_return {
+	uint64_t tsc;
+	uint64_t elr;
+	uint64_t spsr;
+	uint64_t cntvct;
+	uint64_t cntv_cval;
+	uint64_t hcr;
+	uint64_t vmcr;
+	uint64_t misr;
+	uint64_t eisr;
+	uint64_t elrsr;
+	uint64_t ap0r0;
+	uint64_t ap1r0;
+	uint64_t sw_lr0;
+	uint64_t sw_lr1;
+	uint64_t live_lr0;
+	uint64_t live_lr1;
+	uint32_t cntv_ctl;
+	uint32_t source;
+	uint32_t timer_virq;
+	uint8_t used_lrs;
+	bool cntv_expired;
+	bool cntv_el2_masked;
+	bool timer_enabled;
+	bool timer_pending;
+	bool timer_active;
+	bool timer_level;
+	bool host_valid;
+	bool host_enabled;
+	bool host_pending;
+	bool host_active;
+};
+
+struct arm64_vcpu_debug_info {
+	struct arm64_vcpu_last_exit last_exit;
+	struct arm64_vcpu_last_irq last_irq;
+	struct arm64_vcpu_last_timer last_timer;
+	struct arm64_vcpu_last_sgi last_sgi;
+	struct arm64_vcpu_last_psci last_psci;
+	struct arm64_vcpu_last_cpuif last_cpuif;
+	struct arm64_vcpu_last_vgic last_vgic_sync;
+	struct arm64_vcpu_last_vgic last_vgic_maintenance;
+	struct arm64_vcpu_last_wfx last_wfx;
+	struct arm64_vcpu_last_guest_return last_return;
+};
+
 struct acrn_vcpu_arch {
 	/*
 	 * This must be the first member of acrn_vcpu_arch so low-level assembly
@@ -85,8 +267,11 @@ struct acrn_vcpu_arch {
 	struct arm64_vcpu_guest_ctx gctx;
 	struct arm64_vgicv3_vcpu_ctx vgic;
 	struct arm64_vcpu_trap_info trap;
+	struct arm64_vcpu_debug_info debug;
 	uint64_t irqs_pending;
 	uint64_t irqs_pending_mask;
+	struct hv_timer vtimer_backup;
+	bool vtimer_backup_initialized;
 } __aligned(PAGE_SIZE);
 
 struct acrn_vcpu;

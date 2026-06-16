@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -29,6 +29,14 @@
 #define ESR_EL2_EC_IABT_CUR	0x21UL
 #define ESR_EL2_EC_DABT_LOW	0x24UL
 #define ESR_EL2_EC_DABT_CUR	0x25UL
+
+/*
+ * For EC=0x01, ISS.TI distinguishes WFI from WFE. WFI waits for an interrupt;
+ * WFE waits for an event, so the vCPU exit path can give them different
+ * scheduler behavior without decoding the original instruction stream.
+ */
+#define ESR_WFX_TI		(1UL << 0U)
+#define ESR_WFX_IS_WFE(esr)	(((esr) & ESR_WFX_TI) != 0UL)
 
 #define ESR_DABT_ISV		(1UL << 24U)
 #define ESR_DABT_SAS_SHIFT	22U

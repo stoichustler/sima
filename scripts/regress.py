@@ -15,6 +15,8 @@ CWD = Path.cwd()
 PROMPT = "console:\\>"
 ENTER = "\r"
 CTRL_D = b"\x04"
+LINUX_IMAGE_STAGE_ADDR = "0x70000000"
+LINUX_INITRD_STAGE_ADDR = "0x74000000"
 FATAL_PATTERNS = (
     "[cut here]",
     "unexpected arm64 trap",
@@ -22,6 +24,7 @@ FATAL_PATTERNS = (
     "unhandled arm64 vcpu exit",
     "failed to handle arm64 vcpu exit",
 )
+FATAL_DRAIN_TIMEOUT = 1.0
 
 
 def relpath(path):
@@ -38,6 +41,11 @@ def render(cmd, toolchains=None):
     return f"PATH={shlex.quote(str(toolchains))}:$PATH {cmd}" if toolchains else cmd
 
 
+def getenv(name, default=None):
+    value = os.getenv(name)
+    return default if value is None else value
+
+
 def build_env(toolchains):
     env = os.environ.copy()
     if toolchains:
@@ -46,18 +54,21 @@ def build_env(toolchains):
 
 
 def parse_args():
-    toolchains = os.getenv("CLAN_TOOLCHAINS", os.getenv("CLAN_TOOLCHAIN"))
+    toolchains = getenv("SIMA_TOOLCHAINS")
+    toolchains = getenv("SIMA_TOOLCHAIN", toolchains)
     toolchains = relpath(toolchains) if toolchains else None
 
     parser = argparse.ArgumentParser(description="Run the ARM64 QEMU boot regression.")
     parser.add_argument("--toolchains", "--toolchain", default=toolchains, type=relpath)
-    parser.add_argument("--cross-prefix", default=os.getenv("CLAN_CROSS_COMPILE", "aarch64-none-elf-"))
-    parser.add_argument("--kernel", default=ROOT / "build/clan.debug.out", type=relpath)
+    parser.add_argument("--cross-prefix", default=getenv("SIMA_CROSS_COMPILE", "aarch64-none-elf-"))
+    parser.add_argument("--kernel", default=ROOT / "out/qemu_out/sima.debug.out", type=relpath)
     parser.add_argument("--qemu", default=os.getenv("QEMU_SYSTEM_AARCH64", "qemu-system-aarch64"))
-    parser.add_argument("--smp", default=os.getenv("CLAN_QEMU_SMP", "8"))
-    parser.add_argument("-m", "--memory", default=os.getenv("CLAN_QEMU_MEM", "1024M"))
+    parser.add_argument("--smp", default=getenv("SIMA_QEMU_SMP", "8"))
+    parser.add_argument("-m", "--memory", default=getenv("SIMA_QEMU_MEM", "1024M"))
+    parser.add_argument("--linux-image", default=ROOT / "sdk/images/linux/Image", type=relpath)
+    parser.add_argument("--linux-initrd", default=ROOT / "sdk/images/linux/Initrd", type=relpath)
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--log", default=ROOT / "build/regress.log", type=relpath)
+    parser.add_argument("--log", default=ROOT / "out/qemu_out/regress.log", type=relpath)
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args, extra = parser.parse_known_args()
@@ -93,6 +104,10 @@ def qemu_cmd(args):
         "mon:stdio",
         "-kernel",
         str(args.kernel),
+        "-device",
+        f"loader,file={args.linux_image},addr={LINUX_IMAGE_STAGE_ADDR},force-raw=on",
+        "-device",
+        f"loader,file={args.linux_initrd},addr={LINUX_INITRD_STAGE_ADDR},force-raw=on",
         *args.extra,
     ]
 
@@ -173,10 +188,36 @@ class QemuSession:
             self.output += self.decoder.decode(data)
             self.check_fatal()
 
+    def drain_after_fatal(self):
+        deadline = time.monotonic() + FATAL_DRAIN_TIMEOUT
+        while time.monotonic() < deadline:
+            wait = max(0.0, min(0.05, deadline - time.monotonic()))
+            events = self.selector.select(wait)
+            if not events:
+                if self.proc.poll() is not None:
+                    return
+                continue
+
+            for key, _ in events:
+                data = os.read(key.fileobj.fileno(), 4096)
+                if not data:
+                    return
+                self.output += self.decoder.decode(data)
+                if "[end here]" in self.output[-4000:].lower():
+                    return
+
     def check_fatal(self):
-        lower = self.output.lower()
+        # QEMU stdout can split a fatal log line across reads. Only scan
+        # complete lines so the saved regression log keeps the diagnostic
+        # suffix, such as ESR/ELR/FAR for ARM64 vCPU exits.
+        last_lf = self.output.rfind("\n")
+        if last_lf < 0:
+            return
+
+        lower = self.output[:last_lf + 1].lower()
         for pattern in FATAL_PATTERNS:
             if pattern in lower:
+                self.drain_after_fatal()
                 raise RuntimeError(f"fatal QEMU output matched: {pattern}")
 
     def expect(self, pattern, name, timeout=None, keepalive=None):
@@ -202,7 +243,7 @@ class QemuSession:
     def command(self, line, patterns, rejects=None):
         rejects = [] if rejects is None else rejects
         self.send(line + ENTER)
-        text = self.expect(PROMPT, f"{line} returns to CLAN shell")
+        text = self.expect(PROMPT, f"{line} returns to SIMA shell")
         for pattern in patterns:
             if pattern not in text:
                 raise RuntimeError(f"{line!r} output missing {pattern!r}")
@@ -211,16 +252,31 @@ class QemuSession:
                 raise RuntimeError(f"{line!r} output contains rejected {pattern!r}")
         print(f"[pass] {line}: expected output found", flush=True)
 
+    def capture_vm_diagnostics(self, label, vmid):
+        print(f"[regress] diagnostics: {label}", flush=True)
+        try:
+            self.send(CTRL_D)
+            self.expect(PROMPT, f"return to SIMA shell for {label}", timeout=5.0, keepalive=ENTER)
+            for line in ("vcpus", "schedstat", "irqs", f"dumpstat {vmid}"):
+                self.send(line + ENTER)
+                self.expect(PROMPT, f"{line} diagnostics", timeout=15.0, keepalive=ENTER)
+        except Exception as err:
+            print(f"[regress] diagnostics failed: {err}", flush=True)
+
 
 def run_qemu(args, cmd):
     if not args.kernel.is_file():
         raise SystemExit(f"Kernel image not found: {args.kernel}")
+    if not args.linux_image.is_file():
+        raise SystemExit(f"Linux Image not found: {args.linux_image}")
+    if not args.linux_initrd.is_file():
+        raise SystemExit(f"Linux Initrd not found: {args.linux_initrd}")
     if shutil.which(args.qemu) is None:
         raise SystemExit(f"QEMU binary not found: {args.qemu}")
 
     print(f"[regress] qemu: {quote(cmd)}", flush=True)
     with QemuSession(cmd, args.log, args.timeout) as qemu:
-        qemu.expect(PROMPT, "CLAN shell prompt", keepalive=ENTER)
+        qemu.expect(PROMPT, "SIMA shell prompt", keepalive=ENTER)
         qemu.command("vcpus", ["vmid", "vcpu", "pcpu_mode", "isolate", "shared", "switches", "since.us"])
         qemu.command("schedstat", [
             "schedstat algorithm:sched_iorr",
@@ -240,8 +296,15 @@ def run_qemu(args, cmd):
                 "┌─  vm0/vcpu0",
                 "sched:",
                 "├─  guest regs",
+                "elr:0x",
+                "spsr:0x",
+                "x00:0x",
+                "├─  recent events",
+                "exit:",
+                "irq:",
+                "timer:",
                 "├─  guest stack symbols:none",
-                "├─  host stack symbols:clan",
+                "├─  host stack symbols:sima",
                 "│   pcpu:",
                 "source:vcpu-thread",
                 "+0x",
@@ -261,11 +324,17 @@ def run_qemu(args, cmd):
         qemu.expect(PROMPT, "return from VM1 shell")
 
         qemu.send("vsh 2" + ENTER)
-        qemu.expect("login:", "VM2 clot login prompt", keepalive=ENTER)
-        qemu.send("clot" + ENTER)
-        qemu.expect("password:", "VM2 clot password prompt")
-        qemu.send("clot" + ENTER)
-        qemu.expect("clot ~>", "VM2 clot shell")
+        try:
+            qemu.expect("clou login:", "VM2 Linux login", timeout=60.0, keepalive=ENTER)
+        except Exception:
+            qemu.capture_vm_diagnostics("VM2 Linux login timeout", 2)
+            raise
+        qemu.send("root" + ENTER)
+        qemu.expect("Password:", "VM2 Linux password prompt", timeout=10.0)
+        qemu.send("root" + ENTER)
+        qemu.expect("clou", "VM2 Linux shell prompt", timeout=60.0, keepalive=ENTER)
+        qemu.send("id" + ENTER)
+        qemu.expect("uid=0(root)", "VM2 Linux root identity", timeout=10.0)
         qemu.send(CTRL_D)
         qemu.expect(PROMPT, "return from VM2 shell")
 
@@ -281,7 +350,7 @@ def main():
         if not args.no_build:
             print(render(build, args.toolchains))
         print(quote(qemu))
-        print("checks: prompt, vcpus, schedstat, vmap, irqs, vsh 0, ctrl-d, vsh 1, ctrl-d, vsh 2, login")
+        print("checks: prompt, vcpus, schedstat, vmap, irqs, vsh 0, ctrl-d, vsh 1, ctrl-d, vsh 2, Linux root login")
         return 0
 
     if not args.no_build:

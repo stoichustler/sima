@@ -9,12 +9,12 @@
 
 #include <types.h>
 #include <pci.h>
-#ifndef CONFIG_STATIC_QEMU_PLATFORM
+#ifndef CONFIG_STATIC_ARM64_PLATFORM
 #include <board_info.h>
 #endif
 #include <boot.h>
 #include <acrn_common.h>
-#ifndef CONFIG_STATIC_QEMU_PLATFORM
+#ifndef CONFIG_STATIC_ARM64_PLATFORM
 #include <vm_configurations.h>
 #endif
 #include <acrn_hv_defs.h>
@@ -96,6 +96,7 @@ struct acrn_vm_os_config {
 	uint64_t kernel_load_addr;
 	uint64_t kernel_entry_addr;
 	uint64_t kernel_ramdisk_addr;
+	uint64_t kernel_ramdisk_size;
 } __aligned(8);
 
 struct acrn_vm_acpi_config {

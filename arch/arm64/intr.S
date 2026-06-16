@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -168,6 +168,12 @@ arm64_guest_serror_handler:
 
 	.globl vcpu_exit_return
 vcpu_exit_return:
+	/*
+	 * Keep current-EL IRQs out of the ELR_EL2/SPSR_EL2 restore window.
+	 * A host IRQ taken after ELR_EL2 is programmed but before ERET would use
+	 * ELR_EL2 for its own EL2 return address, corrupting the guest PC.
+	 */
+	msr	daifset, #2
 	/* Restore guest architectural state from the frame prepared by C code. */
 	ldr	x0, [sp, #CPU_REGS_OFFSET_ELR]
 	/* ELR_EL2 holds the guest PC used by ERET back to EL1. */

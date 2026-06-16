@@ -7,7 +7,7 @@
 #ifndef ACPI_H
 #define ACPI_H
 
-#ifndef CONFIG_STATIC_QEMU_PLATFORM
+#ifndef CONFIG_STATIC_ARM64_PLATFORM
 #include <board_info.h>
 #endif
 

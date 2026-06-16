@@ -24,9 +24,18 @@ static bool range_overlaps(uint64_t start_a, uint64_t size_a, uint64_t start_b, 
 	return (end_a > start_a) && (end_b > start_b) && (start_a < end_b) && (start_b < end_a);
 }
 
+static bool range_fits(uint64_t addr, uint64_t size, uint64_t window_start, uint64_t window_size)
+{
+	uint64_t addr_end = addr + size;
+	uint64_t window_end = window_start + window_size;
+
+	return (addr_end > addr) && (window_end > window_start) &&
+		(addr >= window_start) && (addr_end <= window_end);
+}
+
 #if defined(CONFIG_ARM64)
 static uint64_t arm64_rawimage_fdt_load_gpa(struct acrn_vm *vm, uint64_t kernel_load_gpa,
-	uint32_t kernel_size)
+	uint32_t kernel_size, uint64_t ramdisk_load_gpa, uint32_t ramdisk_size)
 {
 	uint64_t ram_start = arm64_platform_guest_ram_start(vm->vm_id);
 	uint64_t ram_size = arm64_platform_guest_ram_size(vm->vm_id);
@@ -51,9 +60,9 @@ static uint64_t arm64_rawimage_fdt_load_gpa(struct acrn_vm *vm, uint64_t kernel_
 		fdt_load_gpa = (ram_start + ram_size - fdt_size) & ~(uint64_t)(MEM_4K - 1U);
 	}
 
-	if ((fdt_load_gpa < ram_start) ||
-		((fdt_load_gpa + fdt_size) > (ram_start + ram_size)) ||
-		range_overlaps(fdt_load_gpa, fdt_size, kernel_load_gpa, kernel_size)) {
+	if (!range_fits(fdt_load_gpa, fdt_size, ram_start, ram_size) ||
+		range_overlaps(fdt_load_gpa, fdt_size, kernel_load_gpa, kernel_size) ||
+		range_overlaps(fdt_load_gpa, fdt_size, ramdisk_load_gpa, ramdisk_size)) {
 		return 0UL;
 	}
 
@@ -67,12 +76,49 @@ static uint64_t arm64_rawimage_fdt_load_gpa(struct acrn_vm *vm, uint64_t kernel_
 static int32_t load_rawimage(struct acrn_vm *vm)
 {
 	struct sw_kernel_info *sw_kernel = &(vm->sw.kernel_info);
+	struct sw_module_info *ramdisk_info = &(vm->sw.ramdisk_info);
 	const struct acrn_vm_config *vm_config = get_vm_config(vm->vm_id);
 	uint64_t kernel_load_gpa;
+	uint64_t ram_start;
+	uint64_t ram_size;
+	uint64_t ramdisk_load_gpa = 0UL;
+	uint32_t ramdisk_size = ramdisk_info->size;
 	int32_t ret;
 
 	/* TODO: GPA 0 load support */
 	kernel_load_gpa = vm_config->os_config.kernel_load_addr;
+#if defined(CONFIG_ARM64)
+	ram_start = arm64_platform_guest_ram_start(vm->vm_id);
+	ram_size = arm64_platform_guest_ram_size(vm->vm_id);
+#else
+	ram_start = 0UL;
+	ram_size = UINT64_MAX;
+#endif
+
+	if (!range_fits(kernel_load_gpa, sw_kernel->kernel_size, ram_start, ram_size)) {
+		pr_err("vm-%u image %s does not fit ram gpa[0x%lx-0x%lx]",
+			vm->vm_id, vm_config->os_config.kernel_mod_tag, kernel_load_gpa,
+			kernel_load_gpa + sw_kernel->kernel_size);
+		return -EFAULT;
+	}
+
+	if (ramdisk_size > 0U) {
+		ramdisk_load_gpa = vm_config->os_config.kernel_ramdisk_addr;
+		if (ramdisk_load_gpa == 0UL) {
+			pr_err("vm-%u ramdisk %s has no load address",
+				vm->vm_id, vm_config->os_config.ramdisk_mod_tag);
+			return -EFAULT;
+		}
+		if (!range_fits(ramdisk_load_gpa, ramdisk_size, ram_start, ram_size) ||
+			range_overlaps(ramdisk_load_gpa, ramdisk_size, kernel_load_gpa,
+				sw_kernel->kernel_size)) {
+			pr_err("vm-%u ramdisk %s does not fit ram gpa[0x%lx-0x%lx]",
+				vm->vm_id, vm_config->os_config.ramdisk_mod_tag, ramdisk_load_gpa,
+				ramdisk_load_gpa + ramdisk_size);
+			return -EFAULT;
+		}
+		ramdisk_info->load_addr = (void *)ramdisk_load_gpa;
+	}
 
 	/* TODO: For simplicity assume there are enough space just before kernel load address
 	 * Fix this after implementing find_space_from_vm_vfdt API
@@ -80,7 +126,7 @@ static int32_t load_rawimage(struct acrn_vm *vm)
 	if (vm->sw.fdt_info.src_addr != NULL) {
 #if defined(CONFIG_ARM64)
 		uint64_t fdt_load_gpa = arm64_rawimage_fdt_load_gpa(vm, kernel_load_gpa,
-			sw_kernel->kernel_size);
+			sw_kernel->kernel_size, ramdisk_load_gpa, ramdisk_size);
 
 		if (fdt_load_gpa == 0UL) {
 			pr_err("vm-%u fdt does not fit guest ram without overlapping raw image",
@@ -106,6 +152,20 @@ static int32_t load_rawimage(struct acrn_vm *vm)
 			vm->vm_id, vm_config->os_config.kernel_mod_tag, kernel_load_gpa,
 			kernel_load_gpa + sw_kernel->kernel_size);
 		return -EFAULT;
+	}
+
+	if (ramdisk_size > 0U) {
+		ret = copy_to_gpa(vm, ramdisk_info->src_addr, ramdisk_load_gpa, ramdisk_size);
+		if (ret == 0) {
+			pr_info("vm-%u ramdisk %s copied to 1:1 ram gpa[0x%lx-0x%lx]",
+				vm->vm_id, vm_config->os_config.ramdisk_mod_tag, ramdisk_load_gpa,
+				ramdisk_load_gpa + ramdisk_size);
+		} else {
+			pr_err("vm-%u ramdisk %s does not fit 1:1 ram gpa[0x%lx-0x%lx]",
+				vm->vm_id, vm_config->os_config.ramdisk_mod_tag, ramdisk_load_gpa,
+				ramdisk_load_gpa + ramdisk_size);
+			return -EFAULT;
+		}
 	}
 
 	sw_kernel->kernel_entry_addr = (void *)vm_config->os_config.kernel_entry_addr;

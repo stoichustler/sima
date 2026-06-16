@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -41,6 +41,7 @@ static const uint8_t pl011_pid[] = { 0x11U, 0x10U, 0x14U, 0x00U, 0x0dU, 0xf0U, 0
 static const uint8_t pl011_cid[] = { 0x0dU, 0xf0U, 0x05U, 0xb1U };
 
 struct arm64_vpl011 {
+	uint64_t tx_count;
 	uint32_t ibrd;
 	uint32_t fbrd;
 	uint32_t lcrh;
@@ -48,6 +49,7 @@ struct arm64_vpl011 {
 	uint32_t ifls;
 	uint32_t imsc;
 	uint32_t ris;
+	uint8_t last_tx;
 };
 
 static struct arm64_vpl011 vpl011_devs[CONFIG_MAX_VM_NUM];
@@ -94,6 +96,19 @@ void arm64_vpl011_init_vm(struct acrn_vm *vm)
 	init_console_vuart(vm, arm64_platform_guest_uart_irq(vm->vm_id));
 	console = vm_console_vuart(vm);
 	vuart_set_backend(console, &vpl011_backend_ops);
+}
+
+void arm64_vpl011_get_debug(uint16_t vm_id, struct arm64_vpl011_debug *debug)
+{
+	if ((debug != NULL) && (vm_id < CONFIG_MAX_VM_NUM)) {
+		const struct arm64_vpl011 *vu = &vpl011_devs[vm_id];
+
+		debug->tx_count = vu->tx_count;
+		debug->cr = vu->cr;
+		debug->imsc = vu->imsc;
+		debug->ris = vu->ris;
+		debug->last_tx = vu->last_tx;
+	}
 }
 
 static uint32_t vpl011_read(struct acrn_vm *vm, struct arm64_vpl011 *vu, uint32_t offset)
@@ -164,6 +179,8 @@ static void vpl011_write(struct acrn_vm *vm, struct arm64_vpl011 *vu, uint32_t o
 	switch (offset) {
 	case PL011_DR:
 		ch = (char)(value & 0xffU);
+		vu->tx_count++;
+		vu->last_tx = (uint8_t)ch;
 		(void)console_vm_tx_put(vm->vm_id, ch);
 		if ((vu->ris & PL011_INT_TX) == 0U) {
 			vu->ris |= PL011_INT_TX;

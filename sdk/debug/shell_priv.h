@@ -7,7 +7,7 @@
 #ifndef SHELL_PRIV_H
 #define SHELL_PRIV_H
 
-#ifndef CONFIG_STATIC_QEMU_PLATFORM
+#ifndef CONFIG_STATIC_ARM64_PLATFORM
 #include <board_info.h>
 #endif
 #include <spinlock.h>
@@ -89,7 +89,7 @@ struct shell {
 
 #define SHELL_CMD_VM_CONSOLE		"vsh"
 #define SHELL_CMD_VM_CONSOLE_PARAM	"<vm id>"
-#define SHELL_CMD_VM_CONSOLE_HELP	"switch to the vm console. type `CTRL-D` switch to CLAN"
+#define SHELL_CMD_VM_CONSOLE_HELP	"switch to the vm console. type `CTRL-D` switch to SIMA"
 
 void shell_puts(const char *string_ptr);
 void shell_item_begin(const char *fmt, ...);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -13,6 +13,8 @@
 #include <irq.h>
 #include <logmsg.h>
 #include <rtl.h>
+#include <ticks.h>
+#include <timer.h>
 #include <asm/platform.h>
 #include <asm/sysreg.h>
 #include <asm/guest/vgicv3.h>
@@ -63,6 +65,7 @@
 #define VGICR_WAKER_PROCESSOR_SLEEP	BIT32(1U)
 #define VGICR_WAKER_CHILDREN_ASLEEP	BIT32(2U)
 #define VGIC_VMCR_GROUP_ENABLES		ICH_VMCR_VENG1
+#define VGICR_WAKER_READ_MASK		(VGICR_WAKER_PROCESSOR_SLEEP | VGICR_WAKER_CHILDREN_ASLEEP)
 
 #define ICC_SGI1R_TARGET_LIST_MASK	0xffffUL
 #define ICC_SGI1R_AFF1_SHIFT		16U
@@ -90,6 +93,11 @@
 static uint32_t vgic_lr_count;
 static bool vgic_global_initialized;
 
+static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current);
+static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current);
+static int32_t vgicv3_inject_current_timer(struct acrn_vcpu *vcpu, uint32_t virq,
+	uint32_t guest_ctl, uint64_t guest_cval);
+
 static uint32_t min_u32(uint32_t a, uint32_t b)
 {
 	return (a < b) ? a : b;
@@ -112,20 +120,6 @@ static uint16_t arm64_vcpu_count_from_affinity(uint64_t affinity)
 	return count;
 }
 
-static uint16_t arm64_rdist_count_from_affinity(uint64_t affinity)
-{
-	uint16_t count = 0U;
-	uint16_t pcpu_id;
-
-	for (pcpu_id = 0U; pcpu_id < ARM64_VGIC_MAX_VCPUS; pcpu_id++) {
-		if ((affinity & (1UL << pcpu_id)) != 0UL) {
-			count = pcpu_id + 1U;
-		}
-	}
-
-	return count;
-}
-
 static struct arm64_vgic_irq *vgic_irq_desc(struct acrn_vcpu *vcpu, uint32_t virq)
 {
 	struct arm64_vgic_irq *desc = NULL;
@@ -140,6 +134,23 @@ static struct arm64_vgic_irq *vgic_irq_desc(struct acrn_vcpu *vcpu, uint32_t vir
 	}
 
 	return desc;
+}
+
+static void vgic_record_irq_injection(struct acrn_vcpu *source_vcpu,
+	struct acrn_vcpu *target_vcpu, uint32_t virq, bool level, int32_t status)
+{
+	struct arm64_vcpu_last_irq *last;
+
+	if (target_vcpu != NULL) {
+		last = &target_vcpu->arch.debug.last_irq;
+		last->virq = virq;
+		last->status = status;
+		last->source_vcpu_id = (source_vcpu != NULL) ?
+			source_vcpu->vcpu_id : ARM64_VCPU_DEBUG_INVALID_VCPU_ID;
+		last->target_vcpu_id = target_vcpu->vcpu_id;
+		last->level = level;
+		last->tsc = cpu_ticks();
+	}
 }
 
 static uint32_t vgic_irq_word(uint32_t virq)
@@ -169,6 +180,132 @@ static void vgic_set_pending(struct arm64_vgicv3 *vgic, uint16_t vcpu_id,
 	} else {
 		vgic->pending_bitmap[vcpu_id][word] &= ~mask;
 	}
+}
+
+static void vgic_timer_set_host_mask(struct acrn_vcpu *vcpu, bool masked)
+{
+	if ((vcpu == NULL) || (get_running_vcpu(get_pcpu_id()) != vcpu)) {
+		return;
+	}
+
+	if (masked) {
+		arm64_gicv3_disable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+		arm64_gicv3_clear_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+		vcpu->arch.gctx.cntv_el2_masked = true;
+	} else if (vcpu->arch.gctx.cntv_el2_masked) {
+		vcpu->arch.gctx.cntv_el2_masked = false;
+		arm64_gicv3_clear_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+		arm64_gicv3_enable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+	}
+}
+
+static uint32_t vgic_live_vtimer_ctl(void)
+{
+	return read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+}
+
+static bool vgic_sample_current_vtimer(struct acrn_vcpu *vcpu)
+{
+	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
+	uint32_t ctl = vgic_live_vtimer_ctl();
+	uint64_t cval = read_cntv_cval_el0();
+	uint64_t now = read_cntvct_el0();
+
+	/*
+	 * CNTV is the hardware source for the guest timer while this vCPU is
+	 * loaded. Sampling it at LR synchronization time prevents stale software
+	 * pending state from re-injecting a timer interrupt after the guest has
+	 * already programmed the next deadline.
+	 */
+	if (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+		gctx->cntp_ctl_el0 = ctl;
+		gctx->cntp_cval_el0 = cval;
+	} else {
+		gctx->cntv_ctl_el0 = ctl;
+		gctx->cntv_cval_el0 = cval;
+	}
+
+	return (((ctl & CNTV_CTL_ENABLE) != 0U) && ((ctl & CNTV_CTL_IMASK) == 0U) &&
+		((int64_t)(cval - now) <= 0L));
+}
+
+static uint32_t vgic_vtimer_guest_ctl(const struct arm64_vcpu_guest_ctx *gctx)
+{
+	return (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
+		gctx->cntp_ctl_el0 : gctx->cntv_ctl_el0;
+}
+
+static uint64_t vgic_vtimer_guest_cval(const struct arm64_vcpu_guest_ctx *gctx)
+{
+	return (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
+		gctx->cntp_cval_el0 : gctx->cntv_cval_el0;
+}
+
+static uint64_t vgic_vtimer_host_deadline(const struct arm64_vcpu_guest_ctx *gctx)
+{
+	return vgic_vtimer_guest_cval(gctx) - gctx->cntvoff_el2;
+}
+
+static void vgicv3_disarm_vtimer_backup(struct acrn_vcpu *vcpu)
+{
+	if ((vcpu != NULL) && vcpu->arch.vtimer_backup_initialized) {
+		if (timer_is_started(&vcpu->arch.vtimer_backup)) {
+			del_timer(&vcpu->arch.vtimer_backup);
+		}
+		update_timer(&vcpu->arch.vtimer_backup, 0UL, 0UL);
+	}
+}
+
+static void vgicv3_arm_vtimer_backup(struct acrn_vcpu *vcpu)
+{
+	struct arm64_vcpu_guest_ctx *gctx;
+	uint64_t deadline;
+	uint32_t ctl;
+
+	if ((vcpu == NULL) || !vcpu->arch.vtimer_backup_initialized) {
+		return;
+	}
+
+	gctx = &vcpu->arch.gctx;
+	ctl = vgic_vtimer_guest_ctl(gctx);
+	deadline = vgic_vtimer_host_deadline(gctx);
+	if (((ctl & CNTV_CTL_ENABLE) == 0U) || ((ctl & CNTV_CTL_IMASK) != 0U) ||
+		((int64_t)(deadline - cpu_ticks()) <= 0L)) {
+		vgicv3_disarm_vtimer_backup(vcpu);
+		return;
+	}
+
+	if (timer_is_started(&vcpu->arch.vtimer_backup)) {
+		del_timer(&vcpu->arch.vtimer_backup);
+	}
+	update_timer(&vcpu->arch.vtimer_backup, deadline, 0UL);
+	if (add_timer(&vcpu->arch.vtimer_backup) != 0) {
+		update_timer(&vcpu->arch.vtimer_backup, 0UL, 0UL);
+	}
+}
+
+static void vgicv3_vtimer_backup_handler(void *data)
+{
+	struct acrn_vcpu *vcpu = (struct acrn_vcpu *)data;
+	struct arm64_vcpu_guest_ctx *gctx;
+	uint64_t deadline;
+	uint32_t ctl;
+	uint32_t virq;
+
+	if ((vcpu == NULL) || (vcpu->vm == NULL) || (vcpu->state != VCPU_RUNNING)) {
+		return;
+	}
+
+	gctx = &vcpu->arch.gctx;
+	virq = (gctx->timer_virq == 0U) ? ARM64_GIC_PPI_VIRTUAL_TIMER : gctx->timer_virq;
+	ctl = vgic_vtimer_guest_ctl(gctx);
+	deadline = vgic_vtimer_host_deadline(gctx);
+	if (((ctl & CNTV_CTL_ENABLE) == 0U) || ((ctl & CNTV_CTL_IMASK) != 0U) ||
+		((int64_t)(deadline - cpu_ticks()) > 0L)) {
+		return;
+	}
+
+	(void)vgicv3_inject_current_timer(vcpu, virq, ctl, vgic_vtimer_guest_cval(gctx));
 }
 
 static struct acrn_vcpu *vgic_irq_target_vcpu(struct acrn_vcpu *vcpu,
@@ -211,9 +348,24 @@ static uint64_t make_lr_state(const struct arm64_vgic_irq *desc, bool pending, b
 	if (desc->hw) {
 		lr |= ((uint64_t)desc->pirq << ICH_LR_PINTID_SHIFT);
 		lr |= ICH_LR_HW;
+	} else if (active) {
+		/*
+		 * Software-backed virtual IRQs need EOI maintenance only after the
+		 * guest has accepted them. Pending-only LRs have no active lifecycle
+		 * to complete, and marking them for EOI can create maintenance storms.
+		 */
+		lr |= ICH_LR_EOI;
 	}
 
 	return lr;
+}
+
+static bool vgic_irq_deliverable(const struct arm64_vgicv3 *vgic,
+	const struct acrn_vcpu *vcpu, const struct arm64_vgic_irq *desc)
+{
+	return ((vgic->gicd_ctlr & VGIC_CTLR_ENABLE_G1) != 0U) &&
+		((vcpu->arch.vgic.vmcr & ICH_VMCR_VENG1) != 0UL) &&
+		desc->enabled;
 }
 
 static uint64_t make_lr(const struct arm64_vgic_irq *desc)
@@ -236,7 +388,8 @@ static int32_t find_lr_for_virq(const struct acrn_vcpu *vcpu, uint32_t virq)
 	uint32_t idx;
 
 	for (idx = 0U; idx < vcpu->arch.vgic.used_lrs; idx++) {
-		if (lr_vintid(vcpu->arch.vgic.lr[idx]) == virq) {
+		if ((lr_state(vcpu->arch.vgic.lr[idx]) != ICH_LR_STATE_INVALID) &&
+			(lr_vintid(vcpu->arch.vgic.lr[idx]) == virq)) {
 			return (int32_t)idx;
 		}
 	}
@@ -337,6 +490,48 @@ static void vgicv3_write_lrs(const struct arm64_vgicv3_vcpu_ctx *ctx)
 	}
 }
 
+static uint64_t vgicv3_control_hcr(uint64_t hcr)
+{
+	/*
+	 * ICH_HCR.EOIcount is a hardware-reported completion count. Replaying it
+	 * as saved control state can preserve stale EOI evidence across flushes, so
+	 * only the actual control bits are written back to the virtual CPU
+	 * interface.
+	 */
+	return (hcr & ~ICH_HCR_EOICOUNT_MASK) | ICH_HCR_EN;
+}
+
+static void vgicv3_write_cpuif(const struct arm64_vgicv3_vcpu_ctx *ctx)
+{
+	write_ich_vmcr_el2(ctx->vmcr);
+	write_ich_ap0r0_el2(ctx->ap0r0);
+	write_ich_ap1r0_el2(ctx->ap1r0);
+	vgicv3_write_lrs(ctx);
+	write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
+}
+
+static void vgicv3_write_lrs_hcr(const struct arm64_vgicv3_vcpu_ctx *ctx)
+{
+	/*
+	 * Runtime flushes only publish pending virtual interrupts and maintenance
+	 * controls. VMCR/AP are guest CPU-interface state; replaying old snapshots
+	 * while the vCPU is running can resurrect stale active-priority state.
+	 */
+	vgicv3_write_lrs(ctx);
+	write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
+}
+
+static void vgicv3_write_cpuif_control(const struct arm64_vgicv3_vcpu_ctx *ctx)
+{
+	/*
+	 * Trapped ICC control writes update VMCR/SRE immediately for the running
+	 * vCPU. This keeps guest priority/group enables live without replaying AP
+	 * state, which is owned by the hardware interrupt acknowledge/EOI path.
+	 */
+	write_icc_sre_el1(ctx->sre | ICC_SRE_SRE);
+	write_ich_vmcr_el2(ctx->vmcr);
+}
+
 static void vgicv3_read_lrs(struct arm64_vgicv3_vcpu_ctx *ctx)
 {
 	uint32_t idx;
@@ -361,6 +556,38 @@ static bool vgicv3_vcpu_is_loaded(const struct acrn_vcpu *vcpu)
 	return get_running_vcpu(get_pcpu_id()) == vcpu;
 }
 
+static bool vgicv3_vcpu_is_running_remote(const struct acrn_vcpu *vcpu)
+{
+	uint16_t pcpu_id = pcpuid_from_vcpu(vcpu);
+
+	return (pcpu_id != get_pcpu_id()) && (get_running_vcpu(pcpu_id) == vcpu);
+}
+
+static void vgicv3_record_cpuif_snapshot(struct acrn_vcpu *vcpu,
+	struct arm64_vcpu_last_vgic *last, uint32_t source)
+{
+	uint32_t count = last->count + 1U;
+
+	/*
+	 * ICH_MISR/EISR/ELRSR are the hardware-visible maintenance contract.
+	 * Recording them before software consumes LRs preserves the evidence that
+	 * explains why EL2 was entered and whether EOI state was available.
+	 */
+	last->tsc = cpu_ticks();
+	last->misr = read_ich_misr_el2();
+	last->eisr = read_ich_eisr_el2();
+	last->elrsr = read_ich_elrsr_el2();
+	last->hcr = read_ich_hcr_el2();
+	last->vmcr = read_ich_vmcr_el2();
+	last->ap0r0 = read_ich_ap0r0_el2();
+	last->ap1r0 = read_ich_ap1r0_el2();
+	last->lr0 = (vgic_lr_count > 0U) ? read_ich_lr_el2(0U) : 0UL;
+	last->lr1 = (vgic_lr_count > 1U) ? read_ich_lr_el2(1U) : 0UL;
+	last->source = source;
+	last->count = count;
+	last->used_lrs = vcpu->arch.vgic.used_lrs;
+}
+
 static void vgicv3_read_loaded_lrs(struct acrn_vcpu *vcpu, bool is_current)
 {
 	if (is_current || vgicv3_vcpu_is_loaded(vcpu)) {
@@ -368,11 +595,119 @@ static void vgicv3_read_loaded_lrs(struct acrn_vcpu *vcpu, bool is_current)
 	}
 }
 
+static void vgicv3_complete_eoi_lrs(struct acrn_vcpu *vcpu, uint64_t eoi_lrs,
+	const uint64_t *old_lrs, uint8_t old_used_lrs)
+{
+	struct arm64_vgicv3_vcpu_ctx *ctx = &vcpu->arch.vgic;
+	uint32_t idx = min_u32(vgic_lr_count, ARM64_VGIC_MAX_LRS);
+
+	while (idx > 0U) {
+		uint32_t lr_idx = idx - 1U;
+		uint64_t lr;
+		uint32_t virq;
+		uint32_t state;
+		struct arm64_vgic_irq *desc;
+
+		idx--;
+		if ((eoi_lrs & (1UL << lr_idx)) == 0UL) {
+			continue;
+		}
+
+		lr = (lr_idx < ctx->used_lrs) ? ctx->lr[lr_idx] : 0UL;
+		state = lr_state(lr);
+		if ((state == ICH_LR_STATE_INVALID) &&
+			(old_lrs != NULL) && (lr_idx < old_used_lrs)) {
+			/*
+			 * EISR is an event bitmap, while LR readback is stateful. Some
+			 * implementations can report the EOI after the LR slot has already
+			 * become invalid, so use the pre-sync software LR as the identity
+			 * source to clear the matching virtual IRQ active state.
+			 */
+			lr = old_lrs[lr_idx];
+			state = lr_state(lr);
+		}
+		if (state == ICH_LR_STATE_INVALID) {
+			continue;
+		}
+
+		virq = lr_vintid(lr);
+		desc = vgic_irq_desc(vcpu, virq);
+		if (desc != NULL) {
+			bool lr_pending = ((state & ICH_LR_STATE_PENDING) != 0U);
+			bool keep_pending = lr_pending || (desc->level && desc->pending);
+
+			/*
+			 * The virtual timer is level-triggered by CNTV, not by the
+			 * cached pending bit alone. On EOI maintenance, the guest may
+			 * already have moved CNTV_CVAL to a future deadline without an
+			 * intervening EL2 sysreg trap, so resample CNTV before deciding
+			 * whether to requeue the timer LR.
+			 */
+			if ((virq == vcpu->arch.gctx.timer_virq) && vgicv3_vcpu_is_loaded(vcpu)) {
+				/*
+				 * The timer source is the live CNTV line. Once the guest
+				 * completes a timer LR, keep the software queue empty and let
+				 * the host PPI recreate any still-asserted deadline.
+				 */
+				(void)vgic_sample_current_vtimer(vcpu);
+				keep_pending = false;
+			}
+
+			vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, keep_pending);
+			desc->active = false;
+			if (virq == vcpu->arch.gctx.timer_virq) {
+				vgic_timer_set_host_mask(vcpu, false);
+			}
+		}
+		if (lr_idx < ctx->used_lrs) {
+			remove_lr(vcpu, lr_idx);
+		}
+	}
+}
+
+static void vgicv3_deactivate_irq_locked(struct acrn_vcpu *vcpu, uint32_t virq)
+{
+	struct arm64_vgic_irq *desc;
+	int32_t lr_idx;
+	bool keep_pending = false;
+
+	if (virq >= ARM64_VGIC_IRQ_NUM) {
+		return;
+	}
+
+	/*
+	 * ICC_DIR_EL1 is the explicit deactivation path when a guest uses split
+	 * priority-drop/deactivate semantics. Treating a DIR write as idempotent
+	 * is safe for the current combined-EOI model and prevents a guest-visible
+	 * active LR from sticking if Linux takes the split path anyway.
+	 */
+	vgicv3_sync_vcpu(vcpu, true);
+	desc = vgic_irq_desc(vcpu, virq);
+	if (desc == NULL) {
+		return;
+	}
+
+	if ((virq == vcpu->arch.gctx.timer_virq) && vgicv3_vcpu_is_loaded(vcpu)) {
+		keep_pending = vgic_sample_current_vtimer(vcpu);
+	} else {
+		keep_pending = desc->level && desc->pending;
+	}
+
+	lr_idx = find_lr_for_virq(vcpu, virq);
+	if (lr_idx >= 0) {
+		remove_lr(vcpu, (uint32_t)lr_idx);
+	}
+	desc->active = false;
+	vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, keep_pending);
+	if ((virq == vcpu->arch.gctx.timer_virq) && !keep_pending) {
+		vgic_timer_set_host_mask(vcpu, false);
+	}
+}
+
 static void vgicv3_write_loaded_lrs(const struct acrn_vcpu *vcpu, bool is_current)
 {
 	if (is_current || vgicv3_vcpu_is_loaded(vcpu)) {
-		vgicv3_write_lrs(&vcpu->arch.vgic);
-		write_ich_hcr_el2(vcpu->arch.vgic.hcr | ICH_HCR_EN);
+		vgicv3_write_lrs_hcr(&vcpu->arch.vgic);
 	}
 }
 
@@ -402,12 +737,12 @@ void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity)
 	uint32_t idx;
 	uint32_t spi;
 	uint16_t vcpu_count = arm64_vcpu_count_from_affinity(cpu_affinity);
-	uint16_t rdist_count = arm64_rdist_count_from_affinity(cpu_affinity);
 
 	/*
 	 * The virtual distributor advertises a compact GICv3 with affinity routing
 	 * and Group-1 interrupts enabled. Guest redistributor frames are indexed by
-	 * pCPU slot, and vCPUs register into those slots when they are created.
+	 * guest vCPU ID, so guest MPIDR affinity and GICR_TYPER affinity stay in
+	 * the same compact namespace even when the VM runs on sparse pCPU IDs.
 	 */
 	arm64_vgicv3_global_init();
 
@@ -417,10 +752,7 @@ void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity)
 	if (vgic->vcpu_count == 0U) {
 		vgic->vcpu_count = 1U;
 	}
-	vgic->rdist_count = (uint16_t)min_u32((uint32_t)rdist_count, ARM64_VGIC_MAX_VCPUS);
-	if (vgic->rdist_count == 0U) {
-		vgic->rdist_count = 1U;
-	}
+	vgic->rdist_count = vgic->vcpu_count;
 	vgic->lr_count = vgic_lr_count;
 	vgic->vmcr = (uint32_t)(VGIC_VMCR_GROUP_ENABLES | ICH_VMCR_DEFAULT_MASK);
 	vgic->gicd_ctlr = VGIC_CTLR_ARE_NS | VGIC_CTLR_ENABLE_G1;
@@ -456,21 +788,148 @@ void arm64_vgicv3_init_vcpu(struct acrn_vcpu *vcpu)
 {
 	struct arm64_vgicv3_vcpu_ctx *ctx = &vcpu->arch.vgic;
 	struct arm64_vgicv3 *vgic = &vcpu->vm->arch_vm.vgic;
-	uint16_t pcpu_id = pcpuid_from_vcpu(vcpu);
+	uint16_t rdist_id = vcpu->vcpu_id;
 
 	(void)memset(ctx, 0U, sizeof(*ctx));
-	ctx->hcr = ICH_HCR_EN;
+	/*
+	 * TC traps common ICC registers, including SGI generation and EOImode
+	 * control, so the software vGIC owns the interrupt lifecycle. Leaving these
+	 * accesses virtual in hardware would let Linux enable split deactivate
+	 * semantics that this vGIC does not yet model.
+	 */
+	ctx->hcr = ICH_HCR_EN | ICH_HCR_TC;
 	ctx->vmcr = VGIC_VMCR_GROUP_ENABLES | ICH_VMCR_DEFAULT_MASK;
 	ctx->sre = ICC_SRE_SRE;
 	ctx->pmr = GIC_PRIORITY_LOWEST;
 	ctx->ctlr = 0UL;
+	initialize_timer(&vcpu->arch.vtimer_backup, vgicv3_vtimer_backup_handler,
+		vcpu, 0UL, 0UL);
+	vcpu->arch.vtimer_backup_initialized = true;
 
-	if ((pcpu_id < ARM64_VGIC_MAX_VCPUS) && (vcpu->vcpu_id < vgic->vcpu_count)) {
-		vgic->rdist_vcpu[pcpu_id] = vcpu->vcpu_id;
-		if (pcpu_id >= vgic->rdist_count) {
-			vgic->rdist_count = pcpu_id + 1U;
-		}
+	if ((rdist_id < ARM64_VGIC_MAX_VCPUS) && (vcpu->vcpu_id < vgic->vcpu_count)) {
+		vgic->rdist_vcpu[rdist_id] = vcpu->vcpu_id;
 	}
+}
+
+void arm64_vgicv3_cancel_vtimer_backup(struct acrn_vcpu *vcpu)
+{
+	vgicv3_disarm_vtimer_backup(vcpu);
+}
+
+int32_t arm64_vgicv3_handle_cpuif_sysreg(struct acrn_vcpu *vcpu, uint32_t sysreg,
+	bool read, uint64_t *reg)
+{
+	struct arm64_vgicv3 *vgic;
+	struct arm64_vgicv3_vcpu_ctx *ctx;
+	struct arm64_vcpu_last_cpuif *last;
+	uint64_t flags;
+	uint64_t value = 0UL;
+	uint64_t access_value;
+	bool control_changed = false;
+	int32_t ret = 0;
+
+	if ((vcpu == NULL) || (vcpu->vm == NULL) || (reg == NULL)) {
+		return -EINVAL;
+	}
+
+	vgic = &vcpu->vm->arch_vm.vgic;
+	ctx = &vcpu->arch.vgic;
+	last = &vcpu->arch.debug.last_cpuif;
+	access_value = read ? 0UL : *reg;
+	spinlock_irqsave_obtain(&vgic->lock, &flags);
+	switch (sysreg) {
+	case ARM64_VGIC_SYSREG_ICC_SRE_EL1:
+		if (read) {
+			value = ctx->sre | ICC_SRE_SRE;
+		} else {
+			ctx->sre = *reg | ICC_SRE_SRE;
+			control_changed = true;
+		}
+		break;
+	case ARM64_VGIC_SYSREG_ICC_PMR_EL1:
+		if (read) {
+			value = ctx->pmr;
+		} else {
+			ctx->pmr = *reg & 0xffUL;
+			ctx->vmcr = (ctx->vmcr & ~(0xffUL << 24U)) | (ctx->pmr << 24U);
+			control_changed = true;
+		}
+		break;
+	case ARM64_VGIC_SYSREG_ICC_CTLR_EL1:
+		if (read) {
+			value = ctx->ctlr;
+		} else {
+			/*
+			 * The current LR lifecycle completes software-backed virtual IRQs
+			 * through EOIR maintenance. Keep EOImode as combined priority-drop
+			 * plus deactivate until ICC_DIR_EL1 deactivation is fully modeled.
+			 */
+			ctx->ctlr = 0UL;
+			ctx->vmcr &= ~ICH_VMCR_EOIM;
+			control_changed = true;
+		}
+		break;
+	case ARM64_VGIC_SYSREG_ICC_IGRPEN1_EL1:
+		if (read) {
+			value = ((ctx->vmcr & ICH_VMCR_VENG1) != 0UL) ? 1UL : 0UL;
+		} else if ((*reg & 1UL) != 0UL) {
+			ctx->vmcr |= ICH_VMCR_VENG1;
+			control_changed = true;
+		} else {
+			ctx->vmcr &= ~ICH_VMCR_VENG1;
+			control_changed = true;
+		}
+		break;
+	case ARM64_VGIC_SYSREG_ICC_DIR_EL1:
+		/*
+		 * ICC_DIR_EL1 carries the INTID to deactivate. Linux should only need
+		 * it when EOImode is split, but honoring the write is harmless for the
+		 * combined model and prevents a stale software active bit if the guest
+		 * still takes the explicit deactivate path.
+		 */
+		if (read) {
+			value = 0UL;
+		} else {
+			vgicv3_deactivate_irq_locked(vcpu, (uint32_t)(*reg & ICH_LR_VINTID_MASK));
+		}
+		break;
+	case ARM64_VGIC_SYSREG_ICC_RPR_EL1:
+		/*
+		 * RPR is observational state. Returning the idle priority is sufficient
+		 * for guests that probe it while virtual IRQ acknowledgement/deactivation
+		 * remains in hardware through IAR/EOIR.
+		 */
+		if (read) {
+			value = GIC_PRIORITY_LOWEST;
+		}
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	if (ret == 0) {
+		if (read) {
+			*reg = value;
+			access_value = value;
+		}
+		/*
+		 * Record after emulation so reads capture the returned value and writes
+		 * can be matched against the vGIC state produced by the access.
+		 */
+		last->sysreg = sysreg;
+		last->value = access_value;
+		last->status = ret;
+		last->read = read;
+		last->tsc = cpu_ticks();
+		if (control_changed && vgicv3_vcpu_is_loaded(vcpu)) {
+			vgicv3_write_cpuif_control(ctx);
+		}
+		arm64_vgicv3_flush_current_vcpu(vcpu);
+	}
+	spinlock_irqrestore_release(&vgic->lock, flags);
+
+	return ret;
 }
 
 void arm64_vgicv3_reset_vcpu(struct acrn_vcpu *vcpu)
@@ -488,18 +947,19 @@ void arm64_vgicv3_load_vcpu(struct acrn_vcpu *vcpu)
 	 * virtual interrupts are observable as soon as the guest resumes.
 	 */
 	write_icc_sre_el1(ctx->sre | ICC_SRE_SRE);
-	write_ich_vmcr_el2(ctx->vmcr);
-	write_ich_ap0r0_el2(ctx->ap0r0);
-	write_ich_ap1r0_el2(ctx->ap1r0);
-	vgicv3_write_lrs(ctx);
-	write_ich_hcr_el2(ctx->hcr | ICH_HCR_EN);
+	vgicv3_write_cpuif(ctx);
 }
 
 void arm64_vgicv3_save_vcpu(struct acrn_vcpu *vcpu)
 {
 	struct arm64_vgicv3_vcpu_ctx *ctx = &vcpu->arch.vgic;
 
-	ctx->hcr = read_ich_hcr_el2();
+	/*
+	 * EOIcount is consumed from the live CPU interface during sync. Saving it
+	 * into the vCPU context would make later loads replay an old completion
+	 * count as if it were a persistent HCR control bit.
+	 */
+	ctx->hcr = read_ich_hcr_el2() & ~ICH_HCR_EOICOUNT_MASK;
 	ctx->vmcr = read_ich_vmcr_el2();
 	ctx->ap0r0 = read_ich_ap0r0_el2();
 	ctx->ap1r0 = read_ich_ap1r0_el2();
@@ -510,10 +970,80 @@ void arm64_vgicv3_save_vcpu(struct acrn_vcpu *vcpu)
 	write_ich_hcr_el2(0UL);
 }
 
+static bool vgicv3_active_priority_empty(void)
+{
+	/*
+	 * The virtual AP registers track guest active priority state. If both
+	 * groups are empty, EL1 has returned from the interrupt handler far enough
+	 * that a remaining Active LR is stale state rather than a handler still in
+	 * progress.
+	 */
+	return (read_ich_ap0r0_el2() == 0UL) && (read_ich_ap1r0_el2() == 0UL);
+}
+
+static bool vgicv3_complete_timer_lr(struct acrn_vcpu *vcpu,
+	struct arm64_vgic_irq *desc, uint32_t lr_idx, bool *removed)
+{
+	if (removed != NULL) {
+		*removed = false;
+	}
+	if (!vgicv3_active_priority_empty()) {
+		return false;
+	}
+
+	/*
+	 * CNTV is the level source for the guest timer. Once AP state is empty the
+	 * consumed LR no longer owns redelivery; remove it and let the host PPI
+	 * recreate any still-asserted deadline.
+	 */
+	(void)vgic_sample_current_vtimer(vcpu);
+	desc->active = false;
+	vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, false);
+	remove_lr(vcpu, lr_idx);
+	if (removed != NULL) {
+		*removed = true;
+	}
+	vgic_timer_set_host_mask(vcpu, false);
+
+	return true;
+}
+
+static bool vgicv3_drop_timer_pending_lr(struct acrn_vcpu *vcpu,
+	const struct arm64_vgic_irq *desc, uint32_t lr_idx, uint32_t state)
+{
+	bool pending_only = ((state & ICH_LR_STATE_PENDING) != 0U) &&
+		((state & ICH_LR_STATE_ACTIVE) == 0U);
+
+	/*
+	 * If WFI observes a pending-only timer LR after the software queue and
+	 * active state are both empty, the LR is stale cached delivery state. Keep
+	 * the model single-sourced by CNTV: drop the LR and re-enable the host PPI
+	 * so an expired deadline is injected through the normal timer path.
+	 */
+	if (pending_only && !desc->pending && !desc->active && vgicv3_active_priority_empty() &&
+		vcpu->arch.gctx.cntv_el2_masked) {
+		(void)vgic_sample_current_vtimer(vcpu);
+		remove_lr(vcpu, lr_idx);
+		vgic_timer_set_host_mask(vcpu, false);
+		return true;
+	}
+
+	return false;
+}
+
 static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 {
 	struct arm64_vgicv3_vcpu_ctx *ctx = &vcpu->arch.vgic;
+	uint64_t old_lrs[ARM64_VGIC_MAX_LRS];
+	uint8_t old_used_lrs;
+	uint64_t eoi_lrs = 0UL;
 	uint32_t idx = 0U;
+	bool loaded;
+
+	if (!is_current && vgicv3_vcpu_is_running_remote(vcpu)) {
+		return;
+	}
+	loaded = is_current || vgicv3_vcpu_is_loaded(vcpu);
 
 	/*
 	 * Synchronization is the authoritative readback point from hardware LRs
@@ -521,8 +1051,60 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 	 * IRQ state and from maintenance IRQs when hardware reports LR pressure or
 	 * completion.
 	 */
+	old_used_lrs = ctx->used_lrs;
+	(void)memcpy(old_lrs, ctx->lr, sizeof(old_lrs));
 	vgicv3_read_loaded_lrs(vcpu, is_current);
+	if (loaded) {
+		uint64_t live_hcr = read_ich_hcr_el2();
 
+		eoi_lrs = read_ich_eisr_el2();
+		vgicv3_record_cpuif_snapshot(vcpu, &vcpu->arch.debug.last_vgic_sync,
+			ARM64_VCPU_DEBUG_VGIC_SYNC);
+		if ((live_hcr & ICH_HCR_EOICOUNT_MASK) != 0UL) {
+			/*
+			 * EOIcount reports guest EOIs that did not surface through EISR.
+			 * Consume the count after recording it so later HCR writes do not
+			 * keep rediscovering the same completed interrupt.
+			 */
+			ctx->hcr = live_hcr & ~ICH_HCR_EOICOUNT_MASK;
+			write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
+		} else {
+			ctx->hcr &= ~ICH_HCR_EOICOUNT_MASK;
+		}
+	}
+	if (((ctx->vmcr & ICH_VMCR_EOIM) == 0UL) && (eoi_lrs != 0UL)) {
+		vgicv3_complete_eoi_lrs(vcpu, eoi_lrs, old_lrs, old_used_lrs);
+	}
+
+	for (idx = 0U; idx < old_used_lrs; idx++) {
+		uint64_t old_lr = old_lrs[idx];
+		uint32_t virq;
+		struct arm64_vgic_irq *desc;
+
+		if (lr_state(old_lr) == ICH_LR_STATE_INVALID) {
+			continue;
+		}
+
+		virq = lr_vintid(old_lr);
+		if (find_lr_for_virq(vcpu, virq) >= 0) {
+			continue;
+		}
+
+		desc = vgic_irq_desc(vcpu, virq);
+		if (desc != NULL) {
+			bool queued_level = desc->level && desc->pending;
+
+			if (!queued_level) {
+				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, false);
+			}
+			desc->active = false;
+			if ((virq == ARM64_GIC_PPI_VIRTUAL_TIMER) && !queued_level) {
+				vgic_timer_set_host_mask(vcpu, false);
+			}
+		}
+	}
+
+	idx = 0U;
 	while (idx < ctx->used_lrs) {
 		uint64_t lr = ctx->lr[idx];
 		uint32_t virq = lr_vintid(lr);
@@ -530,9 +1112,39 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 		struct arm64_vgic_irq *desc = vgic_irq_desc(vcpu, virq);
 
 		if (desc != NULL) {
-			vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc,
-				((state & ICH_LR_STATE_PENDING) != 0U));
-			desc->active = ((state & ICH_LR_STATE_ACTIVE) != 0U);
+			bool lr_pending = ((state & ICH_LR_STATE_PENDING) != 0U);
+			bool lr_active = ((state & ICH_LR_STATE_ACTIVE) != 0U);
+			bool removed = false;
+
+			if (!desc->level && lr_active && !lr_pending) {
+				/*
+				 * SGIs are edge-triggered and have no backing level to sample.
+				 * Once readback shows an active-only SGI, the guest has already
+				 * accepted the edge; clear it so later IPIs are not blocked by
+				 * stale active state.
+				 */
+				desc->active = false;
+				remove_lr(vcpu, idx);
+				continue;
+			}
+			if (loaded && desc->level && (virq == vcpu->arch.gctx.timer_virq) &&
+				lr_active && vgicv3_complete_timer_lr(vcpu, desc, idx, &removed)) {
+				if (!removed) {
+					idx++;
+				}
+				continue;
+			}
+
+			/*
+			 * LR pending is already resident in the virtual CPU interface.
+			 * Mirroring it back into the software pending bitmap makes flush
+			 * continuously rebuild the same active+pending LR, so keep the
+			 * bitmap for IRQs that still need an LR slot.
+			 */
+			if (lr_pending || !lr_active || !desc->level || !desc->pending) {
+				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, false);
+			}
+			desc->active = lr_active;
 		}
 
 		if ((state == ICH_LR_STATE_INVALID) || (state == 0U)) {
@@ -557,11 +1169,119 @@ void arm64_vgicv3_sync_current_vcpu(struct acrn_vcpu *vcpu)
 	}
 }
 
+void arm64_vgicv3_complete_wfi_irqs(struct acrn_vcpu *vcpu)
+{
+	struct arm64_vgicv3 *vgic;
+	struct arm64_vgicv3_vcpu_ctx *ctx;
+	uint64_t flags;
+	uint32_t idx = 0U;
+
+	if ((vcpu == NULL) || (vcpu->vm == NULL) || !vcpu->vm->arch_vm.vgic.initialized) {
+		return;
+	}
+
+	vgic = &vcpu->vm->arch_vm.vgic;
+	ctx = &vcpu->arch.vgic;
+	spinlock_irqsave_obtain(&vgic->lock, &flags);
+	vgicv3_sync_vcpu(vcpu, true);
+	while (idx < ctx->used_lrs) {
+		uint64_t lr = ctx->lr[idx];
+		uint32_t state = lr_state(lr);
+		uint32_t virq = lr_vintid(lr);
+		struct arm64_vgic_irq *desc = vgic_irq_desc(vcpu, virq);
+		bool removed = false;
+
+		if ((desc != NULL) && !desc->level && (state == ICH_LR_STATE_ACTIVE)) {
+			/*
+			 * SGIs are edge-triggered software IRQs. If Linux reaches WFI with
+			 * an SGI LR still active-only, the interrupt handler has returned
+			 * far enough that keeping the LR active only blocks later IPIs; a
+			 * pending bit would have kept it deliverable instead.
+			 */
+			desc->active = false;
+			remove_lr(vcpu, idx);
+			continue;
+		}
+		if ((desc != NULL) && desc->level && (virq == vcpu->arch.gctx.timer_virq) &&
+			((state & ICH_LR_STATE_ACTIVE) != 0U) &&
+			vgicv3_complete_timer_lr(vcpu, desc, idx, &removed)) {
+			if (!removed) {
+				idx++;
+			}
+			continue;
+		}
+		if ((desc != NULL) && desc->level && (virq == vcpu->arch.gctx.timer_virq) &&
+			vgicv3_drop_timer_pending_lr(vcpu, desc, idx, state)) {
+			continue;
+		}
+		idx++;
+	}
+	vgicv3_flush_vcpu(vcpu, true);
+	spinlock_irqrestore_release(&vgic->lock, flags);
+}
+
+bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu)
+{
+	struct arm64_vgicv3 *vgic;
+	struct arm64_vgicv3_vcpu_ctx *ctx;
+	uint64_t flags;
+	uint32_t idx;
+	uint32_t word;
+	bool pending = false;
+
+	if ((vcpu == NULL) || (vcpu->vm == NULL) || !vcpu->vm->arch_vm.vgic.initialized) {
+		return false;
+	}
+
+	vgic = &vcpu->vm->arch_vm.vgic;
+	ctx = &vcpu->arch.vgic;
+	spinlock_irqsave_obtain(&vgic->lock, &flags);
+	/*
+	 * WFI must not sleep when a virtual interrupt is already visible through
+	 * a list register. Active+Pending carries a redelivery after guest EOI, so
+	 * treat any LR pending bit as enough work to re-enter EL1 immediately.
+	 */
+	for (idx = 0U; idx < ctx->used_lrs; idx++) {
+		if ((lr_state(ctx->lr[idx]) & ICH_LR_STATE_PENDING) != 0U) {
+			pending = true;
+			break;
+		}
+	}
+
+	/*
+	 * Software pending bits are not enough by themselves; the distributor,
+	 * virtual CPU interface, and interrupt enable state must all allow
+	 * delivery before WFI should behave as if an interrupt can wake it now.
+	 */
+	for (word = 0U; !pending && (word < ARM64_VGIC_WORDS); word++) {
+		uint32_t bits = vgic->pending_bitmap[vcpu->vcpu_id][word];
+
+		while (bits != 0U) {
+			uint32_t bit = (uint32_t)ffs64((uint64_t)bits);
+			uint32_t virq = (word * 32U) + bit;
+			struct arm64_vgic_irq *desc = &vgic->irq[vcpu->vcpu_id][virq];
+
+			bits &= ~BIT32(bit);
+			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc)) {
+				pending = true;
+				break;
+			}
+		}
+	}
+	spinlock_irqrestore_release(&vgic->lock, flags);
+
+	return pending;
+}
+
 static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 {
 	struct arm64_vgicv3 *vgic = &vcpu->vm->arch_vm.vgic;
 	struct arm64_vgicv3_vcpu_ctx *ctx = &vcpu->arch.vgic;
 	uint32_t word;
+
+	if (!is_current && vgicv3_vcpu_is_running_remote(vcpu)) {
+		return;
+	}
 
 	/*
 	 * Flush chooses pending, enabled virtual IRQs and materializes them into
@@ -586,13 +1306,21 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
 				continue;
 			}
-			if (!desc->enabled) {
+			if (!vgic_irq_deliverable(vgic, vcpu, desc)) {
 				continue;
 			}
 
 			lr_idx = find_lr_for_virq(vcpu, virq);
 			if (lr_idx >= 0) {
+				/*
+				 * A level interrupt can assert again while the guest still
+				 * owns the active LR instance. Reflect that as Active+Pending
+				 * in the LR; leaving pending only in software makes the vCPU
+				 * resume with an active-only interrupt that cannot be
+				 * redelivered after the next EOI.
+			 */
 				ctx->lr[lr_idx] = make_lr(desc);
+				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
 				continue;
 			}
 
@@ -604,7 +1332,6 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 			ctx->lr[ctx->used_lrs] = make_lr(desc);
 			ctx->used_lrs++;
 			vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
-			desc->active = desc->level;
 		}
 
 		if ((ctx->hcr & ICH_HCR_UIE) != 0UL) {
@@ -644,11 +1371,59 @@ static void vgicv3_flush_vm(struct acrn_vcpu *current_vcpu)
 	}
 }
 
+static int32_t vgic_inject_locked(struct arm64_vgicv3 *vgic, struct acrn_vcpu *target_vcpu,
+	uint32_t virq, bool level)
+{
+	struct arm64_vgic_irq *desc = vgic_irq_desc(target_vcpu, virq);
+	int32_t ret = -EINVAL;
+
+	if (desc != NULL) {
+		/*
+		 * Always sync before injection so a guest-completed LR does not
+		 * get overwritten by stale software state. The event request wakes
+		 * a blocked vCPU and makes the scheduler re-enter pre-guest
+		 * request processing.
+		 */
+		arm64_vgicv3_sync_vcpu(target_vcpu);
+		desc->level = level;
+		vgic_set_pending(vgic, target_vcpu->vcpu_id, desc, true);
+		if (vgicv3_vcpu_is_loaded(target_vcpu)) {
+			arm64_vgicv3_flush_vcpu(target_vcpu);
+		}
+		ret = 0;
+	}
+
+	return ret;
+}
+
+static int32_t arm64_vgicv3_inject_irq_to(struct acrn_vcpu *source_vcpu,
+	struct acrn_vcpu *target_vcpu, uint32_t virq, bool level)
+{
+	struct arm64_vgicv3 *vgic;
+	uint64_t flags;
+	int32_t ret = -EINVAL;
+
+	if ((target_vcpu != NULL) && (target_vcpu->vm != NULL) && (virq < ARM64_VGIC_IRQ_NUM)) {
+		vgic = &target_vcpu->vm->arch_vm.vgic;
+		if (vgic->initialized) {
+			spinlock_irqsave_obtain(&vgic->lock, &flags);
+			ret = vgic_inject_locked(vgic, target_vcpu, virq, level);
+			spinlock_irqrestore_release(&vgic->lock, flags);
+			vgic_record_irq_injection(source_vcpu, target_vcpu, virq, level, ret);
+			if (ret == 0) {
+				vcpu_make_request(target_vcpu, ARM64_VCPU_REQUEST_EVENT);
+				signal_event(&target_vcpu->events[ARM64_VCPU_EVENT_VIRTUAL_INTERRUPT]);
+			}
+		}
+	}
+
+	return ret;
+}
+
 int32_t arm64_vgicv3_inject_irq(struct acrn_vcpu *vcpu, uint32_t virq, bool level)
 {
 	struct arm64_vgicv3 *vgic;
 	struct acrn_vcpu *target_vcpu;
-	struct arm64_vgic_irq *desc;
 	uint64_t flags;
 	int32_t ret = -EINVAL;
 
@@ -657,26 +1432,9 @@ int32_t arm64_vgicv3_inject_irq(struct acrn_vcpu *vcpu, uint32_t virq, bool leve
 		if (vgic->initialized) {
 			spinlock_irqsave_obtain(&vgic->lock, &flags);
 			target_vcpu = vgic_irq_target_vcpu(vcpu, vgic, virq);
-			desc = vgic_irq_desc(target_vcpu, virq);
-			if (desc != NULL) {
-				/*
-				 * Always sync before injection so a guest-completed LR does not
-				 * get overwritten by stale software state. The event request wakes
-				 * a blocked vCPU and makes the scheduler re-enter pre-guest
-				 * request processing.
-				 */
-				arm64_vgicv3_sync_vcpu(target_vcpu);
-				desc->level = level;
-				if (!desc->enabled) {
-					desc->enabled = true;
-				}
-				vgic_set_pending(vgic, target_vcpu->vcpu_id, desc, true);
-				if (vgicv3_vcpu_is_loaded(target_vcpu)) {
-					arm64_vgicv3_flush_vcpu(target_vcpu);
-				}
-				ret = 0;
-			}
+			ret = vgic_inject_locked(vgic, target_vcpu, virq, level);
 			spinlock_irqrestore_release(&vgic->lock, flags);
+			vgic_record_irq_injection(vcpu, target_vcpu, virq, level, ret);
 			if (ret == 0) {
 				vcpu_make_request(target_vcpu, ARM64_VCPU_REQUEST_EVENT);
 				signal_event(&target_vcpu->events[ARM64_VCPU_EVENT_VIRTUAL_INTERRUPT]);
@@ -717,6 +1475,35 @@ int32_t arm64_vgicv3_clear_irq(struct acrn_vcpu *vcpu, uint32_t virq)
 	return ret;
 }
 
+int32_t arm64_vgicv3_deassert_irq(struct acrn_vcpu *vcpu, uint32_t virq)
+{
+	struct arm64_vgic_irq *desc = vgic_irq_desc(vcpu, virq);
+	struct arm64_vgicv3 *vgic;
+	uint64_t flags;
+	int32_t ret = -EINVAL;
+
+	if (desc != NULL) {
+		vgic = &vcpu->vm->arch_vm.vgic;
+		spinlock_irqsave_obtain(&vgic->lock, &flags);
+		arm64_vgicv3_sync_vcpu(vcpu);
+		/*
+		 * Device level deassertion lowers the input line; it is not a guest
+		 * deactivate command. Preserve Active LRs until the guest EOI path
+		 * completes them, but remove any pending redelivery for the line.
+		 */
+		vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
+		vgic_update_irq_lr(vcpu, desc);
+		if (vgicv3_vcpu_is_loaded(vcpu)) {
+			arm64_vgicv3_flush_vcpu(vcpu);
+		}
+		spinlock_irqrestore_release(&vgic->lock, flags);
+		vcpu_make_request(vcpu, ARM64_VCPU_REQUEST_EVENT);
+		ret = 0;
+	}
+
+	return ret;
+}
+
 static bool sgi1r_targets_vcpu(uint64_t value, uint16_t source_vcpu_id,
 	uint16_t target_vcpu_id)
 {
@@ -737,11 +1524,28 @@ static bool sgi1r_targets_vcpu(uint64_t value, uint16_t source_vcpu_id,
 	return targeted;
 }
 
+static void vgic_record_sgi(struct acrn_vcpu *source_vcpu, uint64_t value,
+	uint32_t intid, uint16_t target_mask, uint16_t delivered_mask, int32_t status)
+{
+	struct arm64_vcpu_last_sgi *last = &source_vcpu->arch.debug.last_sgi;
+
+	last->value = value;
+	last->intid = intid;
+	last->status = status;
+	last->source_vcpu_id = source_vcpu->vcpu_id;
+	last->target_mask = target_mask;
+	last->delivered_mask = delivered_mask;
+	last->tsc = cpu_ticks();
+}
+
 int32_t arm64_vgicv3_handle_sgi1r(struct acrn_vcpu *vcpu, uint64_t value)
 {
 	uint32_t intid = (uint32_t)((value >> ICC_SGI1R_INTID_SHIFT) & ICC_SGI1R_INTID_MASK);
 	uint16_t idx;
+	uint16_t target_mask = 0U;
+	uint16_t delivered_mask = 0U;
 	struct acrn_vcpu *target_vcpu;
+	int32_t last_status = 0;
 
 	/*
 	 * Guest SGI sends are trapped from ICC_SGI1R_EL1 and translated into
@@ -750,12 +1554,20 @@ int32_t arm64_vgicv3_handle_sgi1r(struct acrn_vcpu *vcpu, uint64_t value)
 	 */
 	foreach_vcpu(idx, vcpu->vm, target_vcpu) {
 		if (sgi1r_targets_vcpu(value, vcpu->vcpu_id, target_vcpu->vcpu_id)) {
-			(void)arm64_vgicv3_inject_irq(target_vcpu, intid, false);
+			target_mask |= BIT32(target_vcpu->vcpu_id);
+		}
+		if ((target_vcpu->state != VCPU_OFFLINE) &&
+			((target_mask & BIT32(target_vcpu->vcpu_id)) != 0U)) {
+			last_status = arm64_vgicv3_inject_irq_to(vcpu, target_vcpu, intid, false);
+			if (last_status == 0) {
+				delivered_mask |= BIT32(target_vcpu->vcpu_id);
+			}
 			if (target_vcpu->state == VCPU_RUNNING) {
 				kick_vcpu(target_vcpu);
 			}
 		}
 	}
+	vgic_record_sgi(vcpu, value, intid, target_mask, delivered_mask, last_status);
 
 	return 0;
 }
@@ -774,16 +1586,87 @@ void arm64_vgicv3_maintenance_irq_handler(__unused uint32_t irq, __unused void *
 		 * from software pending state while still on the running pCPU.
 		 */
 		spinlock_irqsave_obtain(&vgic->lock, &flags);
+		vgicv3_record_cpuif_snapshot(vcpu, &vcpu->arch.debug.last_vgic_maintenance,
+			ARM64_VCPU_DEBUG_VGIC_MAINTENANCE);
 		arm64_vgicv3_sync_current_vcpu(vcpu);
 		arm64_vgicv3_flush_current_vcpu(vcpu);
 		spinlock_irqrestore_release(&vgic->lock, flags);
 	}
 }
 
+void arm64_vgicv3_update_current_vtimer(struct acrn_vcpu *vcpu)
+{
+	struct arm64_vgicv3 *vgic;
+	struct arm64_vgic_irq *desc;
+	uint64_t flags;
+	uint32_t virq;
+	bool level;
+
+	if ((vcpu == NULL) || (vcpu->vm == NULL) || (get_running_vcpu(get_pcpu_id()) != vcpu)) {
+		return;
+	}
+
+	virq = vcpu->arch.gctx.timer_virq;
+	if (virq == 0U) {
+		virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+		vcpu->arch.gctx.timer_virq = virq;
+	}
+	level = vgic_sample_current_vtimer(vcpu);
+
+	vgic = &vcpu->vm->arch_vm.vgic;
+	spinlock_irqsave_obtain(&vgic->lock, &flags);
+	/*
+	 * CNTV can expire while the guest has already acknowledged a timer LR.
+	 * Sync before changing the timer pending bit so the software descriptor
+	 * sees the hardware Active state and flush preserves Active+Pending
+	 * instead of overwriting it with a stale Pending-only LR.
+	 */
+	vgicv3_sync_vcpu(vcpu, true);
+	desc = vgic_irq_desc(vcpu, virq);
+	if (desc != NULL) {
+		desc->level = true;
+		if (level) {
+			vgicv3_disarm_vtimer_backup(vcpu);
+			vgic_set_pending(vgic, vcpu->vcpu_id, desc, true);
+		} else {
+			/*
+			 * Pending represents the sampled timer line. Clear it even
+			 * while an LR is still active so EOI synchronization does not
+			 * requeue a stale timer after the guest has advanced CNTV_CVAL.
+			 */
+			vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
+			if (!desc->active) {
+				vgic_timer_set_host_mask(vcpu, false);
+			}
+			vgicv3_arm_vtimer_backup(vcpu);
+		}
+		arm64_vgicv3_flush_current_vcpu(vcpu);
+	}
+	spinlock_irqrestore_release(&vgic->lock, flags);
+}
+
+static int32_t vgicv3_inject_current_timer(struct acrn_vcpu *vcpu, uint32_t virq,
+	uint32_t guest_ctl, uint64_t guest_cval)
+{
+	int32_t ret = arm64_vgicv3_inject_irq(vcpu, virq, true);
+
+	vgicv3_disarm_vtimer_backup(vcpu);
+	vcpu->arch.debug.last_timer.cval = guest_cval;
+	vcpu->arch.debug.last_timer.ctl = (guest_ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK)) |
+		CNTV_CTL_ISTATUS;
+	vcpu->arch.debug.last_timer.virq = virq;
+	vcpu->arch.debug.last_timer.sysreg = 0U;
+	vcpu->arch.debug.last_timer.status = ret;
+	vcpu->arch.debug.last_timer.write = false;
+	vcpu->arch.debug.last_timer.injected = true;
+	vcpu->arch.debug.last_timer.tsc = cpu_ticks();
+
+	return ret;
+}
+
 void arm64_vgicv3_virtual_timer_irq_handler(__unused uint32_t irq, __unused void *data)
 {
 	struct acrn_vcpu *vcpu = get_running_vcpu(get_pcpu_id());
-	uint32_t ctl;
 
 	/*
 	 * CNTV is the hardware timer context loaded for the current vCPU. Its PPI
@@ -794,20 +1677,90 @@ void arm64_vgicv3_virtual_timer_irq_handler(__unused uint32_t irq, __unused void
 	 */
 	if (vcpu != NULL) {
 		uint32_t virq = vcpu->arch.gctx.timer_virq;
+		uint32_t guest_ctl;
+		uint64_t guest_cval;
+
+		/*
+		 * Some CPU models allow EL1 CNTV access without trapping. When the
+		 * physical virtual-timer PPI arrives, the hardware CNTV registers are
+		 * therefore the authoritative guest timer state for this loaded vCPU.
+		 */
+		if (virq == 0U) {
+			vcpu->arch.gctx.timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+			virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+		}
+		if (virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+			vcpu->arch.gctx.cntp_cval_el0 = read_cntv_cval_el0();
+			vcpu->arch.gctx.cntp_ctl_el0 = vgic_live_vtimer_ctl();
+		} else {
+			vcpu->arch.gctx.cntv_cval_el0 = read_cntv_cval_el0();
+			vcpu->arch.gctx.cntv_ctl_el0 = vgic_live_vtimer_ctl();
+		}
 
 		/*
 		 * The hardware virtual timer is level-triggered. Once the deadline
-		 * expires, the PPI remains asserted until EL1 programs a new deadline
-		 * or masks/disables the timer. Mask it while injecting the virtual IRQ
-		 * so EL2 does not loop on the same expired deadline before the guest
-		 * timer handler has a chance to run.
+		 * expires, the PPI remains asserted until the guest programs a new
+		 * deadline or masks/disables the timer. Disable the host's local PPI
+		 * while the virtual IRQ is in flight, but leave CNTV_CTL as guest
+		 * state so the handler observes the same control bits it programmed.
 		 */
-		ctl = read_cntv_ctl_el0();
-		write_cntv_ctl_el0((ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK)) | CNTV_CTL_IMASK);
-		if (virq == 0U) {
-			virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+		vgic_timer_set_host_mask(vcpu, true);
+		if (virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+			guest_ctl = vcpu->arch.gctx.cntp_ctl_el0;
+			guest_cval = vcpu->arch.gctx.cntp_cval_el0;
+		} else {
+			guest_ctl = vcpu->arch.gctx.cntv_ctl_el0;
+			guest_cval = vcpu->arch.gctx.cntv_cval_el0;
 		}
-		(void)arm64_vgicv3_inject_irq(vcpu, virq, true);
+		(void)vgicv3_inject_current_timer(vcpu, virq, guest_ctl, guest_cval);
+	}
+}
+
+void arm64_vgicv3_poll_current_vtimer(struct acrn_vcpu *vcpu)
+{
+	uint32_t ctl;
+	uint64_t cval;
+	uint64_t now;
+
+	if ((vcpu == NULL) || (get_running_vcpu(get_pcpu_id()) != vcpu)) {
+		return;
+	}
+
+	/*
+	 * Normal delivery follows the physical virtual-timer PPI handler above.
+	 * QEMU can leave the Linux BSP with CNTV enabled and an expired deadline
+	 * while PPI27 is not asserted. On guest exits, check only the loaded vCPU
+	 * and translate that expired CNTV state into the same guest PPI.
+	 */
+	ctl = vgic_live_vtimer_ctl();
+	cval = read_cntv_cval_el0();
+
+	if (((ctl & CNTV_CTL_ENABLE) == 0U) || ((ctl & CNTV_CTL_IMASK) != 0U)) {
+		return;
+	}
+
+	now = read_cntvct_el0();
+	if ((int64_t)(cval - now) > 0L) {
+		return;
+	}
+
+	if (vcpu->arch.gctx.timer_virq == 0U) {
+		vcpu->arch.gctx.timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+	}
+	if (vcpu->arch.gctx.timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+		vcpu->arch.gctx.cntp_cval_el0 = cval;
+		vcpu->arch.gctx.cntp_ctl_el0 = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+	} else {
+		vcpu->arch.gctx.cntv_cval_el0 = cval;
+		vcpu->arch.gctx.cntv_ctl_el0 = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+	}
+	vgic_timer_set_host_mask(vcpu, true);
+	if (vcpu->arch.gctx.timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+		(void)vgicv3_inject_current_timer(vcpu, ARM64_GIC_PPI_PHYSICAL_TIMER,
+			vcpu->arch.gctx.cntp_ctl_el0, cval);
+	} else {
+		(void)vgicv3_inject_current_timer(vcpu, ARM64_GIC_PPI_VIRTUAL_TIMER,
+			vcpu->arch.gctx.cntv_ctl_el0, cval);
 	}
 }
 
@@ -1422,6 +2375,7 @@ static bool vgicd_mmio_write(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 		switch (offset) {
 		case VGICD_CTLR:
 			vgic->gicd_ctlr = value & ~VGICD_CTLR_RWP;
+			flush = true;
 			break;
 		case VGICD_ITARGETSR ... (VGICD_ICFGR - 1U):
 			vgic_write_irq_target(vcpu, offset - VGICD_ITARGETSR,
@@ -1646,7 +2600,7 @@ static void vgicr_mmio_read(struct arm64_vgicv3 *vgic,
 		mmio->value = typer >> 32U;
 		break;
 	case VGICR_WAKER:
-		mmio->value = vgic->gicr_waker[frame->pcpu_id];
+		mmio->value = vgic->gicr_waker[frame->pcpu_id] & VGICR_WAKER_READ_MASK;
 		break;
 	case VGICR_PIDR2:
 		mmio->value = GIC_PIDR2_ARCH_GICV3;
@@ -1833,6 +2787,7 @@ int32_t arm64_vgicv3_mmio_handler(struct io_request *io_req, void *handler_priva
 		spinlock_irqsave_obtain(&vgic->lock, &flags);
 		arm64_vgicv3_sync_current_vcpu(vcpu);
 		ret = vgicv3_mmio_access(vcpu, vgic, mmio);
+		arm64_vgicv3_flush_current_vcpu(vcpu);
 		spinlock_irqrestore_release(&vgic->lock, flags);
 	}
 

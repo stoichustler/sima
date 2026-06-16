@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Intel Corporation.
+ * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -46,7 +46,8 @@
 #define CPU_REGS_OFFSET_HPFAR		0x120
 #define CPU_REGS_OFFSET_HOST_TPIDR	0x128
 #define CPU_REGS_OFFSET_EXC_SP		0x130
-#define CPU_REGS_OFFSET_LAST		0x138
+#define CPU_REGS_OFFSET_RESERVED	0x138
+#define CPU_REGS_OFFSET_LAST		0x140
 
 #define STACK_FRAME_OFFSET_X19		0x0
 #define STACK_FRAME_OFFSET_X20		0x8

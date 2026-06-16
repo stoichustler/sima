@@ -1,4 +1,4 @@
 interface:
-  display_name: "CLAN Hypervisor Dev"
-  short_description: "Develop and debug the CLAN ARM64 hypervisor."
-  default_prompt: "Use this skill when working on CLAN hypervisor development tasks in this repository."
+  display_name: "SIMA Hypervisor Dev"
+  short_description: "Develop and debug the SIMA ARM64 hypervisor."
+  default_prompt: "Use this skill when working on SIMA hypervisor development tasks in this repository."
