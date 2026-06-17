@@ -13,17 +13,17 @@ SRCS += $(wildcard $(FILE_PATH)/$(ARCH)/*.c)
 OBJS += $(patsubst %.c,$(HV_OBJDIR)/%.o,$(SRCS))
 
 .PHONY: default
-default: $(LIB_DEBUG)
+default: $(LIB_BSP)
 
 ifneq ($(CONFIG_RELEASE),y)
-$(LIB_DEBUG): $(OBJS)
+$(LIB_BSP): $(OBJS)
 	@echo "ar        $(notdir $@)"
-	@$(AR) $(ARFLAGS) $(LIB_DEBUG) $(OBJS)
+	@$(AR) $(ARFLAGS) $(LIB_BSP) $(OBJS)
 endif
 
 .PHONY: clean
 clean:
-	rm -f $(OBJS)
+	@rm -f $(OBJS)
 
 -include $(OBJS:.o=.d)
 

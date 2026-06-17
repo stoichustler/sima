@@ -8,7 +8,7 @@
 	.align 12
 	.globl rk356x_lk_image_start
 rk356x_lk_image_start:
-	.incbin "sdk/images/lk.bin"
+	.incbin "sdk/image/lk.bin"
 	.globl rk356x_lk_image_end
 rk356x_lk_image_end:
 	.globl rk356x_lk_image_size
@@ -17,7 +17,7 @@ rk356x_lk_image_end:
 	.align 12
 	.globl rk356x_zephyr_image_start
 rk356x_zephyr_image_start:
-	.incbin "sdk/images/zephyr.bin"
+	.incbin "sdk/image/zephyr.bin"
 	.globl rk356x_zephyr_image_end
 rk356x_zephyr_image_end:
 	.globl rk356x_zephyr_image_size

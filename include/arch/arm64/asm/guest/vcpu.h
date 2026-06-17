@@ -351,6 +351,8 @@ struct acrn_vcpu_arch {
 	uint64_t irqs_pending_mask;
 	struct hv_timer vtimer_backup;
 	bool vtimer_backup_initialized;
+	bool vtimer_wfi_rescue;
+	bool vtimer_lr_rescue;
 } __aligned(PAGE_SIZE);
 
 struct acrn_vcpu;

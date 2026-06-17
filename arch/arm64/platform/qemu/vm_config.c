@@ -57,7 +57,7 @@ static struct vm_hpa_regions linux_memory_regions[] = {
 struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 	[0] = {
 		CONFIG_SERVICE_VM,
-		.name = "zephyr",
+		.name = "Zephyr",
 		.cpu_affinity = AFFINITY_CPU(0) | AFFINITY_CPU(2) |
 			AFFINITY_CPU(3) | AFFINITY_CPU(4),
 		.guest_flags = GUEST_FLAG_STATIC_VM | GUEST_FLAG_NO_FW,
@@ -67,9 +67,9 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 			.host_regions = zephyr_memory_regions,
 		},
 		.os_config = {
-			.name = "zephyr",
+			.name = "Zephyr",
 			.kernel_type = KERNEL_RAWIMAGE,
-			.kernel_mod_tag = "zephyr",
+			.kernel_mod_tag = "Zephyr",
 			.kernel_load_addr = QEMU_ZEPHYR_RAM_START,
 			.kernel_entry_addr = QEMU_ZEPHYR_RAM_START,
 		},
@@ -89,7 +89,7 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 	},
 	[1] = {
 		CONFIG_PRE_STD_VM,
-		.name = "lk",
+		.name = "LK",
 		.cpu_affinity = AFFINITY_CPU(3) | AFFINITY_CPU(5) |
 			AFFINITY_CPU(6) | AFFINITY_CPU(7),
 		.guest_flags = GUEST_FLAG_STATIC_VM | GUEST_FLAG_NO_FW,
@@ -99,9 +99,9 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 			.host_regions = lk_memory_regions,
 		},
 		.os_config = {
-			.name = "lk",
+			.name = "LK",
 			.kernel_type = KERNEL_RAWIMAGE,
-			.kernel_mod_tag = "lk",
+			.kernel_mod_tag = "LK",
 			.kernel_load_addr = 0x40100000UL,
 			.kernel_entry_addr = 0x40100000UL,
 		},
@@ -121,7 +121,7 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 	},
 	[2] = {
 		CONFIG_PRE_STD_VM,
-		.name = "linux",
+		.name = "Linux",
 		.cpu_affinity = AFFINITY_CPU(1) | AFFINITY_CPU(4) |
 			AFFINITY_CPU(6) | AFFINITY_CPU(7),
 		.guest_flags = GUEST_FLAG_STATIC_VM,
@@ -131,10 +131,10 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 			.host_regions = linux_memory_regions,
 		},
 		.os_config = {
-			.name = "linux",
+			.name = "Linux",
 			.kernel_type = KERNEL_RAWIMAGE,
-			.kernel_mod_tag = "linux",
-			.ramdisk_mod_tag = "linux-initrd",
+			.kernel_mod_tag = "Linux",
+			.ramdisk_mod_tag = "Initrd",
 			.bootargs = "root=/dev/ram0 rw init=/linuxrc console=ttyAMA0 earlycon=pl011,0x09000000",
 			.kernel_load_addr = QEMU_LINUX_KERNEL_LOAD_ADDR,
 			.kernel_entry_addr = QEMU_LINUX_KERNEL_LOAD_ADDR,
@@ -142,7 +142,7 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 			.kernel_ramdisk_size = SIMA_LINUX_INITRD_SIZE,
 		},
 		.fdt_config = {
-			.fdt_mod_tag = "sima-linux-dtb",
+			.fdt_mod_tag = "Linux-dtb",
 		},
 		.arch = {
 			.guest_ram_start = QEMU_LINUX_RAM_START,
@@ -168,27 +168,27 @@ struct bare_boot_option bare_boot_options[] = {
 	{
 		.addr = (uint64_t)qemu_zephyr_image_start,
 		.size = (uint64_t)qemu_zephyr_image_size,
-		.tag = "zephyr",
+		.tag = "Zephyr",
 	},
 	{
 		.addr = (uint64_t)qemu_lk_image_start,
 		.size = (uint64_t)qemu_lk_image_size,
-		.tag = "lk",
+		.tag = "LK",
 	},
 	{
 		.addr = QEMU_LINUX_IMAGE_STAGE_ADDR,
 		.size = SIMA_LINUX_IMAGE_SIZE,
-		.tag = "linux",
+		.tag = "Linux",
 	},
 	{
 		.addr = QEMU_LINUX_INITRD_STAGE_ADDR,
 		.size = SIMA_LINUX_INITRD_SIZE,
-		.tag = "linux-initrd",
+		.tag = "Initrd",
 	},
 	{
 		.addr = (uint64_t)qemu_sima_linux_dtb_start,
 		.size = (uint64_t)qemu_sima_linux_dtb_size,
-		.tag = "sima-linux-dtb",
+		.tag = "Linux-dtb",
 	},
 };
 

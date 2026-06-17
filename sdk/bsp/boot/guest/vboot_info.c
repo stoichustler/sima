@@ -181,7 +181,7 @@ static int32_t init_vm_sw_load(struct acrn_vm *vm, const struct acrn_boot_info *
 	int32_t ret = -EINVAL;
 	bool fw_loaded = false;
 
-	dev_dbg(DBG_LEVEL_BOOT, "mod counts=%d\n", abi->mods_count);
+	/* dev_dbg(DBG_LEVEL_BOOT, "mod counts=%d\n", abi->mods_count); */
 
 	/* find kernel module first */
 	mod = get_mod_by_tag(abi, vm_config->os_config.kernel_mod_tag);
@@ -232,7 +232,7 @@ static int32_t init_vm_sw_load(struct acrn_vm *vm, const struct acrn_boot_info *
 				pr_err("failed to load acpi module or fdt for vm%d", vm->vm_id);
 			}
 		} else if ((vm_config->guest_flags & GUEST_FLAG_NO_FW) != 0UL) {
-			dev_dbg(DBG_LEVEL_BOOT, "vm%d boots without acpi/fdt", vm->vm_id);
+			dev_dbg(DBG_LEVEL_BOOT, "vm-%d boots without acpi/fdt", vm->vm_id);
 		}
 
 	} else {

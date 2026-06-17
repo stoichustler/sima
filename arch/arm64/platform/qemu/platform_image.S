@@ -8,7 +8,7 @@
 	.align 12
 	.globl qemu_lk_image_start
 qemu_lk_image_start:
-	.incbin "sdk/images/lk.bin"
+	.incbin "sdk/image/lk.bin"
 	.globl qemu_lk_image_end
 qemu_lk_image_end:
 	.globl qemu_lk_image_size
@@ -19,7 +19,7 @@ qemu_lk_image_end:
 	.align 12
 	.globl qemu_sima_linux_dtb_start
 qemu_sima_linux_dtb_start:
-	.incbin "sdk/images/linux/sima-linux.dtb"
+	.incbin "sdk/image/linux/sima-linux.dtb"
 	.globl qemu_sima_linux_dtb_end
 qemu_sima_linux_dtb_end:
 	.globl qemu_sima_linux_dtb_size
@@ -30,7 +30,7 @@ qemu_sima_linux_dtb_end:
 	.align 12
 	.globl qemu_zephyr_image_start
 qemu_zephyr_image_start:
-	.incbin "sdk/images/zephyr.bin"
+	.incbin "sdk/image/zephyr.bin"
 	.globl qemu_zephyr_image_end
 qemu_zephyr_image_end:
 	.globl qemu_zephyr_image_size

@@ -141,8 +141,6 @@ int32_t create_vcpu(struct acrn_vm *vm, uint16_t pcpu_id)
 	uint16_t vcpu_id;
 	int32_t i, ret;
 
-	pr_info("creating vcpu on pcpu%hu", pcpu_id);
-
 	/*
 	 * vcpu->vcpu_id = vm->hw.created_vcpus;
 	 * vm->hw.created_vcpus++;
@@ -168,7 +166,7 @@ int32_t create_vcpu(struct acrn_vm *vm, uint16_t pcpu_id)
 		 * needs revise.
 		 */
 
-		pr_info("create vm%d-vcpu%d, role: %s",
+		pr_info("create vm%d:vcpu%d, role: %s",
 				vcpu->vm->vm_id, vcpu->vcpu_id,
 				is_vcpu_bsp(vcpu) ? "primary" : "secondary");
 
@@ -225,7 +223,8 @@ void launch_vcpu(struct acrn_vcpu *vcpu)
 {
 	uint16_t pcpu_id = pcpuid_from_vcpu(vcpu);
 
-	pr_dbg("vcpu%hu scheduled on pcpu%hu", vcpu->vcpu_id, pcpu_id);
+	pr_dbg("vm%hu:vcpu%hu scheduled on pcpu%hu", vcpu->vm->vm_id,
+		vcpu->vcpu_id, pcpu_id);
 
 	vcpu_set_state(vcpu, VCPU_RUNNING);
 

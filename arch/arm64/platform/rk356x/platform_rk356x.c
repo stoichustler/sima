@@ -398,5 +398,5 @@ void arch_init_service_vm_vfdt(struct acrn_vm *vm)
 	fdt_check_ret(fdt_end_node(fdt), "root end");
 	fdt_check_ret(fdt_finish(fdt), "finish");
 
-	pr_info("vm%hu static vfdt size=0x%x", vm->vm_id, fdt_totalsize(fdt));
+	pr_info("vm-%hu static vfdt size=0x%x", vm->vm_id, fdt_totalsize(fdt));
 }

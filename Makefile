@@ -149,8 +149,8 @@ REL_INCLUDE_PATH += include/debug
 REL_INCLUDE_PATH += include/public
 REL_INCLUDE_PATH += include/dm
 REL_INCLUDE_PATH += include/hw
-REL_INCLUDE_PATH += sdk/boot/include
-REL_INCLUDE_PATH += sdk/boot/include/guest
+REL_INCLUDE_PATH += sdk/bsp/boot/include
+REL_INCLUDE_PATH += sdk/bsp/boot/include/guest
 
 ARCH ?= x86
 REL_INCLUDE_PATH += include/arch/$(ARCH)
@@ -171,14 +171,13 @@ DTC ?= dtc
 
 include arch/$(ARCH)/Makefile
 
-LIB_DEBUG = $(HV_MODDIR)/libdebug.a
-LIB_RELEASE = $(HV_MODDIR)/librelease.a
+LIB_BSP = $(HV_MODDIR)/libbsp.a
 
 export ARCH
 export CC AS AR LD OBJCOPY
 export CFLAGS ASFLAGS ARFLAGS LDFLAGS ARCH_CFLAGS ARCH_ASFLAGS ARCH_ARFLAGS ARCH_LDFLAGS
 export HV_OBJDIR HV_MODDIR CONFIG_RELEASE INCLUDE_PATH
-export LIB_DEBUG LIB_RELEASE
+export LIB_BSP
 
 ifneq ($(CONFIG_RELEASE),y)
 CFLAGS += -DHV_DEBUG -DPROFILING_ON -fno-omit-frame-pointer
@@ -266,17 +265,17 @@ endif
 COMMON_C_SRCS += core/vm_config.c
 COMMON_C_SRCS += core/event.c
 COMMON_C_SRCS += core/fdt.c
-COMMON_C_SRCS += sdk/boot/guest/vboot_info.c
+COMMON_C_SRCS += sdk/bsp/boot/guest/vboot_info.c
 COMMON_C_SRCS += core/vm_load.c
 ifeq ($(CONFIG_GUEST_KERNEL_RAWIMAGE),y)
-COMMON_C_SRCS += sdk/boot/guest/rawimage_loader.c
+COMMON_C_SRCS += sdk/bsp/boot/guest/rawimage_loader.c
 endif
-COMMON_C_SRCS += sdk/boot/boot.c
-COMMON_C_SRCS += sdk/boot/multiboot/multiboot.c
+COMMON_C_SRCS += sdk/bsp/boot/boot.c
+COMMON_C_SRCS += sdk/bsp/boot/multiboot/multiboot.c
 ifeq ($(CONFIG_MULTIBOOT2),y)
-COMMON_C_SRCS += sdk/boot/multiboot/multiboot2.c
+COMMON_C_SRCS += sdk/bsp/boot/multiboot/multiboot2.c
 endif
-COMMON_C_SRCS += sdk/boot/bare.c
+COMMON_C_SRCS += sdk/bsp/boot/bare.c
 
 # dm componment
 COMMON_C_SRCS += sdk/dm/vuart.c
@@ -308,12 +307,12 @@ endif
 COMMON_C_SRCS += sdk/dm/mmio_dev.c
 COMMON_C_SRCS += sdk/dm/vgpio.c
 ifeq ($(CONFIG_GUEST_KERNEL_BZIMAGE),y)
-COMMON_C_SRCS += sdk/boot/guest/bzimage_loader.c
+COMMON_C_SRCS += sdk/bsp/boot/guest/bzimage_loader.c
 endif
 ifeq ($(CONFIG_GUEST_KERNEL_ELF),y)
-COMMON_C_SRCS += sdk/boot/guest/elf_loader.c
+COMMON_C_SRCS += sdk/bsp/boot/guest/elf_loader.c
 endif
-COMMON_C_SRCS += sdk/hw/pci.c
+COMMON_C_SRCS += sdk/bsp/pci/pci.c
 endif # ifeq ($(ARCH),x86)
 
 ifeq ($(ARCH),arm64)
@@ -326,15 +325,9 @@ COMMON_MOD = $(HV_MODDIR)/core_mod.a
 
 MODULES += $(COMMON_MOD)
 
-ifeq ($(CONFIG_RELEASE),y)
-MODULES += $(LIB_RELEASE)
-LIB_BUILD = $(LIB_RELEASE)
-LIB_MK = sdk/release/Makefile
-else
-MODULES += $(LIB_DEBUG)
-LIB_BUILD = $(LIB_DEBUG)
-LIB_MK = sdk/debug/Makefile
-endif
+MODULES += $(LIB_BSP)
+LIB_BUILD = $(LIB_BSP)
+LIB_MK = sdk/bsp/Makefile
 
 DISTCLEAN_OBJS := $(shell find $(BASEDIR) -name '*.o')
 VERSION := $(HV_OBJDIR)/include/version.h
@@ -355,12 +348,12 @@ $(HV_CONFIG_DIR):
 	@mkdir -p $@
 
 ifneq ($(LINUX_IMAGE_SIZE_H),)
-$(LINUX_IMAGE_SIZE_H): sdk/images/linux/Image sdk/images/linux/Initrd | $(HV_OBJDIR)/include
-	@echo "images    $(notdir $@)"
+$(LINUX_IMAGE_SIZE_H): sdk/image/linux/Image sdk/image/linux/Initrd | $(HV_OBJDIR)/include
+	@echo "image     $(notdir $@)"
 	@{ \
-		image_size=$$(stat -c %s sdk/images/linux/Image); \
-		initrd_size=$$(stat -c %s sdk/images/linux/Initrd); \
-		echo "/* Auto-generated from sdk/images. */"; \
+		image_size=$$(stat -c %s sdk/image/linux/Image); \
+		initrd_size=$$(stat -c %s sdk/image/linux/Initrd); \
+		echo "/* Auto-generated from sdk/image. */"; \
 		echo "#ifndef LINUX_IMAGE_SIZES_H"; \
 		echo "#define LINUX_IMAGE_SIZES_H"; \
 		echo "#define SIMA_LINUX_IMAGE_SIZE $${image_size}U"; \
@@ -485,11 +478,11 @@ $(VM_CFG_C_OBJS): $(HV_OBJDIR)/%.o: %.c $(HEADERS) $(ARCH_PRE_BUILD_TARGETS)
 
 ifeq ($(ARCH),arm64)
 ifeq ($(PLATFORM),qemu)
-sdk/images/linux/sima-linux.dtb: sdk/images/linux/sima-linux.dts
+sdk/image/linux/sima-linux.dtb: sdk/image/linux/sima-linux.dts
 	$(Q)echo "dtc       $@"
 	$(Q)$(DTC) -I dts -O dtb -o $@ $<
 
-$(HV_OBJDIR)/arch/arm64/platform/qemu/platform_image.o: sdk/images/linux/sima-linux.dtb
+$(HV_OBJDIR)/arch/arm64/platform/qemu/platform_image.o: sdk/image/linux/sima-linux.dtb
 endif
 endif
 

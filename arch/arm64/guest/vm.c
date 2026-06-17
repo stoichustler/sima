@@ -180,8 +180,6 @@ static void init_stage2_identity_map(struct acrn_vm *vm)
 	}
 	log_stage2_vio(vm, "vpl011", arm64_platform_guest_uart_base(vm->vm_id),
 		arm64_platform_guest_uart_size(vm->vm_id));
-	pr_info("vm-%u stage-2 protect writable map is vm ram only; zero page is read-only; vgic/vits/vpl011 are vio mmio",
-		vm->vm_id);
 }
 
 static void register_arm64_vio_mmio(struct acrn_vm *vm)

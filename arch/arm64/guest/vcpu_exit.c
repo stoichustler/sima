@@ -358,7 +358,7 @@ static int32_t handle_instruction_abort(struct acrn_vcpu *vcpu)
 	 * permission fault. They are captured for diagnostics but are not emulated
 	 * as MMIO because no load/store value or target register exists.
 	 */
-	pr_err("arm64 instruction abort vm%u-vcpu%u ipa=0x%lx far=0x%lx hpfar=0x%lx fsc=0x%x esr=0x%lx elr=0x%lx",
+	pr_err("arm64 instruction abort vm%u:vcpu%u ipa=0x%lx far=0x%lx hpfar=0x%lx fsc=0x%x esr=0x%lx elr=0x%lx",
 		vcpu->vm->vm_id, vcpu->vcpu_id, ipa, regs->far, regs->hpfar,
 		fsc, regs->esr, regs->elr);
 
@@ -478,7 +478,7 @@ static int32_t handle_psci64(struct acrn_vcpu *vcpu, bool advance_elr)
 		record_psci_call(vcpu, fn, vcpu, ret);
 		break;
 	default:
-		pr_warn("vm%u-vcpu%u unsupported psci call 0x%x",
+		pr_warn("vm%u:vcpu%u unsupported psci call 0x%x",
 			vcpu->vm->vm_id, vcpu->vcpu_id, fn);
 		ret = PSCI_RET_NOT_SUPPORTED;
 		record_psci_call(vcpu, fn, NULL, ret);
@@ -738,6 +738,7 @@ static int32_t handle_sysreg(struct acrn_vcpu *vcpu)
 static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 {
 	bool is_wfe = ESR_WFX_IS_WFE(vcpu->arch.regs.esr);
+	bool timer_rescue_wfi = !is_wfe && vcpu->arch.vtimer_wfi_rescue;
 	bool pending_irq;
 	bool irq_masked;
 	bool request_pending;
@@ -761,6 +762,19 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 	irq_masked = ((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL);
 	request_pending = vcpu_has_pending_request(vcpu);
 	should_yield = is_wfe || (!request_pending && (!pending_irq || irq_masked));
+	if (timer_rescue_wfi) {
+		if (pending_irq && irq_masked) {
+			vcpu->arch.vtimer_lr_rescue = true;
+			vcpu->arch.gctx.hcr_el2 |= HCR_TWI;
+			arm64_vgicv3_update_current_vtimer(vcpu);
+			should_yield = false;
+		} else {
+			vcpu->arch.vtimer_wfi_rescue = false;
+			vcpu->arch.vtimer_lr_rescue = false;
+			vcpu->arch.gctx.hcr_el2 &= ~HCR_TWI;
+		}
+		write_hcr_el2(vcpu->arch.gctx.hcr_el2);
+	}
 
 	last->esr = vcpu->arch.regs.esr;
 	last->elr = vcpu->arch.regs.elr;
@@ -791,7 +805,9 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 	 * This handler is non-default diagnostic plumbing because QEMU 3OS leaves
 	 * HCR_EL2.TWI/TWE clear. If a diagnostic mode enables the traps, keep the
 	 * behavior lightweight: WFE yields, and WFI yields only when no immediately
-	 * useful virtual event is visible.
+	 * useful virtual event is visible. The timer rescue path keeps TWI armed
+	 * only while a pending virtual IRQ is still masked by guest PSTATE.I, so
+	 * repeated guest WFI instructions cannot consume the pending-only timer LR.
 	 */
 	if (should_yield) {
 		yield_current();
@@ -839,7 +855,7 @@ int32_t vcpu_exit_handler(struct acrn_vcpu *vcpu)
 		return 0;
 	}
 
-	pr_err("unhandled arm64 vcpu exit vm%u-vcpu%u ec=0x%lx esr=0x%lx elr=0x%lx far=0x%lx hpfar=0x%lx",
+	pr_err("unhandled arm64 vcpu exit vm%u:vcpu%u ec=0x%lx esr=0x%lx elr=0x%lx far=0x%lx hpfar=0x%lx",
 		vcpu->vm->vm_id, vcpu->vcpu_id, ec, vcpu->arch.regs.esr,
 		vcpu->arch.regs.elr, vcpu->arch.regs.far, vcpu->arch.regs.hpfar);
 	return -EINVAL;
