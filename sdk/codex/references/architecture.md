@@ -84,7 +84,7 @@ qemu-system-aarch64 \
   -serial mon:stdio \
   -kernel out/qemu_out/beau.debug.out \
   -device loader,file=sdk/image/linux/Image,addr=0x70000000,force-raw=on \
-  -device loader,file=sdk/image/linux/Initrd,addr=0x74000000,force-raw=on
+  -device loader,file=sdk/image/linux/Initramfs.cpio.gz,addr=0x74000000,force-raw=on
 ```
 
 ## Current VM Layout
@@ -105,21 +105,21 @@ qemu-system-aarch64 \
   - Kernel image: `sdk/image/linux/Image`
   - QEMU kernel stage address: `0x70000000`
   - Kernel load/entry: `0x48080000`
-  - Initrd image: `sdk/image/linux/Initrd`
-  - QEMU initrd stage address: `0x74000000`
-  - Initrd load: `0x4c000000`
+  - Initramfs image: `sdk/image/linux/Initramfs.cpio.gz`
+  - QEMU initramfs stage address: `0x74000000`
+  - Initramfs load: `0x4c000000`
   - DTB: `sdk/image/linux/beau-linux.dtb`
   - RAM identity window: `0x48000000-0x50000000`
   - pCPUs: 1, 4, 6, 7
-  - Boot console: `console=ttyAMA0 earlycon=pl011,0x09000000`
-  - Login: `root` / `root`
+  - Boot console: `console=ttyAMA0 rdinit=/init earlycon=pl011,0x09000000`
+  - Initramfs shell: `uos` prompt as root
 - pCPU3 is intentionally shared by VM0 and VM1 AP vCPUs.
   Each VM's vCPU0/BSP pCPU is private: VM0 uses pCPU2, VM1 uses pCPU5,
   and VM2 uses pCPU1.
 
 QEMU and rk356x both keep guest images under `sdk/image`. LK and Zephyr are
-embedded RTOS raw images. Linux `Image`, `Initrd`, `beau-linux.dts`, and
-`beau-linux.dtb` live under `sdk/image/linux`; `Image` and `Initrd` are staged
+embedded RTOS raw images. Linux `Image`, `Initramfs.cpio.gz`, `beau-linux.dts`, and
+`beau-linux.dtb` live under `sdk/image/linux`; `Image` and `Initramfs.cpio.gz` are staged
 by a loader and copied by BEAU, while `beau-linux.dtb` is embedded as the
 Linux-on-BEAU DTB module.
 
@@ -136,7 +136,7 @@ used by another VM.
 - Zephyr and LK are RTOS raw images and use `GUEST_FLAG_NO_FW`. This skips
   external ACPI/FDT boot modules; ARM64 can still pass a synthetic static vFDT.
 - VM2 Linux clears `GUEST_FLAG_NO_FW`, uses loader/module delivery for `Image`
-  and `Initrd`, and receives the embedded `beau-linux.dtb`.
+  and `Initramfs.cpio.gz`, and receives the embedded `beau-linux.dtb`.
 - VM2 Linux keeps PL011 earlycon enabled so `vsh 2` can replay kernel logs even
   before the normal PL011 console driver is registered.
 - The host owns CNTP for scheduler ticks. Guest physical/virtual timer sysreg
@@ -183,7 +183,8 @@ For VM/scheduler/console changes, validate:
 5. `vsh 0` reaches `zero ~>` and the switch banner appears before replayed VM0
    logs.
 6. `vsh 1` reaches `beau ~>`.
-7. `vsh 2` reaches `clou login:` and logs in as `root` / `root`.
+7. `vsh 2` reaches the Linux initramfs `uos` root shell and `id` reports
+   `uid=0(root)`.
 8. Ctrl-D returns to BEAU shell.
 9. No `[cut here]`, `unexpected arm64 trap`, or host unexpected IRQ appears.
 

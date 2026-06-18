@@ -41,7 +41,7 @@ for mixed RTOS and Linux guests.
 | Docs | SDK notes, ARM64 assembly comments, concise architecture references |
 
 LK and Zephyr stay as repository-local `.incbin` guest images under
-`sdk/image`. VM2 Linux uses `sdk/image/linux/Image` and `sdk/image/linux/Initrd`, which
+`sdk/image`. VM2 Linux uses `sdk/image/linux/Image` and `sdk/image/linux/Initramfs.cpio.gz`, which
 QEMU stages with `-device loader`; BEAU then copies them into the VM2 RAM window.
 The Linux device tree remains repository-local as `sdk/image/linux/beau-linux.dtb`.
 

@@ -41,9 +41,17 @@ struct hv_timer console_timer;
 #define VM_CONSOLE_RINGBUF_MASK     (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_RINGBUF_CAPACITY (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #ifndef CONFIG_VM_CONSOLE_DRAIN_BUDGET
-#define CONFIG_VM_CONSOLE_DRAIN_BUDGET 128U
+#define CONFIG_VM_CONSOLE_DRAIN_BUDGET 256U
 #endif
 #define VM_CONSOLE_DRAIN_BUDGET CONFIG_VM_CONSOLE_DRAIN_BUDGET
+#ifndef CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET
+#define CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET 512U
+#endif
+#define VM_CONSOLE_DRAIN_BURST_BUDGET CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET
+#ifndef CONFIG_VM_CONSOLE_DRAIN_BURST_THRESHOLD
+#define CONFIG_VM_CONSOLE_DRAIN_BURST_THRESHOLD (CONFIG_VM_CONSOLE_RINGBUF_SIZE / 2U)
+#endif
+#define VM_CONSOLE_DRAIN_BURST_THRESHOLD CONFIG_VM_CONSOLE_DRAIN_BURST_THRESHOLD
 #define VM_CONSOLE_DRAIN_BUF_SIZE 1024U
 #define VM_CONSOLE_PREFIX_MAX_SIZE 16U
 #define VM_CONSOLE_EXCEPTION_RINGBUF_SIZE 4096U
@@ -191,20 +199,41 @@ static uint32_t console_ring_queued(uint32_t prod, uint32_t cons, uint32_t capac
 	return (queued > capacity) ? capacity : queued;
 }
 
+static uint32_t console_vm_ring_drain_budget(struct vm_console_ringbuf *rb)
+{
+	uint64_t rflags;
+	uint32_t queued;
+
+	spinlock_irqsave_obtain(&rb->lock, &rflags);
+	queued = console_ring_queued(rb->prod, rb->cons, VM_CONSOLE_RINGBUF_CAPACITY);
+	spinlock_irqrestore_release(&rb->lock, rflags);
+
+	return (queued >= VM_CONSOLE_DRAIN_BURST_THRESHOLD) ?
+		VM_CONSOLE_DRAIN_BURST_BUDGET : VM_CONSOLE_DRAIN_BUDGET;
+}
+
+static uint32_t console_vm_ring_budget_from_queued(uint32_t queued)
+{
+	return (queued >= VM_CONSOLE_DRAIN_BURST_THRESHOLD) ?
+		VM_CONSOLE_DRAIN_BURST_BUDGET : VM_CONSOLE_DRAIN_BUDGET;
+}
+
 bool console_vm_ring_get_stats(uint16_t vmid, struct console_vm_ring_stats *stats)
 {
 	struct vm_console_ringbuf *rb;
 	uint64_t rflags;
+	uint32_t queued;
 	bool valid = false;
 
 	if ((stats != NULL) && (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM)) {
 		rb = &vm_console_ringbufs[vmid];
 		spinlock_irqsave_obtain(&rb->lock, &rflags);
+		queued = console_ring_queued(rb->prod, rb->cons, VM_CONSOLE_RINGBUF_CAPACITY);
 		stats->vmid = vmid;
 		stats->size = CONFIG_VM_CONSOLE_RINGBUF_SIZE;
 		stats->capacity = VM_CONSOLE_RINGBUF_CAPACITY;
-		stats->drain_budget = VM_CONSOLE_DRAIN_BUDGET;
-		stats->queued = console_ring_queued(rb->prod, rb->cons, VM_CONSOLE_RINGBUF_CAPACITY);
+		stats->drain_budget = console_vm_ring_budget_from_queued(queued);
+		stats->queued = queued;
 		stats->high_water = rb->high_water;
 		stats->input_bytes = rb->input_bytes;
 		stats->stored_bytes = rb->stored_bytes;
@@ -535,11 +564,11 @@ static void console_vm_ring_drain_internal(uint16_t vmid)
 		rb = &vm_console_ringbufs[vmid];
 		if (console_vm_ring_drain_begin(rb)) {
 			/*
-			 * Host serial output is synchronous. Keep each timer callback
-			 * short so selecting a chatty Linux VM does not monopolize the
-			 * BEAU shell pCPU while a whole boot-log ring is replayed at once.
+			 * Host serial output is synchronous. Start with a short drain
+			 * window, then allow a bounded burst when Linux has a deep
+			 * backlog so handoff remains smooth without starving output.
 			 */
-			budget = VM_CONSOLE_DRAIN_BUDGET;
+			budget = console_vm_ring_drain_budget(rb);
 			do {
 				chunk = (budget < VM_CONSOLE_DRAIN_BUF_SIZE) ? budget : VM_CONSOLE_DRAIN_BUF_SIZE;
 				if (chunk == 0U) {

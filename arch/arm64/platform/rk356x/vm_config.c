@@ -116,12 +116,12 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 			.name = "linux",
 			.kernel_type = KERNEL_RAWIMAGE,
 			.kernel_mod_tag = "linux",
-			.ramdisk_mod_tag = "linux-initrd",
-			.bootargs = "root=/dev/ram0 rw init=/linuxrc console=ttyAMA0",
+			.ramdisk_mod_tag = "Initramfs.cpio.gz",
+			.bootargs = "console=ttyAMA0 rdinit=/init loglevel=7",
 			.kernel_load_addr = RK356X_LINUX_KERNEL_LOAD_ADDR,
 			.kernel_entry_addr = RK356X_LINUX_KERNEL_LOAD_ADDR,
-			.kernel_ramdisk_addr = RK356X_LINUX_INITRD_LOAD_ADDR,
-			.kernel_ramdisk_size = BEAU_LINUX_INITRD_SIZE,
+			.kernel_ramdisk_addr = RK356X_LINUX_INITRAMFS_LOAD_ADDR,
+			.kernel_ramdisk_size = BEAU_LINUX_INITRAMFS_SIZE,
 		},
 		.arch = {
 			.guest_ram_start = RK356X_LINUX_RAM_START,
@@ -158,9 +158,9 @@ struct bare_boot_option bare_boot_options[] = {
 		.tag = "linux",
 	},
 	{
-		.addr = RK356X_LINUX_INITRD_STAGE_ADDR,
-		.size = BEAU_LINUX_INITRD_SIZE,
-		.tag = "linux-initrd",
+		.addr = RK356X_LINUX_INITRAMFS_STAGE_ADDR,
+		.size = BEAU_LINUX_INITRAMFS_SIZE,
+		.tag = "Initramfs.cpio.gz",
 	},
 };
 

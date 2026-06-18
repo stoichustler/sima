@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CWD = Path.cwd()
 LINUX_IMAGE_STAGE_ADDR = "0x70000000"
-LINUX_INITRD_STAGE_ADDR = "0x74000000"
+LINUX_INITRAMFS_STAGE_ADDR = "0x74000000"
 
 
 def relpath(path):
@@ -41,7 +41,12 @@ def parse_args():
     parser.add_argument("--smp", default=getenv("BEAU_QEMU_SMP", "8"))
     parser.add_argument("-m", "--memory", default=getenv("BEAU_QEMU_MEM", "1024M"))
     parser.add_argument("--linux-image", default=ROOT / "sdk/image/linux/Image", type=relpath)
-    parser.add_argument("--linux-initrd", default=ROOT / "sdk/image/linux/Initrd", type=relpath)
+    parser.add_argument(
+        "--linux-initramfs",
+        dest="linux_initramfs",
+        default=ROOT / "sdk/image/linux/Initramfs.cpio.gz",
+        type=relpath,
+    )
     parser.add_argument("--toolchains", "--toolchain", default=toolchains, type=relpath)
     parser.add_argument("--cross-prefix", default=getenv("BEAU_CROSS_COMPILE", "aarch64-none-elf-"))
     parser.add_argument("--build", action="store_true")
@@ -91,7 +96,7 @@ def main():
         "-device",
         f"loader,file={args.linux_image},addr={LINUX_IMAGE_STAGE_ADDR},force-raw=on",
         "-device",
-        f"loader,file={args.linux_initrd},addr={LINUX_INITRD_STAGE_ADDR},force-raw=on",
+        f"loader,file={args.linux_initramfs},addr={LINUX_INITRAMFS_STAGE_ADDR},force-raw=on",
         *args.extra,
     ]
 
@@ -118,8 +123,8 @@ def main():
         raise SystemExit(1)
     if not args.linux_image.is_file():
         raise SystemExit(f"Linux Image not found: {args.linux_image}")
-    if not args.linux_initrd.is_file():
-        raise SystemExit(f"Linux Initrd not found: {args.linux_initrd}")
+    if not args.linux_initramfs.is_file():
+        raise SystemExit(f"Linux initramfs not found: {args.linux_initramfs}")
 
     qemu = shutil.which(args.qemu)
     if qemu is None:

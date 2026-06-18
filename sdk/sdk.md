@@ -64,7 +64,7 @@ qemu-system-aarch64 \
   -serial mon:stdio \
   -kernel out/qemu_out/beau.debug.out \
   -device loader,file=sdk/image/linux/Image,addr=0x70000000,force-raw=on \
-  -device loader,file=sdk/image/linux/Initrd,addr=0x74000000,force-raw=on
+  -device loader,file=sdk/image/linux/Initramfs.cpio.gz,addr=0x74000000,force-raw=on
 ```
 
 For manual validation, set `BEAU_TOOLCHAINS` to the bare-metal toolchain bin
@@ -92,7 +92,7 @@ GIC init, the BEAU shell prompt, and VM launch logs.
 
 LK and Zephyr stay as `.incbin` RTOS images under `sdk/image`:
 `sdk/image/lk.bin` and `sdk/image/zephyr.bin`. VM2 Linux uses
-`sdk/image/linux/Image` and `sdk/image/linux/Initrd`; QEMU stages them with
+`sdk/image/linux/Image` and `sdk/image/linux/Initramfs.cpio.gz`; QEMU stages them with
 `-device loader` at `0x70000000` and `0x74000000`, then BEAU copies them into
 VM2 guest RAM. The Linux DTB is `sdk/image/linux/beau-linux.dtb` and remains embedded
 as a small `.incbin` module because it describes Linux running on BEAU.
@@ -116,17 +116,17 @@ Current QEMU VM layout:
   - Kernel module tag: `linux`
   - QEMU kernel stage address: `0x70000000`
   - Kernel load address and entry: `0x48080000`
-  - Initrd image: `sdk/image/linux/Initrd`
-  - Initrd module tag: `linux-initrd`
-  - QEMU initrd stage address: `0x74000000`
-  - Initrd load address: `0x4c000000`
+  - Initramfs image: `sdk/image/linux/Initramfs.cpio.gz`
+  - Initramfs module tag: `Initramfs.cpio.gz`
+  - QEMU initramfs stage address: `0x74000000`
+  - Initramfs load address: `0x4c000000`
   - DTB image: `sdk/image/linux/beau-linux.dtb`
   - DTB module tag: `beau-linux-dtb`
-  - Boot console: `console=ttyAMA0 earlycon=pl011,0x09000000`
+  - Boot console: `console=ttyAMA0 rdinit=/init earlycon=pl011,0x09000000`
   - Identity RAM window: `0x48000000-0x50000000`
   - vCPUs: 4, running on pCPU1, pCPU4, pCPU6, and pCPU7
   - QEMU vITS window: `0x08080000-0x0809ffff`
-  - Login: `root` / `root`
+  - Initramfs shell: `uos` prompt as root
 - pCPU0-pCPU5 model ordinary cores.
 - pCPU6-pCPU7 model performance cores.
 - VM0 uses ordinary cores only. VM1 may mix ordinary and performance cores; the
@@ -138,7 +138,7 @@ The generated `out/qemu_out/beau.debug.out` has been boot-tested on QEMU. The
 build also emits `out/qemu_out/beau.out` as the base link image and
 `out/qemu_out/beau.debug.bin` as the raw debug image. Zephyr and LK autostart
 from embedded RTOS images. VM2 Linux autostarts when QEMU stages `Image` and
-`Initrd`; BEAU supplies the embedded `beau-linux.dtb`.
+`Initramfs.cpio.gz`; BEAU supplies the embedded `beau-linux.dtb`.
 The BEAU shell stays quiet during late guest AP bring-up; press Enter after the
 boot logs settle to show the `console:\>` prompt.
 
@@ -153,7 +153,7 @@ boot logs settle to show the `console:\>` prompt.
 - QEMU platform code and static board/scenario configuration under
   `arch/arm64/platform/qemu`.
 - Bare-boot image embedding for LK and Zephyr raw images from `sdk/image`.
-- Linux VM2 loader tags for externally staged `Image` and `Initrd`, plus the
+- Linux VM2 loader tags for externally staged `Image` and `Initramfs.cpio.gz`, plus the
   embedded `beau-linux.dtb` module.
 - Static QEMU VM configuration for Zephyr as the service VM and LK/Linux as
   pre-launched VMs.
@@ -170,7 +170,7 @@ boot logs settle to show the `console:\>` prompt.
 - Zephyr and LK are marked with `GUEST_FLAG_NO_FW`, so the boot-info path does
   not require external ACPI/FDT modules for the current RTOS images. VM2 Linux
   clears that flag, receives `beau-linux.dtb`, and uses the loader/module path
-  instead of platform `.incbin` image embedding for `Image` and `Initrd`.
+  instead of platform `.incbin` image embedding for `Image` and `Initramfs.cpio.gz`.
 - EL2 entry, exception vector setup, MMU enablement, and 1:1 host mappings.
   The primary and secondary EL2 entry paths explicitly select `SP_EL2` with
   `SPSel=1`, so host scheduling, guest entry, and guest exit use the same EL2
@@ -242,24 +242,24 @@ boot logs settle to show the `console:\>` prompt.
 - `dumpstat [vm id]` prints all created vCPUs in the VM, including the saved
   ARM64 register image, scheduler state, current-thread status, recent vCPU
   exit reason, recent virtual IRQ injection, recent guest timer programming or
-  injection, VM console-ring/vPL011 counters, a raw guest stack trace from the
-  VM register image, and the host stack saved by the vCPU thread on its bound
-  pCPU. IRQ exits report `ec:n/a` because `ESR_EL2.EC` is only meaningful for
-  synchronous exits. Guest stack entries are raw addresses because BEAU does not
-  embed guest symbol tables. The debug image embeds the BEAU symbol table, so
-  host stack return addresses are printed as `function+offset`. Offline vCPUs
-  skip stack output.
+  injection, a raw guest stack trace from the VM register image, and the host
+  stack saved by the vCPU thread on its bound pCPU. IRQ exits report `ec:n/a`
+  because `ESR_EL2.EC` is only meaningful for synchronous exits. Guest stack
+  entries are raw addresses because BEAU does not embed guest symbol tables. The
+  debug image embeds the BEAU symbol table, so host stack return addresses are
+  printed as `function+offset`. Offline vCPUs skip stack output.
 - ARM64 host exception call traces resolve return addresses through the
   embedded BEAU symbol table and print `function+offset` beside the raw LR.
 - VM vPL011 TX output from the currently selected `vsh` VM is written into a
   Xen-style per-VM async console ring buffer, using monotonic producer/consumer
   indexes and a 4KB power-of-two data area with 4095 bytes of usable capacity.
   The console timer path runs every 10ms and drains up to
-  `CONFIG_VM_CONSOLE_DRAIN_BUDGET` bytes, default 128, to the host serial
-  console per pass, so guest PL011 writes no longer wait for host serial output
-  and `vsh 2` does not synchronously replay a full Linux boot-log ring at once.
-  `dumpstat [vm id]` reports the current VM console-ring queued bytes,
-  high-water mark, drops, overflow count, drain budget, and draining state.
+  `CONFIG_VM_CONSOLE_DRAIN_BUDGET` bytes, default 256, to the host serial
+  console per pass. If the selected VM has at least half a ring of queued
+  output, the drain path can temporarily use
+  `CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET`, default 512. This keeps `vsh 2` from
+  synchronously replaying a full Linux boot-log ring while still clearing deep
+  Linux console backlog faster than the first 128-byte drain experiment.
 - Non-selected VM console output is not replayed into the BEAU shell.
 - VM exception logs have a separate 4KB/4095-byte per-VM ring reserved for VM
   trap/oops capture. The ring is internal debug plumbing and is no longer
@@ -273,9 +273,9 @@ boot logs settle to show the `console:\>` prompt.
 - ARM64 vPL011 avoids running the vGIC level-deassert path for ordinary PL011
   polling reads, especially Linux's frequent `FR` reads around console output.
   RX reads, interrupt status reads, interrupt-mask writes, interrupt clears, and
-  newly raised TX-ready state still update the virtual IRQ line. `dumpstat [vm
-  id]` prints vPL011 TX bytes, TX-ready raises, current `CR/IMSC/RIS/pending`
-  state, last TX byte, and virtual IRQ assert/deassert counts.
+  newly raised TX-ready state still update the virtual IRQ line. vPL011 keeps
+  internal counters for TX bytes, TX-ready raises, pending state, and virtual
+  IRQ assert/deassert transitions for temporary diagnostics.
 - Initial vGICv3 model:
   - VM and vCPU vGIC state.
   - ICH LR save/load/sync/flush.
@@ -341,12 +341,12 @@ The following have been verified on QEMU with `-smp 8`:
   pCPU1, pCPU4, pCPU6, and pCPU7.
 - `vsh 0` enters the Zephyr console and reaches `zero ~>`.
 - `vsh 1` enters the LK console and reaches `beau ~>`.
-- `vsh 2` enters the Linux console. During the 2026-06-16 VM2 debug session,
-  4-vCPU Linux progressed through secondary CPU bring-up and reached
-  `clou login:` in at least one run, but root-shell login is not yet stable.
+- `vsh 2` enters the Linux console and should reach the initramfs `uos` root
+  shell. The VM2 regression now verifies root identity with `id` instead of
+  using the old login flow.
 - VM0 Zephyr `help` and VM1 LK `help` complete through the async VM console
-  path. VM2 Linux root login and `help` are still part of the active
-  timer/vGIC stability investigation.
+  path. VM2 Linux shell commands remain part of the active timer/vGIC stability
+  investigation.
 - VM0 Zephyr `symtab list` completes through `vsh 0` and returns to the
   `zero ~>` prompt with async batched VM console output.
 - VM console output bypasses vUART TX FIFO forwarding for the selected `vsh`
@@ -377,18 +377,17 @@ The following have been verified on QEMU with `-smp 8`:
   VM2 Linux enumerated the virtual ITS:
   `ITS [mem 0x08080000-0x0809ffff]`,
   `ITS: Using hypervisor restricted LPI range [8192]`, and allocated LPI
-  pending tables for CPU0-CPU3. VM2 Linux still timed out waiting for
-  `clou login:`, matching the existing VM2 timer/login instability rather than
-  a new ITS-specific panic or warning.
+  pending tables for CPU0-CPU3. This predates the switch to the direct
+  initramfs `uos` shell.
 
 ## VM2 Linux Debug Snapshot
 
-Status as of 2026-06-17:
+Status as of 2026-06-18:
 
-- Current baseline: VM2 Linux reaches the PL011 login prompt, accepts
-  `root` / `root`, enters the root shell, and passes the automated root identity
-  check in the standard QEMU regression. This is the baseline to preserve before
-  making any further VM2 timer or vGIC change.
+- Current baseline: VM2 Linux uses `sdk/image/linux/Initramfs.cpio.gz` and
+  `rdinit=/init`, enters the initramfs `uos` root shell on PL011, and the
+  regression checks root identity with `id`. This is the baseline to preserve
+  before making any further VM2 timer or vGIC change.
 - The baseline was restored after reverting the stale pending-only timer LR
   drop experiment. That experiment made boot and VM console handoff visibly
   slower and must not be treated as the starting point for future work.
@@ -497,10 +496,11 @@ Status as of 2026-06-17:
   Updated outputs are `out/qemu_out/beau.debug.out` and
   `out/qemu_out/beau.debug.bin`.
 - Manual validation is still pending. The next run should rebuild/boot the
-  updated image, enter VM2 Linux as `root` / `root`, keep the 4-vCPU guest
-  running past the previous RCU stall window, and confirm that vCPU0 no longer
-  remains at `cpu_do_idle+8` with virq 27 pending. If the stall still appears,
-  capture `dumpstat 2`, `vcpus`, `schedstat`, and `irqstat` immediately.
+  updated image, enter the VM2 Linux initramfs `uos` root shell, keep the
+  4-vCPU guest running past the previous RCU stall window, and confirm that
+  vCPU0 no longer remains at `cpu_do_idle+8` with virq 27 pending. If the stall
+  still appears, capture `dumpstat 2`, `vcpus`, `schedstat`, and `irqstat`
+  immediately.
 
 ### RCU Stall Repair Strategy
 
@@ -527,9 +527,10 @@ Status as of 2026-06-17:
    switch-in/out, timer IRQ injection, maintenance/EOI handling, or explicit
    guest exits. Avoid background backup timers or always-on polling in the QEMU
    3OS path unless a later design proves they are required.
-8. Treat the RCU fix as complete only when VM2 reaches `root` / `root`, remains
-   responsive long enough to cover the earlier RCU stall window, emits no
-   `timer-softirq=0` RCU warning, and VM0/VM1 still pass the regression gate.
+8. Treat the RCU fix as complete only when VM2 reaches the initramfs `uos` root
+   shell, remains responsive long enough to cover the earlier RCU stall window,
+   emits no `timer-softirq=0` RCU warning, and VM0/VM1 still pass the regression
+   gate.
 
 ### Experiments Not To Repeat
 
@@ -604,11 +605,11 @@ virtualization port.
 - QEMU VM layout is still statically configured in `vm_config.c`;
   QEMU FDT parsing is not yet used to derive VM layout.
 - Zephyr and LK are RTOS raw images and boot with `GUEST_FLAG_NO_FW`. VM2 Linux
-  uses a loader/module path for `Image` and `Initrd`, while its Linux-on-BEAU
+  uses a loader/module path for `Image` and `Initramfs.cpio.gz`, while its Linux-on-BEAU
   DTB remains embedded.
-- VM2 Linux runs as a 4-vCPU guest. The path has reached the Linux login prompt
-  during QEMU validation; repeated cold-boot coverage is still needed before
-  calling the 4-vCPU path stable.
+- VM2 Linux runs as a 4-vCPU guest. The path should reach the initramfs `uos`
+  shell during QEMU validation; repeated cold-boot coverage is still needed
+  before calling the 4-vCPU path stable.
 - VM2 Linux keeps `earlycon=pl011,0x09000000` so `vsh 2` can show Linux logs
   before the normal PL011 console driver is registered.
 - VM console output from SMP guests can interleave because multiple guest CPUs
@@ -619,14 +620,14 @@ virtualization port.
 
 ## Next Steps
 
-1. Add repeated cold-boot and root-shell coverage for VM2 Linux 4-vCPU/SMP,
+1. Add repeated cold-boot and initramfs-shell coverage for VM2 Linux 4-vCPU/SMP,
    with diagnostics for timer, SGI, and pending/active LR state on failures.
 2. Validate the bounded console drain and vPL011 IRQ-line throttling against
    `vsh 2` handoff smoothness. If VM2 is still visibly slow, capture
-   `dumpstat 2`, `irqstat`, and `schedstat`, then compare console-ring
-   `queued/high/dropped` with vPL011 `txirq/assert/deassert` and the VM2 guest
-   UART IRQ count before changing vGICv3, vtimer, or vCPU-exit code.
-3. Extend `scripts/regress.py` with more VM2 Linux root-shell commands, reboot
+   `dumpstat 2`, `irqstat`, and `schedstat`, then compare the VM2 guest UART IRQ
+   count against scheduler/timer progress before changing vGICv3, vtimer, or
+   vCPU-exit code.
+3. Extend `scripts/regress.py` with more VM2 Linux initramfs-shell commands, reboot
    coverage, repeated cold boots, and saved log artifacts suitable for CI.
 4. Audit ARM64 abort handling to confirm whether guest instruction aborts are
    trapped and diagnosed correctly. Cover instruction fetch aborts separately

@@ -89,7 +89,7 @@ loader, then copied by BEAU:
 
 ```text
 sdk/image/linux/Image
-sdk/image/linux/Initrd
+sdk/image/linux/Initramfs.cpio.gz
 ```
 
 The Linux-on-BEAU DTB remains a small embedded module:
@@ -99,7 +99,7 @@ sdk/image/linux/beau-linux.dtb
 ```
 
 `platform_image.S` should use `.incbin` only for LK, Zephyr, and small DTB
-modules. Do not add Linux `Image` or `Initrd` as `.incbin` inputs; use
+modules. Do not add Linux `Image` or `Initramfs.cpio.gz` as `.incbin` inputs; use
 loader/module delivery for those files.
 
 ## VM Configuration
@@ -179,8 +179,8 @@ QEMU validation should cover:
 - `vcpus`, `schedstat`, `vmap`, `irqstat`, and `dumpstat`.
 - `vsh 0` reaching the Zephyr shell.
 - `vsh 1` reaching the LK shell.
-- `vsh 2` reaching the Linux `clou login:` prompt and logging in as
-  `root` / `root`.
+- `vsh 2` reaching the Linux initramfs `uos` root shell and `id` reporting
+  `uid=0(root)`.
 - No `[cut here]`, `unexpected arm64 trap`, or `unhandled arm64 vcpu exit`.
 
 ## Hardware Validation

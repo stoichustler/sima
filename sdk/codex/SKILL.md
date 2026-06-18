@@ -23,9 +23,9 @@ description: Develop, debug, validate, and document the BEAU hypervisor in this 
    - Preserve QEMU RTOS stage-2 RAM identity mapping: guest IPA/GPA equals HPA/PA.
    - Keep Zephyr/LK RTOS boot paths independent of external ACPI/FDT modules.
    - Keep LK and Zephyr image inputs under `sdk/image`, and keep Linux
-     `Image`, `Initrd`, `beau-linux.dts`, and `beau-linux.dtb` under
+     `Image`, `Initramfs.cpio.gz`, `beau-linux.dts`, and `beau-linux.dtb` under
      `sdk/image/linux`.
-   - Do not move Linux `Image` or `Initrd` into `.incbin`; use loader/module
+   - Do not move Linux `Image` or `Initramfs.cpio.gz` into `.incbin`; use loader/module
      delivery. The Linux-on-BEAU DTB may remain an embedded module.
 
 3. Make focused changes:
@@ -77,7 +77,7 @@ description: Develop, debug, validate, and document the BEAU hypervisor in this 
 - Inspect `arch/arm64/platform/<platform>/vm_config.c`, `arch/arm64/guest/vm.c`, `sdk/boot/guest/vboot_info.c`, and `sdk/boot/guest/rawimage_loader.c`.
 - Verify VM RAM windows, load/entry addresses, `GUEST_FLAG_NO_FW`, static vFDT placement, and stage-2 identity logs.
 - In QEMU, check `vcpus`, `schedstat`, `vsh 0`, `vsh 1`, and VM2 Linux
-  `root` / `root` login through `vsh 2`.
+  reaching the initramfs `uos` root shell through `vsh 2`.
 
 ### rk356x Platform Work
 
@@ -85,7 +85,7 @@ description: Develop, debug, validate, and document the BEAU hypervisor in this 
   `arch/arm64/platform/rk356x`.
 - Keep guest image embedding pointed at `sdk/image/lk.bin`,
   `sdk/image/zephyr.bin`, and small DTB modules. Keep Linux `Image` and
-  `Initrd` under `sdk/image` but load them through module/loader staging.
+  `Initramfs.cpio.gz` under `sdk/image` but load them through module/loader staging.
 - Treat rk356x hardware validation as manual flashing and serial-log inspection
   until an automated board workflow exists.
 - Do not add board flashing commands or local artifact paths to documentation

@@ -348,16 +348,16 @@ $(HV_CONFIG_DIR):
 	@mkdir -p $@
 
 ifneq ($(LINUX_IMAGE_SIZE_H),)
-$(LINUX_IMAGE_SIZE_H): sdk/image/linux/Image sdk/image/linux/Initrd | $(HV_OBJDIR)/include
+$(LINUX_IMAGE_SIZE_H): Makefile sdk/image/linux/Image sdk/image/linux/Initramfs.cpio.gz | $(HV_OBJDIR)/include
 	@echo "image     $(notdir $@)"
 	@{ \
 		image_size=$$(stat -c %s sdk/image/linux/Image); \
-		initrd_size=$$(stat -c %s sdk/image/linux/Initrd); \
+		initramfs_size=$$(stat -c %s sdk/image/linux/Initramfs.cpio.gz); \
 		echo "/* Auto-generated from sdk/image. */"; \
 		echo "#ifndef LINUX_IMAGE_SIZES_H"; \
 		echo "#define LINUX_IMAGE_SIZES_H"; \
 		echo "#define BEAU_LINUX_IMAGE_SIZE $${image_size}U"; \
-		echo "#define BEAU_LINUX_INITRD_SIZE $${initrd_size}U"; \
+		echo "#define BEAU_LINUX_INITRAMFS_SIZE $${initramfs_size}U"; \
 		echo "#endif /* LINUX_IMAGE_SIZES_H */"; \
 	} > $@
 

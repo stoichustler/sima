@@ -9,7 +9,7 @@
 
 	chosen {
 		stdout-path = "/pl011@9000000";
-		bootargs = "rw root=/dev/ram0 console=ttyAMA0 init=/sbin/init";
+		bootargs = "console=ttyAMA0 rdinit=/init loglevel=7";
 		linux,initrd-start = <0x0 0x4c000000>;
 		linux,initrd-end = <0x0 0x4c300000>;
 	};

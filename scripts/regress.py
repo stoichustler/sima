@@ -13,10 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CWD = Path.cwd()
 PROMPT = "console:\\>"
+LINUX_PROMPT = "uos "
 ENTER = "\r"
 CTRL_D = b"\x04"
 LINUX_IMAGE_STAGE_ADDR = "0x70000000"
-LINUX_INITRD_STAGE_ADDR = "0x74000000"
+LINUX_INITRAMFS_STAGE_ADDR = "0x74000000"
 FATAL_PATTERNS = (
     "[cut here]",
     "unexpected arm64 trap",
@@ -66,7 +67,12 @@ def parse_args():
     parser.add_argument("--smp", default=getenv("BEAU_QEMU_SMP", "8"))
     parser.add_argument("-m", "--memory", default=getenv("BEAU_QEMU_MEM", "1024M"))
     parser.add_argument("--linux-image", default=ROOT / "sdk/image/linux/Image", type=relpath)
-    parser.add_argument("--linux-initrd", default=ROOT / "sdk/image/linux/Initrd", type=relpath)
+    parser.add_argument(
+        "--linux-initramfs",
+        dest="linux_initramfs",
+        default=ROOT / "sdk/image/linux/Initramfs.cpio.gz",
+        type=relpath,
+    )
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--log", default=ROOT / "out/qemu_out/regress.log", type=relpath)
     parser.add_argument("--no-build", action="store_true")
@@ -107,7 +113,7 @@ def qemu_cmd(args):
         "-device",
         f"loader,file={args.linux_image},addr={LINUX_IMAGE_STAGE_ADDR},force-raw=on",
         "-device",
-        f"loader,file={args.linux_initrd},addr={LINUX_INITRD_STAGE_ADDR},force-raw=on",
+        f"loader,file={args.linux_initramfs},addr={LINUX_INITRAMFS_STAGE_ADDR},force-raw=on",
         *args.extra,
     ]
 
@@ -269,8 +275,8 @@ def run_qemu(args, cmd):
         raise SystemExit(f"Kernel image not found: {args.kernel}")
     if not args.linux_image.is_file():
         raise SystemExit(f"Linux Image not found: {args.linux_image}")
-    if not args.linux_initrd.is_file():
-        raise SystemExit(f"Linux Initrd not found: {args.linux_initrd}")
+    if not args.linux_initramfs.is_file():
+        raise SystemExit(f"Linux initramfs not found: {args.linux_initramfs}")
     if shutil.which(args.qemu) is None:
         raise SystemExit(f"QEMU binary not found: {args.qemu}")
 
@@ -325,14 +331,10 @@ def run_qemu(args, cmd):
 
         qemu.send("vsh 2" + ENTER)
         try:
-            qemu.expect("clou login:", "VM2 Linux login", timeout=60.0, keepalive=ENTER)
+            qemu.expect(LINUX_PROMPT, "VM2 Linux initramfs shell", timeout=60.0, keepalive=ENTER)
         except Exception:
-            qemu.capture_vm_diagnostics("VM2 Linux login timeout", 2)
+            qemu.capture_vm_diagnostics("VM2 Linux initramfs shell timeout", 2)
             raise
-        qemu.send("root" + ENTER)
-        qemu.expect("Password:", "VM2 Linux password prompt", timeout=10.0)
-        qemu.send("root" + ENTER)
-        qemu.expect("clou", "VM2 Linux shell prompt", timeout=60.0, keepalive=ENTER)
         qemu.send("id" + ENTER)
         qemu.expect("uid=0(root)", "VM2 Linux root identity", timeout=10.0)
         qemu.send(CTRL_D)
@@ -350,7 +352,7 @@ def main():
         if not args.no_build:
             print(render(build, args.toolchains))
         print(quote(qemu))
-        print("checks: prompt, vcpus, schedstat, vmap, irqstat, vsh 0, ctrl-d, vsh 1, ctrl-d, vsh 2, Linux root login")
+        print("checks: prompt, vcpus, schedstat, vmap, irqstat, vsh 0, ctrl-d, vsh 1, ctrl-d, vsh 2, Linux initramfs shell")
         return 0
 
     if not args.no_build:
