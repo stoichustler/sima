@@ -40,6 +40,10 @@ struct hv_timer console_timer;
 #endif
 #define VM_CONSOLE_RINGBUF_MASK     (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_RINGBUF_CAPACITY (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
+#ifndef CONFIG_VM_CONSOLE_DRAIN_BUDGET
+#define CONFIG_VM_CONSOLE_DRAIN_BUDGET 128U
+#endif
+#define VM_CONSOLE_DRAIN_BUDGET CONFIG_VM_CONSOLE_DRAIN_BUDGET
 #define VM_CONSOLE_DRAIN_BUF_SIZE 1024U
 #define VM_CONSOLE_PREFIX_MAX_SIZE 16U
 #define VM_CONSOLE_EXCEPTION_RINGBUF_SIZE 4096U
@@ -185,6 +189,36 @@ static uint32_t console_ring_queued(uint32_t prod, uint32_t cons, uint32_t capac
 	uint32_t queued = prod - cons;
 
 	return (queued > capacity) ? capacity : queued;
+}
+
+bool console_vm_ring_get_stats(uint16_t vmid, struct console_vm_ring_stats *stats)
+{
+	struct vm_console_ringbuf *rb;
+	uint64_t rflags;
+	bool valid = false;
+
+	if ((stats != NULL) && (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM)) {
+		rb = &vm_console_ringbufs[vmid];
+		spinlock_irqsave_obtain(&rb->lock, &rflags);
+		stats->vmid = vmid;
+		stats->size = CONFIG_VM_CONSOLE_RINGBUF_SIZE;
+		stats->capacity = VM_CONSOLE_RINGBUF_CAPACITY;
+		stats->drain_budget = VM_CONSOLE_DRAIN_BUDGET;
+		stats->queued = console_ring_queued(rb->prod, rb->cons, VM_CONSOLE_RINGBUF_CAPACITY);
+		stats->high_water = rb->high_water;
+		stats->input_bytes = rb->input_bytes;
+		stats->stored_bytes = rb->stored_bytes;
+		stats->drained_bytes = rb->drained_bytes;
+		stats->dropped_bytes = rb->dropped_bytes;
+		stats->overflow_events = rb->overflow_events;
+		stats->last_overflow_tsc = rb->last_overflow_tsc;
+		stats->pending = rb->pending;
+		stats->draining = rb->draining;
+		spinlock_irqrestore_release(&rb->lock, rflags);
+		valid = true;
+	}
+
+	return valid;
 }
 
 void console_vm_exception_log(uint16_t vmid, const char *buf, size_t len)
@@ -500,7 +534,12 @@ static void console_vm_ring_drain_internal(uint16_t vmid)
 	if (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM) {
 		rb = &vm_console_ringbufs[vmid];
 		if (console_vm_ring_drain_begin(rb)) {
-			budget = VM_CONSOLE_RINGBUF_CAPACITY;
+			/*
+			 * Host serial output is synchronous. Keep each timer callback
+			 * short so selecting a chatty Linux VM does not monopolize the
+			 * BEAU shell pCPU while a whole boot-log ring is replayed at once.
+			 */
+			budget = VM_CONSOLE_DRAIN_BUDGET;
 			do {
 				chunk = (budget < VM_CONSOLE_DRAIN_BUF_SIZE) ? budget : VM_CONSOLE_DRAIN_BUF_SIZE;
 				if (chunk == 0U) {

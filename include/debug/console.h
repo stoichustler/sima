@@ -12,6 +12,23 @@
 
 struct acrn_vcpu;
 
+struct console_vm_ring_stats {
+	uint16_t vmid;
+	uint32_t size;
+	uint32_t capacity;
+	uint32_t drain_budget;
+	uint32_t queued;
+	uint32_t high_water;
+	uint64_t input_bytes;
+	uint64_t stored_bytes;
+	uint64_t drained_bytes;
+	uint64_t dropped_bytes;
+	uint64_t overflow_events;
+	uint64_t last_overflow_tsc;
+	bool pending;
+	bool draining;
+};
+
 struct console_vm_exception_stats {
 	uint16_t vmid;
 	uint32_t size;
@@ -58,6 +75,7 @@ bool console_is_vm_active(uint16_t vmid);
 bool console_vm_kick(void);
 bool console_vm_tx_put(uint16_t vmid, char ch);
 void console_vm_ring_drain(uint16_t vmid);
+bool console_vm_ring_get_stats(uint16_t vmid, struct console_vm_ring_stats *stats);
 void console_vm_exception_log(uint16_t vmid, const char *buf, size_t len);
 uint32_t console_vm_exception_count(void);
 bool console_vm_exception_get_stats(uint16_t vmid, struct console_vm_exception_stats *stats);

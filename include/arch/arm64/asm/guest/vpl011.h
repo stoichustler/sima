@@ -14,10 +14,15 @@ struct io_request;
 
 struct arm64_vpl011_debug {
 	uint64_t tx_count;
+	uint64_t tx_irq_count;
+	uint64_t irq_assert_count;
+	uint64_t irq_deassert_count;
 	uint32_t cr;
 	uint32_t imsc;
 	uint32_t ris;
+	uint32_t pending;
 	uint8_t last_tx;
+	bool irq_asserted;
 };
 
 void arm64_vpl011_init_vm(struct acrn_vm *vm);

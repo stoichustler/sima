@@ -1221,6 +1221,7 @@ static int32_t shell_to_vm_console(int32_t argc, char **argv)
 	snprintf(temp_str, TEMP_STR_SIZE, "\r\n──────── [switch to vm-%d shell] ────────\r\n", vm_id);
 	shell_puts(temp_str);
 	console_vmid = vm_id;
+	console_vm_ring_drain(vm_id);
 
 	return 0;
 }

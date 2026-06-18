@@ -242,21 +242,24 @@ boot logs settle to show the `console:\>` prompt.
 - `dumpstat [vm id]` prints all created vCPUs in the VM, including the saved
   ARM64 register image, scheduler state, current-thread status, recent vCPU
   exit reason, recent virtual IRQ injection, recent guest timer programming or
-  injection, a raw guest stack trace from the VM register image, and the host
-  stack saved by the vCPU thread on its bound pCPU. IRQ exits report `ec:n/a`
-  because `ESR_EL2.EC` is only meaningful for synchronous exits. Guest stack
-  entries are raw addresses because BEAU does not embed guest symbol tables. The
-  debug image embeds the BEAU symbol table, so host stack return addresses are
-  printed as `function+offset`. Offline vCPUs skip stack output.
+  injection, VM console-ring/vPL011 counters, a raw guest stack trace from the
+  VM register image, and the host stack saved by the vCPU thread on its bound
+  pCPU. IRQ exits report `ec:n/a` because `ESR_EL2.EC` is only meaningful for
+  synchronous exits. Guest stack entries are raw addresses because BEAU does not
+  embed guest symbol tables. The debug image embeds the BEAU symbol table, so
+  host stack return addresses are printed as `function+offset`. Offline vCPUs
+  skip stack output.
 - ARM64 host exception call traces resolve return addresses through the
   embedded BEAU symbol table and print `function+offset` beside the raw LR.
 - VM vPL011 TX output from the currently selected `vsh` VM is written into a
   Xen-style per-VM async console ring buffer, using monotonic producer/consumer
   indexes and a 4KB power-of-two data area with 4095 bytes of usable capacity.
-  The console timer path runs every 10ms and drains it to the host serial
-  console in bounded batches, so guest PL011 writes no longer wait for host
-  serial output. The ring is internal only; there is no shell command for
-  changing console output mode or reading normal console-ring stats.
+  The console timer path runs every 10ms and drains up to
+  `CONFIG_VM_CONSOLE_DRAIN_BUDGET` bytes, default 128, to the host serial
+  console per pass, so guest PL011 writes no longer wait for host serial output
+  and `vsh 2` does not synchronously replay a full Linux boot-log ring at once.
+  `dumpstat [vm id]` reports the current VM console-ring queued bytes,
+  high-water mark, drops, overflow count, drain budget, and draining state.
 - Non-selected VM console output is not replayed into the BEAU shell.
 - VM exception logs have a separate 4KB/4095-byte per-VM ring reserved for VM
   trap/oops capture. The ring is internal debug plumbing and is no longer
@@ -267,6 +270,12 @@ boot logs settle to show the `console:\>` prompt.
   - Backend notification is routed through `vuart_notify_rx()` instead of direct
     console-to-vPL011 calls.
 - ARM64 vPL011 vio for guest PL011 MMIO and RX interrupt notification.
+- ARM64 vPL011 avoids running the vGIC level-deassert path for ordinary PL011
+  polling reads, especially Linux's frequent `FR` reads around console output.
+  RX reads, interrupt status reads, interrupt-mask writes, interrupt clears, and
+  newly raised TX-ready state still update the virtual IRQ line. `dumpstat [vm
+  id]` prints vPL011 TX bytes, TX-ready raises, current `CR/IMSC/RIS/pending`
+  state, last TX byte, and virtual IRQ assert/deassert counts.
 - Initial vGICv3 model:
   - VM and vCPU vGIC state.
   - ICH LR save/load/sync/flush.
@@ -612,8 +621,11 @@ virtualization port.
 
 1. Add repeated cold-boot and root-shell coverage for VM2 Linux 4-vCPU/SMP,
    with diagnostics for timer, SGI, and pending/active LR state on failures.
-2. Harden PL011 RX/TX interrupt behavior for Linux after the real console
-   driver takes over.
+2. Validate the bounded console drain and vPL011 IRQ-line throttling against
+   `vsh 2` handoff smoothness. If VM2 is still visibly slow, capture
+   `dumpstat 2`, `irqstat`, and `schedstat`, then compare console-ring
+   `queued/high/dropped` with vPL011 `txirq/assert/deassert` and the VM2 guest
+   UART IRQ count before changing vGICv3, vtimer, or vCPU-exit code.
 3. Extend `scripts/regress.py` with more VM2 Linux root-shell commands, reboot
    coverage, repeated cold boots, and saved log artifacts suitable for CI.
 4. Audit ARM64 abort handling to confirm whether guest instruction aborts are
