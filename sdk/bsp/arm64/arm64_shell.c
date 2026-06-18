@@ -965,21 +965,21 @@ static void shell_dumpstat_timer_state(const struct dumpstat_snapshot *snapshot)
 	} else {
 		shell_item_line("  vgic:none");
 	}
-	shell_item_line(" cpuif:vmcr:0x%016lx hcr:0x%016lx ctlr:0x%016lx",
+	shell_item_line(" cpuif:vmcr:0x%016lx hcr:0x%016lx     ctlr:0x%016lx",
 		snapshot->vgic_ctx.vmcr, snapshot->vgic_ctx.hcr, snapshot->vgic_ctx.ctlr);
-	shell_item_line("       sre:0x%016lx pmr:0x%016lx used_lrs:%u",
+	shell_item_line("        sre:0x%016lx pmr:0x%016lx used_lrs:%u",
 		snapshot->vgic_ctx.sre, snapshot->vgic_ctx.pmr, snapshot->vgic_ctx.used_lrs);
 	if (snapshot->has_live_timer) {
-		shell_item_line("       live_hcr:0x%016lx live_vmcr:0x%016lx misr:0x%016lx",
+		shell_item_line("         live_hcr:0x%016lx  live_vmcr:0x%016lx misr:0x%016lx",
 			snapshot->live_ich_hcr_el2, snapshot->live_ich_vmcr_el2,
 			snapshot->live_ich_misr_el2);
-		shell_item_line("       eisr:0x%016lx elrsr:0x%016lx",
+		shell_item_line("             eisr:0x%016lx      elrsr:0x%016lx",
 			snapshot->live_ich_eisr_el2, snapshot->live_ich_elrsr_el2);
 		shell_item_line("       live_ap0r0:0x%016lx live_ap1r0:0x%016lx",
 			snapshot->live_ich_ap0r0_el2, snapshot->live_ich_ap1r0_el2);
-		shell_item_line("       live_lr0:0x%016lx live_lr1:0x%016lx",
+		shell_item_line("         live_lr0:0x%016lx   live_lr1:0x%016lx",
 			snapshot->live_ich_lr[0U], snapshot->live_ich_lr[1U]);
-		shell_item_line("       live_lr2:0x%016lx live_lr3:0x%016lx",
+		shell_item_line("         live_lr2:0x%016lx   live_lr3:0x%016lx",
 			snapshot->live_ich_lr[2U], snapshot->live_ich_lr[3U]);
 		shell_item_line("       live_icc:pmr:0x%016lx ctlr:0x%016lx sre:0x%016lx igrpen1:0x%016lx",
 			snapshot->live_icc_pmr_el1, snapshot->live_icc_ctlr_el1,
