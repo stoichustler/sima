@@ -184,7 +184,7 @@ For VM/scheduler/console changes, validate:
    logs.
 6. `vsh 1` reaches `beau ~>`.
 7. `vsh 2` reaches the Linux initramfs `uos` root shell and `id` reports
-   `uid=0(root)`.
+   `uid=0`.
 8. Ctrl-D returns to BEAU shell.
 9. No `[cut here]`, `unexpected arm64 trap`, or host unexpected IRQ appears.
 

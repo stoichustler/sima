@@ -119,6 +119,21 @@ void vuart_putchar(struct acrn_vuart *vu, char ch)
 	release_vuart_lock(vu, rflags);
 }
 
+bool vuart_try_putchar(struct acrn_vuart *vu, char ch)
+{
+	uint64_t rflags;
+	bool stored = false;
+
+	obtain_vuart_lock(vu, rflags);
+	if (!fifo_isfull(&vu->rxfifo)) {
+		fifo_putchar(&vu->rxfifo, ch);
+		stored = true;
+	}
+	release_vuart_lock(vu, rflags);
+
+	return stored;
+}
+
 char vuart_getchar(struct acrn_vuart *vu)
 {
 	uint64_t rflags;
@@ -174,6 +189,18 @@ bool vuart_rx_pending(struct acrn_vuart *vu)
 	pending = (fifo_numchars(&vu->rxfifo) > 0U);
 	release_vuart_lock(vu, rflags);
 	return pending;
+}
+
+uint32_t vuart_rx_numchars(struct acrn_vuart *vu)
+{
+	uint64_t rflags;
+	uint32_t count;
+
+	obtain_vuart_lock(vu, rflags);
+	count = fifo_numchars(&vu->rxfifo);
+	release_vuart_lock(vu, rflags);
+
+	return count;
 }
 
 void vuart_set_backend(struct acrn_vuart *vu, const struct vuart_backend_ops *ops)

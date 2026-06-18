@@ -77,6 +77,19 @@ def parse_args():
     parser.add_argument("--log", default=ROOT / "out/qemu_out/regress.log", type=relpath)
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--stress-vsh-switch",
+        action="store_true",
+        help="Run the VM console switch/Enter pressure sequence after the standard smoke checks.",
+    )
+    parser.add_argument("--stress-rounds", type=int, default=4)
+    parser.add_argument("--stress-enters", type=int, default=80)
+    parser.add_argument("--stress-enter-delay", type=float, default=0.0)
+    parser.add_argument(
+        "--no-terminal-replies",
+        action="store_true",
+        help="Do not synthesize terminal responses such as CPR replies for VM shells.",
+    )
     args, extra = parser.parse_known_args()
     if extra[:1] == ["--"]:
         extra = extra[1:]
@@ -137,6 +150,7 @@ class QemuSession:
         self.log_path = log_path
         self.timeout = timeout
         self.output = ""
+        self.cpr_scan_offset = 0
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.decoder_finalized = False
         self.proc = None
@@ -192,7 +206,25 @@ class QemuSession:
             if not data:
                 return
             self.output += self.decoder.decode(data)
+            if not getattr(self, "disable_terminal_replies", False):
+                self.reply_terminal_queries()
             self.check_fatal()
+
+    def reply_terminal_queries(self):
+        pending = self.output[self.cpr_scan_offset:]
+        if "\x1b[6n" in pending:
+            self.send("\x1b[1;1R")
+        self.cpr_scan_offset = len(self.output)
+
+    def drain_for(self, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"QEMU exited early with status {self.proc.returncode}")
+            before = len(self.output)
+            self.read_some(deadline)
+            if len(self.output) == before:
+                time.sleep(0.005)
 
     def drain_after_fatal(self):
         deadline = time.monotonic() + FATAL_DRAIN_TIMEOUT
@@ -263,11 +295,80 @@ class QemuSession:
         try:
             self.send(CTRL_D)
             self.expect(PROMPT, f"return to BEAU shell for {label}", timeout=5.0, keepalive=ENTER)
-            for line in ("vcpus", "schedstat", "irqstat", f"dumpstat {vmid}"):
+            for line in ("vcpus", "schedstat", "irqstat", f"constat {vmid}", f"dumpstat {vmid}"):
                 self.send(line + ENTER)
                 self.expect(PROMPT, f"{line} diagnostics", timeout=15.0, keepalive=ENTER)
         except Exception as err:
             print(f"[regress] diagnostics failed: {err}", flush=True)
+
+
+def vsh_enter(qemu, vmid, prompt, name, timeout=30.0):
+    qemu.send(f"vsh {vmid}" + ENTER)
+    try:
+        qemu.expect(prompt, name, timeout=timeout, keepalive=ENTER)
+    except Exception:
+        qemu.capture_vm_diagnostics(name, vmid)
+        raise
+
+
+def vsh_return(qemu, name):
+    qemu.send(CTRL_D)
+    qemu.expect(PROMPT, name, timeout=10.0, keepalive=ENTER)
+
+
+def send_enter_burst(qemu, count, delay, name):
+    print(f"[regress] stress: {name}: {count} Enter keys", flush=True)
+    for idx in range(max(0, count)):
+        qemu.send(ENTER)
+        if delay > 0.0:
+            qemu.drain_for(delay)
+        elif (idx + 1) % 16 == 0:
+            qemu.drain_for(0.02)
+    qemu.drain_for(0.2)
+
+
+def expect_vm2_id(qemu, name):
+	qemu.send("id" + ENTER)
+	try:
+		qemu.expect("gid=0", name, timeout=20.0, keepalive=ENTER)
+	except Exception:
+		qemu.capture_vm_diagnostics(name, 2)
+		raise
+
+
+def run_vsh_switch_stress(qemu, args):
+    if args.stress_rounds < 1:
+        return
+
+    vsh_enter(qemu, 2, LINUX_PROMPT, "stress VM2 Linux shell", timeout=30.0)
+    send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay, "VM2 initial")
+    expect_vm2_id(qemu, "VM2 Linux identity after initial Enter burst")
+    vsh_return(qemu, "return from stress VM2 initial")
+
+    vsh_enter(qemu, 1, "beau ~>", "stress VM1 LK shell")
+    send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay, "VM1 LK")
+    vsh_return(qemu, "return from stress VM1")
+
+    for idx in range(args.stress_rounds):
+        label = idx + 1
+        vsh_enter(qemu, 0, "zero ~>", f"stress round {label}: VM0 Zephyr shell")
+        send_enter_burst(qemu, max(1, args.stress_enters // 4),
+            args.stress_enter_delay, f"round {label} VM0")
+        vsh_return(qemu, f"stress round {label}: return from VM0")
+
+        vsh_enter(qemu, 1, "beau ~>", f"stress round {label}: VM1 LK shell")
+        send_enter_burst(qemu, max(1, args.stress_enters // 4),
+            args.stress_enter_delay, f"round {label} VM1")
+        vsh_return(qemu, f"stress round {label}: return from VM1")
+
+        vsh_enter(qemu, 2, LINUX_PROMPT, f"stress round {label}: VM2 Linux shell",
+            timeout=30.0)
+        send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay,
+            f"round {label} VM2")
+        expect_vm2_id(qemu, f"stress round {label}: VM2 identity after switch")
+        vsh_return(qemu, f"stress round {label}: return from VM2")
+
+    print("[pass] VM console switch stress complete", flush=True)
 
 
 def run_qemu(args, cmd):
@@ -282,6 +383,7 @@ def run_qemu(args, cmd):
 
     print(f"[regress] qemu: {quote(cmd)}", flush=True)
     with QemuSession(cmd, args.log, args.timeout) as qemu:
+        qemu.disable_terminal_replies = args.no_terminal_replies
         qemu.expect(PROMPT, "BEAU shell prompt", keepalive=ENTER)
         qemu.command("vcpus", ["vmid", "vcpu", "pcpu_mode", "isolate", "shared", "switches", "since.us"])
         qemu.command("schedstat", [
@@ -312,7 +414,7 @@ def run_qemu(args, cmd):
                 "├─  guest stack symbols:none",
                 "├─  host stack symbols:beau",
                 "│   pcpu:",
-                "source:vcpu-thread",
+                "from vcpu",
                 "+0x",
             ],
             ["depth:", "vcpu saved stack", "vcpu vm stack", "host stack source:", "fp   0x",
@@ -335,10 +437,12 @@ def run_qemu(args, cmd):
         except Exception:
             qemu.capture_vm_diagnostics("VM2 Linux initramfs shell timeout", 2)
             raise
-        qemu.send("id" + ENTER)
-        qemu.expect("uid=0(root)", "VM2 Linux root identity", timeout=10.0)
+        expect_vm2_id(qemu, "VM2 Linux root identity")
         qemu.send(CTRL_D)
         qemu.expect(PROMPT, "return from VM2 shell")
+
+        if args.stress_vsh_switch:
+            run_vsh_switch_stress(qemu, args)
 
     print(f"[pass] regression complete; log: {args.log}", flush=True)
 
@@ -352,7 +456,10 @@ def main():
         if not args.no_build:
             print(render(build, args.toolchains))
         print(quote(qemu))
-        print("checks: prompt, vcpus, schedstat, vmap, irqstat, vsh 0, ctrl-d, vsh 1, ctrl-d, vsh 2, Linux initramfs shell")
+        checks = "prompt, vcpus, schedstat, vmap, irqstat, vsh 0, ctrl-d, vsh 1, ctrl-d, vsh 2, Linux initramfs shell"
+        if args.stress_vsh_switch:
+            checks += ", VM console switch/Enter stress"
+        print(f"checks: {checks}")
         return 0
 
     if not args.no_build:

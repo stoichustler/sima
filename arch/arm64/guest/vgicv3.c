@@ -18,6 +18,7 @@
 #include <timer.h>
 #include <asm/platform.h>
 #include <asm/sysreg.h>
+#include <asm/trap.h>
 #include <asm/guest/vgicv3.h>
 
 /*
@@ -72,19 +73,18 @@
  * The Linux virtual timer has a related post-boot diagnostic signature: EL2 can
  * show an expired, host-masked CNTV source and a pending-only timer LR while
  * Linux reports that RCU timer wakeups did not happen. Do not solve this by
- * marking pending-only timer LRs for EOI maintenance: Linux can EOI such an LR
- * before the timer line has been lowered, causing EL2 to resample the still-high
- * CNTV source and immediately rebuild the same LR in a maintenance storm. Timer
- * repair must instead keep the CNTV line model and host mask in sync when EL2
- * already owns an in-flight timer LR. The timer LR should stay Pending-only
- * until EL1 actually acknowledges it; manufacturing Active+Pending would model
- * a completed acknowledge and can leave Linux past WFI but before first timer
- * delivery.
+ * marking every pending-only timer LR for EOI maintenance: Linux can EOI such an
+ * LR before the timer line has been lowered, causing EL2 to resample the
+ * still-high CNTV source and immediately rebuild the same LR in a maintenance
+ * storm. Timer repair must instead keep the CNTV line model and host mask in
+ * sync when EL2 already owns an in-flight timer LR. The timer LR should stay
+ * Pending-only until EL1 actually acknowledges it; manufacturing
+ * Active+Pending would model a completed acknowledge and can leave Linux past
+ * WFI but before first timer delivery.
  */
 #define BIT32(n)			(1U << (n))
 
 #define VGIC_VTIMER_STUCK_RESCUE_US	500U
-
 #define VGICD_CTLR			0x0000U
 #define VGICD_TYPER			0x0004U
 #define VGICD_IIDR			0x0008U
@@ -484,6 +484,7 @@ static void vgicv3_disarm_vtimer_backup(struct acrn_vcpu *vcpu)
 			del_timer(&vcpu->arch.vtimer_backup);
 		}
 		update_timer(&vcpu->arch.vtimer_backup, 0UL, 0UL);
+		vcpu->arch.vtimer_stuck_rescue_armed = false;
 	}
 }
 
@@ -503,6 +504,7 @@ static void vgicv3_arm_vtimer_backup(struct acrn_vcpu *vcpu)
 		return;
 	}
 
+	vcpu->arch.vtimer_stuck_rescue_armed = false;
 	gctx = &vcpu->arch.gctx;
 	deadline = vgic_vtimer_host_deadline(gctx);
 	if (!vgic_vtimer_guest_enabled(gctx) || ((int64_t)(deadline - cpu_ticks()) <= 0L)) {
@@ -526,8 +528,7 @@ static void vgicv3_arm_vtimer_stuck_rescue(struct acrn_vcpu *vcpu)
 	if ((vcpu == NULL) || !vcpu->arch.vtimer_backup_initialized) {
 		return;
 	}
-
-	if (timer_is_started(&vcpu->arch.vtimer_backup)) {
+	if (vcpu->arch.vtimer_stuck_rescue_armed) {
 		return;
 	}
 
@@ -536,23 +537,25 @@ static void vgicv3_arm_vtimer_stuck_rescue(struct acrn_vcpu *vcpu)
 	 * nudge so the current vCPU re-enters the normal sync/flush request path.
 	 */
 	deadline = cpu_ticks() + us_to_ticks(VGIC_VTIMER_STUCK_RESCUE_US);
+	if (timer_is_started(&vcpu->arch.vtimer_backup)) {
+		del_timer(&vcpu->arch.vtimer_backup);
+	}
 	update_timer(&vcpu->arch.vtimer_backup, deadline, 0UL);
 	if (add_timer(&vcpu->arch.vtimer_backup) != 0) {
 		update_timer(&vcpu->arch.vtimer_backup, 0UL, 0UL);
+		vcpu->arch.vtimer_stuck_rescue_armed = false;
+	} else {
+		vcpu->arch.vtimer_stuck_rescue_armed = true;
 	}
 }
 
 static void vgicv3_arm_vtimer_wfi_rescue(struct acrn_vcpu *vcpu)
 {
 	/*
-	 * Once the WFI rescue has rebuilt a pending timer LR, leave EL1 to run
-	 * through the idle return path and unmask IRQs. Re-arming TWI here can
-	 * trap the guest back at the WFI return PC before it reaches daifclr.
+	 * A pending-only timer LR can wake Linux from WFI while PSTATE.I is still
+	 * set. If the guest loops back into WFI before reaching daifclr, the backup
+	 * detector must be able to re-arm TWI even after the first LR rescue.
 	 */
-	if (vcpu->arch.vtimer_lr_rescue) {
-		return;
-	}
-
 	vcpu->arch.vtimer_wfi_rescue = true;
 	vcpu->arch.gctx.hcr_el2 |= HCR_TWI;
 	if (get_running_vcpu(get_pcpu_id()) == vcpu) {
@@ -564,7 +567,12 @@ static void vgicv3_keep_vtimer_rescue(struct acrn_vcpu *vcpu)
 {
 	vcpu->arch.vtimer_wfi_rescue = false;
 	vcpu->arch.vtimer_lr_rescue = true;
-	vcpu->arch.gctx.hcr_el2 &= ~HCR_TWI;
+	/*
+	 * Keep trapping WFI while EL2 is preserving a pending-only timer LR for an
+	 * expired CNTV source. The clear path disables TWI once the timer line drops
+	 * or guest EOI proves the interrupt has completed.
+	 */
+	vcpu->arch.gctx.hcr_el2 |= HCR_TWI;
 	if (get_running_vcpu(get_pcpu_id()) == vcpu) {
 		write_hcr_el2(vcpu->arch.gctx.hcr_el2);
 	}
@@ -590,6 +598,7 @@ static void vgicv3_vtimer_backup_handler(void *data)
 	if ((vcpu == NULL) || (vcpu->vm == NULL) || (vcpu->state != VCPU_RUNNING)) {
 		return;
 	}
+	vcpu->arch.vtimer_stuck_rescue_armed = false;
 	if (get_running_vcpu(get_pcpu_id()) == vcpu) {
 		struct arm64_vgicv3 *vgic = &vcpu->vm->arch_vm.vgic;
 		uint64_t flags;
@@ -607,8 +616,6 @@ static void vgicv3_vtimer_backup_handler(void *data)
 		arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_BACKUP, virq,
 			ctl, vgic_vtimer_guest_cval(gctx), false, false);
 		vgicv3_arm_vtimer_wfi_rescue(vcpu);
-		vcpu_make_request(vcpu, ARM64_VCPU_REQUEST_EVENT);
-		signal_event(&vcpu->events[ARM64_VCPU_EVENT_VIRTUAL_INTERRUPT]);
 		return;
 	}
 
@@ -1746,12 +1753,12 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 			}
 
 			/*
-			 * LR pending is already resident in the virtual CPU interface.
-			 * Mirroring it back into the software pending bitmap makes flush
-			 * continuously rebuild the same active+pending LR, so keep the
-			 * bitmap for IRQs that still need an LR slot.
+			 * Edge pending is a delivery credit and can be consumed once it is
+			 * resident in an LR. Level pending is the sampled device line; keep
+			 * it set until the device deassert path lowers the line.
 			 */
-			if (lr_pending || !lr_active || !desc->level || !desc->pending) {
+			if (!desc->level &&
+				(lr_pending || !lr_active || !desc->pending)) {
 				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id, desc, false);
 			}
 			desc->active = lr_active;
@@ -1776,6 +1783,31 @@ void arm64_vgicv3_sync_current_vcpu(struct acrn_vcpu *vcpu)
 {
 	if ((vcpu != NULL) && (vcpu->vm != NULL) && vcpu->vm->arch_vm.vgic.initialized) {
 		vgicv3_sync_vcpu(vcpu, true);
+	}
+}
+
+void arm64_vgicv3_refresh_current_level_irq(struct acrn_vm *vm, uint32_t virq)
+{
+	struct acrn_vcpu *vcpu = get_running_vcpu(get_pcpu_id());
+
+	if ((vm != NULL) && (vcpu != NULL) && (vcpu->vm == vm) &&
+		(virq < ARM64_VGIC_IRQ_NUM) && vm->arch_vm.vgic.initialized) {
+		struct arm64_vgicv3 *vgic = &vm->arch_vm.vgic;
+		struct arm64_vgic_irq *desc;
+		uint64_t flags;
+
+		spinlock_irqsave_obtain(&vgic->lock, &flags);
+		desc = vgic_irq_desc(vcpu, virq);
+		if ((desc != NULL) && desc->level && desc->pending) {
+			/*
+			 * A device line that is still high may need an active LR to become
+			 * active+pending after a guest MMIO exit, but it does not need a
+			 * fresh vCPU event request or remote wakeup.
+			 */
+			vgicv3_sync_vcpu(vcpu, true);
+			vgicv3_flush_vcpu(vcpu, true);
+		}
+		spinlock_irqrestore_release(&vgic->lock, flags);
 	}
 }
 
@@ -1857,9 +1889,10 @@ bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu)
 	}
 
 	/*
-	 * Software pending bits are not enough by themselves; the distributor,
-	 * virtual CPU interface, and interrupt enable state must all allow
-	 * delivery before WFI should behave as if an interrupt can wake it now.
+	 * Software pending bits for edge-like interrupts are delivery credits that
+	 * still need an LR. Ordinary level pending mirrors the device line; it
+	 * should wake WFI only while it still needs an LR slot, not while an active
+	 * LR already owns guest-visible progress.
 	 */
 	for (word = 0U; !pending && (word < ARM64_VGIC_WORDS); word++) {
 		uint32_t bits = vgic->pending_bitmap[vcpu->vcpu_id][word];
@@ -1870,7 +1903,8 @@ bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu)
 			struct arm64_vgic_irq *desc = &vgic->irq[vcpu->vcpu_id][virq];
 
 			bits &= ~BIT32(bit);
-			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc)) {
+			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc) &&
+				(!desc->level || (find_lr_for_virq(vcpu, virq) < 0))) {
 				pending = true;
 				break;
 			}
@@ -1894,6 +1928,90 @@ bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu)
 	spinlock_irqrestore_release(&vgic->lock, flags);
 
 	return pending;
+}
+
+static bool vgicv3_pending_lr_blocks_reschedule(const struct acrn_vcpu *vcpu,
+	uint64_t lr)
+{
+	uint32_t virq = lr_vintid(lr);
+	uint32_t state = lr_state(lr);
+	bool blocks = (state & ICH_LR_STATE_PENDING) != 0U;
+
+	if (blocks && vcpu->arch.vtimer_lr_rescue && vgic_is_vtimer_irq(vcpu, virq) &&
+		((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL)) {
+		/*
+		 * A rescued pending-only timer LR may be visible for many WFI retry
+		 * windows while Linux keeps PSTATE.I set. Treat it as guest progress
+		 * for WFI, but do not let that single timer line monopolize the host
+		 * pCPU and starve sibling VMs or later UART/SGI requests.
+		 */
+		blocks = false;
+	}
+
+	return blocks;
+}
+
+bool arm64_vgicv3_pending_irq_blocks_reschedule(struct acrn_vcpu *vcpu)
+{
+	struct arm64_vgicv3 *vgic;
+	struct arm64_vgicv3_vcpu_ctx *ctx;
+	uint64_t flags;
+	uint32_t idx;
+	uint32_t word;
+	bool blocks = false;
+
+	if ((vcpu == NULL) || (vcpu->vm == NULL) || !vcpu->vm->arch_vm.vgic.initialized) {
+		return false;
+	}
+
+	vgic = &vcpu->vm->arch_vm.vgic;
+	ctx = &vcpu->arch.vgic;
+	spinlock_irqsave_obtain(&vgic->lock, &flags);
+	for (idx = 0U; idx < ctx->used_lrs; idx++) {
+		if (vgicv3_pending_lr_blocks_reschedule(vcpu, ctx->lr[idx])) {
+			blocks = true;
+			break;
+		}
+	}
+
+	for (word = 0U; !blocks && (word < ARM64_VGIC_WORDS); word++) {
+		uint32_t bits = vgic->pending_bitmap[vcpu->vcpu_id][word];
+
+		while (bits != 0U) {
+			uint32_t bit = (uint32_t)ffs64((uint64_t)bits);
+			uint32_t virq = (word * 32U) + bit;
+			struct arm64_vgic_irq *desc = &vgic->irq[vcpu->vcpu_id][virq];
+			bool timer_rescue = vcpu->arch.vtimer_lr_rescue &&
+				vgic_is_vtimer_irq(vcpu, virq) &&
+				((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL);
+
+			bits &= ~BIT32(bit);
+			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc) &&
+				(!desc->level || (find_lr_for_virq(vcpu, virq) < 0)) &&
+				!timer_rescue) {
+				blocks = true;
+				break;
+			}
+		}
+	}
+	for (word = 0U; vgic->its_enabled && !blocks && (word < ARM64_VGIC_LPI_WORDS); word++) {
+		uint32_t bits = vgic->lpi_pending_bitmap[vcpu->vcpu_id][word];
+
+		while (bits != 0U) {
+			uint32_t bit = (uint32_t)ffs64((uint64_t)bits);
+			uint32_t lpi = ARM64_VGIC_LPI_BASE + (word * 32U) + bit;
+			struct arm64_vgic_irq *desc = &vgic->lpi[vcpu->vcpu_id][lpi - ARM64_VGIC_LPI_BASE];
+
+			bits &= ~BIT32(bit);
+			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc)) {
+				blocks = true;
+				break;
+			}
+		}
+	}
+	spinlock_irqrestore_release(&vgic->lock, flags);
+
+	return blocks;
 }
 
 static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
@@ -1940,11 +2058,13 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 			if (lr_idx >= 0) {
 				/*
 				 * If the IRQ already has an LR slot, refresh it from descriptor
-				 * state. Level timer state stays pending while CNTV is asserted;
-				 * the dedicated timer sync paths clear it after the source lowers.
+				 * state. Level IRQ state stays pending while the source line is
+				 * asserted; the device deassert path clears it after the source
+				 * lowers. The virtual timer has extra live-CNTV sampling, but it
+				 * follows the same pending-as-level-line rule here.
 				 */
 				ctx->lr[lr_idx] = make_vtimer_lr(vcpu, desc);
-				if (!desc->level || !vgic_is_vtimer_irq(vcpu, virq)) {
+				if (!desc->level) {
 					vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
 				}
 				continue;
@@ -1957,7 +2077,7 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 
 			ctx->lr[ctx->used_lrs] = make_vtimer_lr(vcpu, desc);
 			ctx->used_lrs++;
-			if (!desc->level || !vgic_is_vtimer_irq(vcpu, virq)) {
+			if (!desc->level) {
 				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
 			}
 		}

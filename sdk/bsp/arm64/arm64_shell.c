@@ -18,10 +18,15 @@
 #include <vcpu.h>
 #include <host_pm.h>
 #include <schedule.h>
+#include <console.h>
+#include <vuart.h>
 #include <debug/symbol.h>
 #include <asm/mmu.h>
 #include <asm/platform.h>
 #include <asm/guest/vcpu.h>
+#include <asm/guest/vgicv3.h>
+#include <asm/guest/vpl011.h>
+#include <asm/sysreg.h>
 #include "../shell_priv.h"
 
 #define SHELL_CMD_MEM_MAP		"vmap"
@@ -30,6 +35,9 @@
 #define SHELL_CMD_DUMPSTAT		"dumpstat"
 #define SHELL_CMD_DUMPSTAT_PARAM	"[vm id]"
 #define SHELL_CMD_DUMPSTAT_HELP		"dump arm64 vm registers, raw guest stack, and host stack"
+#define SHELL_CMD_CONSTAT		"constat"
+#define SHELL_CMD_CONSTAT_PARAM		"[vm id]"
+#define SHELL_CMD_CONSTAT_HELP		"dump vm console and vpl011 state"
 #define SHELL_CMD_REBOOT		"reboot"
 #define SHELL_CMD_REBOOT_PARAM		NULL
 #define SHELL_CMD_REBOOT_HELP		"trigger a system reboot (immediately)"
@@ -48,6 +56,7 @@
 
 static int32_t shell_list_mem(__unused int32_t argc, __unused char **argv);
 static int32_t shell_dumpstat(int32_t argc, char **argv);
+static int32_t shell_constat(int32_t argc, char **argv);
 static int32_t shell_reboot(__unused int32_t argc, __unused char **argv);
 
 struct shell_cmd arch_shell_cmds[] = {
@@ -62,6 +71,12 @@ struct shell_cmd arch_shell_cmds[] = {
 		.cmd_param	= SHELL_CMD_DUMPSTAT_PARAM,
 		.help_str	= SHELL_CMD_DUMPSTAT_HELP,
 		.fcn		= shell_dumpstat,
+	},
+	{
+		.str		= SHELL_CMD_CONSTAT,
+		.cmd_param	= SHELL_CMD_CONSTAT_PARAM,
+		.help_str	= SHELL_CMD_CONSTAT_HELP,
+		.fcn		= shell_constat,
 	},
 	{
 		.str		= SHELL_CMD_REBOOT,
@@ -251,7 +266,7 @@ static void shell_dumpstat_regs(const struct cpu_regs *regs)
 
 static const char *shell_yes_no(bool value)
 {
-	return value ? "yes" : "no";
+	return value ? "Y" : "N";
 }
 
 static const char *shell_exit_source_to_str(uint32_t source)
@@ -395,7 +410,7 @@ static void shell_dumpstat_vgic_event(const char *label,
 	if (last->tsc == 0UL) {
 		shell_item_line("%s:none", label);
 	} else {
-		shell_item_line("%s:source:%s count:%u used_lrs:%u tsc:0x%lx",
+		shell_item_line("%s:source:%s count:%u used_lrs:%u tsc:0x%08lx",
 			label, shell_vgic_source_to_str(last->source),
 			last->count, last->used_lrs, last->tsc);
 		shell_item_line("       misr:0x%016lx eisr:0x%016lx elrsr:0x%016lx",
@@ -423,11 +438,11 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 		shell_item_line(" exit:none");
 	} else {
 		if (last_exit->ec == ARM64_VCPU_DEBUG_EXIT_EC_INVALID) {
-			shell_item_line(" exit:source:%s ec:N/A status:%d tsc:0x%lx",
+			shell_item_line(" exit:source:%s ec:N/A status:%d tsc:0x%08lx",
 				shell_exit_source_to_str(last_exit->source),
 				last_exit->status, last_exit->tsc);
 		} else {
-			shell_item_line(" exit:source:%s ec:0x%x status:%d tsc:0x%lx",
+			shell_item_line(" exit:source:%s ec:0x%x status:%d tsc:0x%08lx",
 				shell_exit_source_to_str(last_exit->source),
 				last_exit->ec, last_exit->status, last_exit->tsc);
 		}
@@ -443,7 +458,7 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 	if (last_irq->tsc == 0UL) {
 		shell_item_line("  irq:none");
 	} else {
-		shell_item_line("  irq:virq:%u level:%s source-vcpu:%hu target-vcpu:%hu status:%d tsc:0x%lx",
+		shell_item_line("  irq:virq:%u level:%s source-vcpu:%hu target-vcpu:%hu status:%d tsc:0x%08lx",
 			last_irq->virq, shell_yes_no(last_irq->level),
 			last_irq->source_vcpu_id, last_irq->target_vcpu_id,
 			last_irq->status, last_irq->tsc);
@@ -452,7 +467,7 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 	if (last_timer->tsc == 0UL) {
 		shell_item_line("timer:none");
 	} else {
-		shell_item_line("timer:virq:%u sysreg:0x%x write:%s injected:%s status:%d tsc:0x%lx",
+		shell_item_line("timer:virq:%u sysreg:0x%x write:%s injected:%s status:%d tsc:0x%08lx",
 			last_timer->virq, last_timer->sysreg,
 			shell_yes_no(last_timer->write), shell_yes_no(last_timer->injected),
 			last_timer->status, last_timer->tsc);
@@ -463,7 +478,7 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 	if (last_sgi->tsc == 0UL) {
 		shell_item_line("  sgi:none");
 	} else {
-		shell_item_line("  sgi:intid:%u source-vcpu:%hu target-mask:0x%04x delivered:0x%04x status:%d tsc:0x%lx",
+		shell_item_line("  sgi:intid:%u source-vcpu:%hu target-mask:0x%04x delivered:0x%04x status:%d tsc:0x%08lx",
 			last_sgi->intid, last_sgi->source_vcpu_id,
 			last_sgi->target_mask, last_sgi->delivered_mask,
 			last_sgi->status, last_sgi->tsc);
@@ -473,7 +488,7 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 	if (last_sgi_target->tsc == 0UL) {
 		shell_item_line("sgi-target:none");
 	} else {
-		shell_item_line("sgi-target:intid:%u source-vcpu:%hu target-vcpu:%hu status:%d request:%s running:%s current:%s tsc:0x%lx",
+		shell_item_line("sgi-target:intid:%u source-vcpu:%hu target-vcpu:%hu status:%d request:%s running:%s current:%s tsc:0x%08lx",
 			last_sgi_target->intid, last_sgi_target->source_vcpu_id,
 			last_sgi_target->target_vcpu_id, last_sgi_target->status,
 			shell_yes_no(last_sgi_target->request_pending),
@@ -497,7 +512,7 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 	if (last_psci->tsc == 0UL) {
 		shell_item_line(" psci:none");
 	} else {
-		shell_item_line(" psci:fn:0x%x source-vcpu:%hu target-vcpu:%hu ret:%ld tsc:0x%lx",
+		shell_item_line(" psci:fn:0x%x source-vcpu:%hu target-vcpu:%hu ret:%ld tsc:0x%08lx",
 			last_psci->fn, last_psci->source_vcpu_id,
 			last_psci->target_vcpu_id, last_psci->ret, last_psci->tsc);
 		shell_item_line("      mpidr:0x%016lx entry:0x%016lx context:0x%016lx",
@@ -511,7 +526,7 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 		 * The trapped ICC access is the guest-visible lifecycle command that
 		 * can explain why a live LR stayed active, pending, or disabled.
 		 */
-		shell_item_line("cpuif-access:%s read:%s value:0x%016lx status:%d tsc:0x%lx",
+		shell_item_line("cpuif-access:%s read:%s value:0x%016lx status:%d tsc:0x%08lx",
 			shell_cpuif_sysreg_to_str(last_cpuif->sysreg),
 			shell_yes_no(last_cpuif->read), last_cpuif->value,
 			last_cpuif->status, last_cpuif->tsc);
@@ -520,7 +535,7 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 	if (last_wfx->tsc == 0UL) {
 		shell_item_line("  wfx:none");
 	} else {
-		shell_item_line("  wfx:type:%s pending:%s irq-masked:%s request:%s yield:%s tsc:0x%lx",
+		shell_item_line("  wfx:type:%s pending:%s irq-masked:%s request:%s yield:%s tsc:0x%08lx",
 			last_wfx->is_wfe ? "wfe" : "wfi",
 			shell_yes_no(last_wfx->pending_irq),
 			shell_yes_no(last_wfx->irq_masked),
@@ -541,7 +556,7 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 	if (last_return->tsc == 0UL) {
 		shell_item_line("return:none");
 	} else {
-		shell_item_line("return:source:%s elr:0x%016lx spsr:0x%016lx tsc:0x%lx",
+		shell_item_line("return:source:%s elr:0x%016lx spsr:0x%016lx tsc:0x%08lx",
 			shell_exit_source_to_str(last_return->source),
 			last_return->elr, last_return->spsr, last_return->tsc);
 		shell_item_line("       cntv_ctl:0x%08x cntv_cval:0x%016lx cntvct:0x%016lx expired:%s",
@@ -594,14 +609,14 @@ static void shell_dumpstat_vtimer_trace(const struct arm64_vcpu_vtimer_trace *tr
 		const struct arm64_vcpu_vtimer_trace_entry *entry = &trace->entry[ring_idx];
 		int64_t delta = (int64_t)(entry->cval - entry->cntvct);
 
-		shell_item_line("vt[%02u] %-7s pcpu:%hu virq:%u ctl:0x%08x exp:%3s mask:%3s p/a/l:%3s/%3s/%3s wr:%3s inj:%3s delta:%ld",
+		shell_item_line("vt[%02u] %-7s pcpu:%hu virq:%u ctl:0x%08x exp:%s mask:%s p/a/l:%s/%s/%s wr:%s inj:%s delta:%ld",
 			idx, shell_vtimer_trace_event_to_str(entry->event),
 			entry->pcpu_id, entry->virq, entry->ctl,
 			shell_yes_no(entry->expired), shell_yes_no(entry->masked),
 			shell_yes_no(entry->pending), shell_yes_no(entry->active),
 			shell_yes_no(entry->level), shell_yes_no(entry->write),
 			shell_yes_no(entry->injected), delta);
-		shell_item_line("       cval:0x%016lx cntvct:0x%016lx lr0:0x%016lx hcr:0x%016lx misr:0x%016lx tsc:0x%lx",
+		shell_item_line("       cval:0x%016lx cntvct:0x%016lx lr0:0x%016lx hcr:0x%016lx misr:0x%016lx tsc:0x%08lx",
 			entry->cval, entry->cntvct, entry->lr0, entry->hcr,
 			entry->misr, entry->tsc);
 	}
@@ -714,7 +729,7 @@ static void shell_dumpstat_host_stack(const struct acrn_vcpu *vcpu)
 		return;
 	}
 
-	shell_item_line("pcpu:%hu source:vcpu-thread", pcpuid_from_vcpu(vcpu));
+	shell_item_line("pcpu:%hu from vcpu", pcpuid_from_vcpu(vcpu));
 	shell_dumpstat_unwind_host_stack(vcpu->thread_obj.host_sp,
 		saved_frame->x29, saved_frame->lr, stack_start, stack_end);
 }
@@ -754,6 +769,9 @@ struct dumpstat_snapshot {
 	uint64_t irqs_pending;
 	uint64_t irqs_pending_mask;
 	uint32_t live_cntv_ctl_el0;
+	bool vtimer_stuck_rescue_armed;
+	bool vtimer_wfi_rescue;
+	bool vtimer_lr_rescue;
 	bool has_timer_irq;
 	bool has_local_irq;
 	bool has_live_timer;
@@ -776,6 +794,10 @@ static void shell_dumpstat_capture(void *data)
 		snapshot->pending_req = snapshot->vcpu->pending_req;
 		snapshot->irqs_pending = snapshot->vcpu->arch.irqs_pending;
 		snapshot->irqs_pending_mask = snapshot->vcpu->arch.irqs_pending_mask;
+		snapshot->vtimer_stuck_rescue_armed =
+			snapshot->vcpu->arch.vtimer_stuck_rescue_armed;
+		snapshot->vtimer_wfi_rescue = snapshot->vcpu->arch.vtimer_wfi_rescue;
+		snapshot->vtimer_lr_rescue = snapshot->vcpu->arch.vtimer_lr_rescue;
 		if ((snapshot->vcpu->vm != NULL) &&
 			(snapshot->vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
 			(void)memcpy_s(snapshot->local_irq, sizeof(snapshot->local_irq),
@@ -846,6 +868,9 @@ static const struct cpu_regs *shell_dumpstat_get_regs(struct acrn_vcpu *vcpu,
 	snapshot->pending_req = vcpu->pending_req;
 	snapshot->irqs_pending = vcpu->arch.irqs_pending;
 	snapshot->irqs_pending_mask = vcpu->arch.irqs_pending_mask;
+	snapshot->vtimer_stuck_rescue_armed = vcpu->arch.vtimer_stuck_rescue_armed;
+	snapshot->vtimer_wfi_rescue = vcpu->arch.vtimer_wfi_rescue;
+	snapshot->vtimer_lr_rescue = vcpu->arch.vtimer_lr_rescue;
 	snapshot->has_timer_irq = false;
 	if ((vcpu->vm != NULL) && (vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
 		(void)memcpy_s(&snapshot->timer_irq, sizeof(snapshot->timer_irq),
@@ -902,6 +927,10 @@ static void shell_dumpstat_timer_state(const struct dumpstat_snapshot *snapshot)
 	shell_item_line("       cntv_ctl:0x%08x cntv_cval:0x%016lx el2_masked:%s",
 		gctx->cntv_ctl_el0, gctx->cntv_cval_el0,
 		shell_yes_no(gctx->cntv_el2_masked));
+	shell_item_line("       rescue:stuck:%s wfi:%s lr:%s",
+		shell_yes_no(snapshot->vtimer_stuck_rescue_armed),
+		shell_yes_no(snapshot->vtimer_wfi_rescue),
+		shell_yes_no(snapshot->vtimer_lr_rescue));
 	if (snapshot->has_live_timer) {
 		uint64_t guest_now = snapshot->live_cntvct_el0;
 		const struct arm64_gicv3_local_irq_state *host_irq = &snapshot->host_timer_irq;
@@ -993,7 +1022,7 @@ static void shell_dumpstat_local_irqs(const struct dumpstat_snapshot *snapshot)
 			}
 		}
 		if (irq->pending || irq->active || ((idx < ARM64_VGIC_SGI_NUM) && irq->enabled)) {
-			shell_item_line("local:virq:%u enabled:%s pending:%s active:%s level:%s",
+			shell_item_line("local:virq:%2u enabled:%s pending:%s active:%s level:%s",
 				irq->virq, shell_yes_no(irq->enabled),
 				shell_yes_no(irq->pending), shell_yes_no(irq->active),
 				shell_yes_no(irq->level));
@@ -1083,6 +1112,162 @@ static int32_t shell_dumpstat(int32_t argc, char **argv)
 	for (vcpu_id = 0U; vcpu_id < vm->hw.created_vcpus; vcpu_id++) {
 		(void)shell_dumpstat_vcpu(vcpu_from_vid(vm, vcpu_id));
 	}
+
+	return 0;
+}
+
+static uint32_t shell_lr_state(uint64_t lr)
+{
+	return (uint32_t)((lr >> ICH_LR_STATE_SHIFT) & 0x3UL);
+}
+
+static uint32_t shell_lr_vintid(uint64_t lr)
+{
+	return (uint32_t)(lr & ICH_LR_VINTID_MASK);
+}
+
+static const char *shell_lr_state_to_str(uint32_t state)
+{
+	const char *str;
+
+	switch (state) {
+	case ICH_LR_STATE_PENDING:
+		str = "pending";
+		break;
+	case ICH_LR_STATE_ACTIVE:
+		str = "active";
+		break;
+	case ICH_LR_STATE_ACTIVE_PENDING:
+		str = "active+pending";
+		break;
+	default:
+		str = "invalid";
+		break;
+	}
+
+	return str;
+}
+
+static uint32_t shell_constat_lr_count(const struct acrn_vcpu *vcpu, uint32_t virq,
+	char *buf, size_t size)
+{
+	uint32_t count = 0U;
+	uint32_t len = 0U;
+	uint32_t idx;
+
+	if ((buf != NULL) && (size != 0UL)) {
+		buf[0U] = '\0';
+	}
+	for (idx = 0U; idx < vcpu->arch.vgic.used_lrs; idx++) {
+		uint64_t lr = vcpu->arch.vgic.lr[idx];
+		uint32_t state = shell_lr_state(lr);
+
+		if ((state != ICH_LR_STATE_INVALID) && (shell_lr_vintid(lr) == virq)) {
+			count++;
+			if ((buf != NULL) && (len < size)) {
+				int32_t ret = snprintf(&buf[len], size - len, "%slr%u:%s",
+					(len == 0U) ? "" : ",", idx, shell_lr_state_to_str(state));
+
+				if (ret > 0) {
+					len += (uint32_t)ret;
+					if (len >= size) {
+						len = (uint32_t)size;
+					}
+				}
+			}
+		}
+	}
+	if ((buf != NULL) && (size != 0UL) && (count == 0U)) {
+		(void)snprintf(buf, size, "-");
+	}
+
+	return count;
+}
+
+static void shell_constat_vgic_uart(const struct acrn_vm *vm, uint32_t irq)
+{
+	const struct arm64_vgicv3 *vgic = &vm->arch_vm.vgic;
+	uint16_t vcpu_id;
+
+	if (!vgic->initialized || (irq >= ARM64_VGIC_IRQ_NUM)) {
+		shell_item_line("uart-spi:unavailable");
+		return;
+	}
+
+	for (vcpu_id = 0U; vcpu_id < vm->hw.created_vcpus; vcpu_id++) {
+		const struct acrn_vcpu *vcpu = vcpu_from_vid((struct acrn_vm *)vm, vcpu_id);
+		const struct arm64_vgic_irq *desc = &vgic->irq[vcpu_id][irq];
+		char lrs[64U];
+
+		if (vcpu == NULL) {
+			continue;
+		}
+		(void)shell_constat_lr_count(vcpu, irq, lrs, sizeof(lrs));
+		shell_item_line("spi%u/vcpu%hu target:%u en:%s pend:%s act:%s level:%s used_lrs:%u lrs:%s",
+			irq, vcpu_id, desc->target_vcpu,
+			shell_yes_no(desc->enabled), shell_yes_no(desc->pending),
+			shell_yes_no(desc->active), shell_yes_no(desc->level),
+			vcpu->arch.vgic.used_lrs, lrs);
+	}
+}
+
+static int32_t shell_constat(int32_t argc, char **argv)
+{
+	struct acrn_vm *vm;
+	struct acrn_vuart *vu;
+	struct console_vm_input_stats input;
+	struct console_vm_ring_stats ring;
+	struct arm64_vpl011_debug vpl011;
+	int64_t param;
+	uint16_t vm_id = 0U;
+	uint32_t irq;
+
+	if (argc > 2) {
+		return -EINVAL;
+	}
+
+	if (argc == 2) {
+		param = strtol_deci(argv[1]);
+		if ((param < 0) || (param >= CONFIG_MAX_VM_NUM)) {
+			return -EINVAL;
+		}
+		vm_id = (uint16_t)param;
+	}
+
+	vm = get_vm_from_vmid(vm_id);
+	if (is_poweroff_vm(vm)) {
+		return -EINVAL;
+	}
+
+	(void)memset(&input, 0U, sizeof(input));
+	(void)memset(&ring, 0U, sizeof(ring));
+	(void)memset(&vpl011, 0U, sizeof(vpl011));
+	(void)console_vm_input_get_stats(&input);
+	(void)console_vm_ring_get_stats(vm_id, &ring);
+	arm64_vpl011_get_debug(vm_id, &vpl011);
+	vu = vm_console_vuart(vm);
+	irq = arm64_platform_guest_uart_irq(vm_id);
+
+	shell_item_begin("constat vm%hu:%s", vm_id, vm->name);
+	shell_item_line("selected-vmid:%hu input-vmid:%hu backlog:%u/%u budget:%u last-enter:%s non-enter:%s",
+		input.selected_vmid, input.input_vmid, input.queued, input.capacity,
+		input.guest_budget, shell_yes_no(input.last_enter),
+		shell_yes_no(input.has_non_enter));
+	shell_item_line("ring:queued:%u/%u high:%u pending:%s draining:%s in:%lu stored:%lu drained:%lu dropped:%lu overflow:%lu",
+		ring.queued, ring.capacity, ring.high_water,
+		shell_yes_no(ring.pending), shell_yes_no(ring.draining),
+		ring.input_bytes, ring.stored_bytes, ring.drained_bytes,
+		ring.dropped_bytes, ring.overflow_events);
+	shell_item_line("vuart:rx:%u tx:%u irq:%u ier:0x%02x lsr:0x%02x active:%s",
+		vuart_rx_numchars(vu), vu->txfifo.num, vu->irq, vu->ier,
+		vu->lsr, shell_yes_no(vu->active));
+	shell_item_line("vpl011:asserted:%s pending:0x%08x imsc:0x%08x ris:0x%08x cr:0x%08x tx:%lu txirq:%lu assert:%lu deassert:%lu last-tx:0x%02x",
+		shell_yes_no(vpl011.irq_asserted), vpl011.pending,
+		vpl011.imsc, vpl011.ris, vpl011.cr, vpl011.tx_count,
+		vpl011.tx_irq_count, vpl011.irq_assert_count,
+		vpl011.irq_deassert_count, vpl011.last_tx);
+	shell_constat_vgic_uart(vm, irq);
+	shell_item_end();
 
 	return 0;
 }

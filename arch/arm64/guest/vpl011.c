@@ -13,6 +13,7 @@
 #include <vuart.h>
 #include <debug/serial.h>
 #include <asm/platform.h>
+#include <asm/guest/vgicv3.h>
 #include <asm/guest/vpl011.h>
 
 #define PL011_DR		0x000U
@@ -69,25 +70,30 @@ static uint32_t vpl011_pending_state(struct acrn_vm *vm, const struct arm64_vpl0
 	return vu->ris | vpl011_rx_int_state(vm);
 }
 
-static void vpl011_update_irq(struct acrn_vm *vm, struct arm64_vpl011 *vu)
+static void vpl011_update_irq(struct acrn_vm *vm, struct arm64_vpl011 *vu, bool kick_asserted)
 {
 	uint32_t pending = vpl011_pending_state(vm, vu);
 	bool assert = ((pending & vu->imsc) != 0U);
+	uint32_t irq = arm64_platform_guest_uart_irq(vm->vm_id);
 
 	vu->pending = pending;
 	/*
-	 * vGIC level inject/deassert syncs and flushes the target vCPU. Linux
-	 * polls PL011_FR around normal console writes, so unchanged low levels
-	 * must not be replayed as a full deassert path on every MMIO access.
-	 * Asserted levels are still passed through so the vGIC can redeliver a
-	 * level source after guest EOI if the device line remains high.
+	 * vGIC level inject/deassert syncs and flushes the target vCPU. Keep the
+	 * virtual line state level-triggered, but only replay an asserted line
+	 * when fresh RX data arrived. Guest MMIO polling can refresh the current
+	 * LR in place; new host input must also kick the remote target vCPU if the
+	 * line was already high and Linux is stopped in WFI behind another IRQ.
 	 */
-	if (assert) {
-		arch_trigger_level_intr(vm, arm64_platform_guest_uart_irq(vm->vm_id), assert);
+	if (assert && !vu->irq_asserted) {
+		arch_trigger_level_intr(vm, irq, true);
 		vu->irq_asserted = true;
 		vu->irq_assert_count++;
-	} else if (vu->irq_asserted) {
-		arch_trigger_level_intr(vm, arm64_platform_guest_uart_irq(vm->vm_id), assert);
+	} else if (assert && kick_asserted) {
+		arch_trigger_level_intr(vm, irq, true);
+	} else if (assert) {
+		arm64_vgicv3_refresh_current_level_irq(vm, irq);
+	} else if (!assert && vu->irq_asserted) {
+		arch_trigger_level_intr(vm, irq, false);
 		vu->irq_asserted = false;
 		vu->irq_deassert_count++;
 	}
@@ -145,7 +151,7 @@ static void vpl011_notify_rx(struct acrn_vuart *console)
 	} else {
 		console->ier &= (uint8_t)~IER_ERBFI;
 	}
-	vpl011_update_irq(vm, vu);
+	vpl011_update_irq(vm, vu, true);
 }
 
 static const struct vuart_backend_ops vpl011_backend_ops = {
@@ -196,6 +202,9 @@ static uint32_t vpl011_read(struct acrn_vm *vm, struct arm64_vpl011 *vu, uint32_
 		if (ch != -1) {
 			value = (uint32_t)(uint8_t)ch;
 		}
+		if (console_vm_rx_refill(console)) {
+			console->ier |= IER_ERBFI;
+		}
 		if (!vuart_rx_pending(console)) {
 			console->ier &= (uint8_t)~IER_ERBFI;
 		}
@@ -243,7 +252,7 @@ static uint32_t vpl011_read(struct acrn_vm *vm, struct arm64_vpl011 *vu, uint32_
 	}
 
 	if (update_irq) {
-		vpl011_update_irq(vm, vu);
+		vpl011_update_irq(vm, vu, false);
 	} else {
 		vu->pending = vpl011_pending_state(vm, vu);
 	}
@@ -287,7 +296,7 @@ static void vpl011_write(struct acrn_vm *vm, struct arm64_vpl011 *vu, uint32_t o
 	}
 
 	if (update_irq) {
-		vpl011_update_irq(vm, vu);
+		vpl011_update_irq(vm, vu, false);
 	}
 }
 

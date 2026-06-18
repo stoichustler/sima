@@ -44,17 +44,18 @@ mount -t devpts devpts /dev/pts 2>/dev/null || true
 # uos commands
 alias ll='ls -la'
 
-PS1='\[\033[0;92m\]uos \w\[\033[0m\] '
+TERM=dumb
+PS1='uos \w '
 
-export PS1 PATH
+export PS1 PATH TERM
 
 while true; do
 	if [ -c /dev/ttyAMA0 ]; then
-		setsid /bin/sh -c 'exec </dev/ttyAMA0 >/dev/ttyAMA0 2>&1; stty sane 2>/dev/null || true; exec /bin/sh -i' && continue
+		setsid /bin/sh -c 'exec </dev/ttyAMA0 >/dev/ttyAMA0 2>&1; stty sane rows 24 cols 80 -ixon -ixoff 2>/dev/null || true; exec /bin/sh -i' && continue
 	fi
 
 	if [ -c /dev/console ]; then
-		setsid /bin/sh -c 'exec </dev/console >/dev/console 2>&1; stty sane 2>/dev/null || true; exec /bin/sh -i'
+		setsid /bin/sh -c 'exec </dev/console >/dev/console 2>&1; stty sane rows 24 cols 80 -ixon -ixoff 2>/dev/null || true; exec /bin/sh -i'
 	fi
 
 	sleep 1

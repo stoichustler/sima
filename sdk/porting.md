@@ -180,7 +180,7 @@ QEMU validation should cover:
 - `vsh 0` reaching the Zephyr shell.
 - `vsh 1` reaching the LK shell.
 - `vsh 2` reaching the Linux initramfs `uos` root shell and `id` reporting
-  `uid=0(root)`.
+  `uid=0`.
 - No `[cut here]`, `unexpected arm64 trap`, or `unhandled arm64 vcpu exit`.
 
 ## Hardware Validation

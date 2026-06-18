@@ -30,7 +30,7 @@
 #define ARM64_VCPU_DEBUG_INVALID_VCPU_ID	0xffffU
 #define ARM64_VCPU_DEBUG_VGIC_SYNC		1U
 #define ARM64_VCPU_DEBUG_VGIC_MAINTENANCE	2U
-#define ARM64_VCPU_VTIMER_TRACE_NUM		16U
+#define ARM64_VCPU_VTIMER_TRACE_NUM		8U
 #define ARM64_VTIMER_TRACE_LOAD		1U
 #define ARM64_VTIMER_TRACE_UNLOAD		2U
 #define ARM64_VTIMER_TRACE_SYSREG		3U
@@ -351,6 +351,7 @@ struct acrn_vcpu_arch {
 	uint64_t irqs_pending_mask;
 	struct hv_timer vtimer_backup;
 	bool vtimer_backup_initialized;
+	bool vtimer_stuck_rescue_armed;
 	bool vtimer_wfi_rescue;
 	bool vtimer_lr_rescue;
 } __aligned(PAGE_SIZE);

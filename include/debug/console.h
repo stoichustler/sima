@@ -43,6 +43,16 @@ struct console_vm_exception_stats {
 	bool pending;
 };
 
+struct console_vm_input_stats {
+	uint16_t selected_vmid;
+	uint16_t input_vmid;
+	uint32_t queued;
+	uint32_t capacity;
+	uint32_t guest_budget;
+	bool last_enter;
+	bool has_non_enter;
+};
+
 /** Initializes the console module.
  *
  */
@@ -74,8 +84,10 @@ bool console_is_hv(void);
 bool console_is_vm_active(uint16_t vmid);
 bool console_vm_kick(void);
 bool console_vm_tx_put(uint16_t vmid, char ch);
+bool console_vm_rx_refill(struct acrn_vuart *vu);
 void console_vm_ring_drain(uint16_t vmid);
 bool console_vm_ring_get_stats(uint16_t vmid, struct console_vm_ring_stats *stats);
+bool console_vm_input_get_stats(struct console_vm_input_stats *stats);
 void console_vm_exception_log(uint16_t vmid, const char *buf, size_t len);
 uint32_t console_vm_exception_count(void);
 bool console_vm_exception_get_stats(uint16_t vmid, struct console_vm_exception_stats *stats);

@@ -121,11 +121,13 @@ void init_pci_vuart(struct pci_vdev *vdev);
 void deinit_pci_vuart(struct pci_vdev *vdev);
 
 void vuart_putchar(struct acrn_vuart *vu, char ch);
+bool vuart_try_putchar(struct acrn_vuart *vu, char ch);
 char vuart_getchar(struct acrn_vuart *vu);
 uint32_t vuart_get_tx_chars(struct acrn_vuart *vu, char *buf, uint32_t len);
 void vuart_put_tx_char(struct acrn_vuart *vu, char ch);
 char vuart_get_rx_char(struct acrn_vuart *vu);
 bool vuart_rx_pending(struct acrn_vuart *vu);
+uint32_t vuart_rx_numchars(struct acrn_vuart *vu);
 void vuart_set_backend(struct acrn_vuart *vu, const struct vuart_backend_ops *ops);
 void vuart_notify_rx(struct acrn_vuart *vu);
 void vuart_toggle_intr(const struct acrn_vuart *vu);

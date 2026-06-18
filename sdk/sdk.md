@@ -253,13 +253,21 @@ boot logs settle to show the `console:\>` prompt.
 - VM vPL011 TX output from the currently selected `vsh` VM is written into a
   Xen-style per-VM async console ring buffer, using monotonic producer/consumer
   indexes and a 4KB power-of-two data area with 4095 bytes of usable capacity.
-  The console timer path runs every 10ms and drains up to
-  `CONFIG_VM_CONSOLE_DRAIN_BUDGET` bytes, default 256, to the host serial
+  The console timer path runs every 5ms and drains up to
+  `CONFIG_VM_CONSOLE_DRAIN_BUDGET` bytes, default 512, to the host serial
   console per pass. If the selected VM has at least half a ring of queued
   output, the drain path can temporarily use
-  `CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET`, default 512. This keeps `vsh 2` from
+  `CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET`, default 2048. This keeps `vsh 2` from
   synchronously replaying a full Linux boot-log ring while still clearing deep
   Linux console backlog faster than the first 128-byte drain experiment.
+  Host-to-VM console input is first buffered in a small host backlog, then fed to
+  the guest with `CONFIG_VM_CONSOLE_RX_BUDGET`, default 4 bytes per pass, and
+  only while the guest RX FIFO is below `CONFIG_VM_CONSOLE_RX_LOW_WATERMARK`,
+  default 1 byte. Ordinary input beyond the backlog can be dropped under
+  sustained key repeat. Guest RX reads refill one queued byte while budget
+  remains, so short commands stay ordered and Ctrl-D still switches back to the
+  BEAU shell. This keeps a held key from monopolizing the console timer path or
+  keeping Linux in continuous UART RX IRQ and shell echo handling.
 - Non-selected VM console output is not replayed into the BEAU shell.
 - VM exception logs have a separate 4KB/4095-byte per-VM ring reserved for VM
   trap/oops capture. The ring is internal debug plumbing and is no longer
@@ -269,6 +277,18 @@ boot logs settle to show the `console:\>` prompt.
   - `vpl011` is the ARM64 PL011 backend implementation.
   - Backend notification is routed through `vuart_notify_rx()` instead of direct
     console-to-vPL011 calls.
+- ARM64 vGICv3 keeps ordinary level IRQ pending while the sampled device line is
+  asserted and clears it only through the device deassert path. vPL011 uses this
+  to enter the vGIC injection path only on visible UART IRQ line changes, so a
+  held console key no longer needs repeated `arch_trigger_level_intr(assert=true)`
+  calls or vCPU event requests to redeliver RX interrupts. Guest UART MMIO exits
+  on an already asserted line refresh the current vGIC LR in place so active RX
+  interrupts can become active+pending without a remote wakeup storm.
+- ARM64 vtimer stuck rescue keeps WFI trapping armed while a timer pending-only
+  LR remains stuck with EL1 IRQs masked, and clears that rescue state only when
+  timer EOI or a line-low resample proves the source is complete. This lets
+  Linux escape repeated WFI returns after heavy console RX traffic instead of
+  leaving CNTV host-masked with `pending:yes active:no`.
 - ARM64 vPL011 vio for guest PL011 MMIO and RX interrupt notification.
 - ARM64 vPL011 avoids running the vGIC level-deassert path for ordinary PL011
   polling reads, especially Linux's frequent `FR` reads around console output.
@@ -481,7 +501,9 @@ Status as of 2026-06-18:
     and vGIC state before honoring host `need_reschedule()`.
   - if a pending guest IRQ is visible after that refresh, the return path skips
     the host reschedule once and returns to EL1 so Linux can leave the idle path
-    and unmask interrupts.
+    and unmask interrupts. Physical IRQ exits still run host softirq processing
+    before this refresh/schedule decision; skipping host softirqs made the BEAU
+    console nearly unresponsive when VM2 kept virq27 pending.
 - This fix intentionally does not modify `core/` scheduler/timer/vCPU code and
   does not modify `sdk/image/linux/beau-linux.dts`.
 - Human-run validation completed for the local fix:
@@ -548,6 +570,9 @@ Status as of 2026-06-18:
 - Porting anoa's full switch-out backup timer model directly to BEAU caused a
   large VM2 slowdown. Do not arm a backup timer on every vCPU unload in the
   current QEMU 3OS path.
+- Skipping host softirq processing on physical IRQ return when a guest IRQ is
+  pending starved the BEAU shell/console during the VM2 held-Enter scenario and
+  was reverted. Keep `do_softirq_no_irqenable()` on the physical IRQ exit path.
 - Expanding the vITS software model to a static 8192-LPI descriptor array
   caused QEMU to stop producing useful shell output for more than 60 seconds.
   Keep the compact active-window model unless dynamic allocation is added.

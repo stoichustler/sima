@@ -163,14 +163,15 @@ static void refresh_current_vtimer(struct acrn_vcpu *vcpu)
 
 static bool vcpu_has_pending_guest_irq(struct acrn_vcpu *vcpu)
 {
-	return arm64_vgicv3_has_pending_irq(vcpu);
+	return arm64_vgicv3_pending_irq_blocks_reschedule(vcpu);
 }
 
 static struct acrn_vcpu *schedule_without_guest_return_work(uint16_t pcpu_id,
 	struct acrn_vcpu *vcpu)
 {
 	refresh_current_vtimer(vcpu);
-	if (need_reschedule(pcpu_id) && !vcpu_has_pending_guest_irq(vcpu)) {
+	if (need_reschedule(pcpu_id) && !vcpu_has_pending_request(vcpu) &&
+		!vcpu_has_pending_guest_irq(vcpu)) {
 		schedule();
 		vcpu = get_exit_vcpu(pcpu_id);
 		refresh_current_vtimer(vcpu);
@@ -798,13 +799,13 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 			vcpu->arch.gctx.hcr_el2 |= HCR_TWI;
 			arm64_vgicv3_update_current_vtimer(vcpu);
 			/*
-			 * The rescue trap is only needed to advance this WFI and rebuild a
-			 * pending timer LR. After that, let EL1 run through the idle return
-			 * path and unmask IRQs naturally while keeping the LR rescue marker
-			 * until timer EOI or line-low cleanup.
+			 * Keep TWI armed while the pending-only timer rescue is active.
+			 * Linux may return from this WFI with IRQs masked, do idle-exit
+			 * bookkeeping, and then loop into WFI again before daifclr. The
+			 * rescue marker protects the LR contents; TWI guarantees that a
+			 * repeated WFI cannot sleep behind the same pending virtual timer.
 			 */
 			vcpu->arch.vtimer_wfi_rescue = false;
-			vcpu->arch.gctx.hcr_el2 &= ~HCR_TWI;
 			should_yield = false;
 		} else {
 			vcpu->arch.vtimer_wfi_rescue = false;
@@ -844,10 +845,10 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 	 * HCR_EL2.TWI/TWE clear. If a diagnostic mode enables the traps, keep the
 	 * behavior lightweight: WFE yields, and WFI yields only when no virtual event
 	 * is visible. A masked pending IRQ still has to return to EL1 so Linux can run
-	 * out of the idle path and unmask interrupts. The timer rescue path uses TWI
-	 * only to trap the next WFI and rebuild a pending timer LR; after that the LR
-	 * rescue marker protects the pending-only LR until EL1 unmasks and EOIs the
-	 * timer.
+	 * out of the idle path and unmask interrupts. The timer rescue path keeps TWI
+	 * armed while EL2 preserves a pending-only timer LR, so repeated WFI cannot
+	 * sleep behind the same masked virtual timer. Timer EOI or a line-low resample
+	 * clears both the rescue marker and TWI.
 	 */
 	if (should_yield) {
 		yield_current();

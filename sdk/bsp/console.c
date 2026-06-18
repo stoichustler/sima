@@ -25,7 +25,7 @@
 
 struct hv_timer console_timer;
 
-#define CONSOLE_KICK_TIMER_TIMEOUT  10UL /* timeout is 10ms */
+#define CONSOLE_KICK_TIMER_TIMEOUT  5UL /* timeout is 5ms */
 #ifndef CONFIG_VM_CONSOLE_RINGBUF_SIZE
 #define CONFIG_VM_CONSOLE_RINGBUF_SIZE  4096U
 #endif
@@ -41,19 +41,43 @@ struct hv_timer console_timer;
 #define VM_CONSOLE_RINGBUF_MASK     (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_RINGBUF_CAPACITY (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #ifndef CONFIG_VM_CONSOLE_DRAIN_BUDGET
-#define CONFIG_VM_CONSOLE_DRAIN_BUDGET 256U
+#define CONFIG_VM_CONSOLE_DRAIN_BUDGET 512U
 #endif
 #define VM_CONSOLE_DRAIN_BUDGET CONFIG_VM_CONSOLE_DRAIN_BUDGET
 #ifndef CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET
-#define CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET 512U
+#define CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET 2048U
 #endif
 #define VM_CONSOLE_DRAIN_BURST_BUDGET CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET
 #ifndef CONFIG_VM_CONSOLE_DRAIN_BURST_THRESHOLD
 #define CONFIG_VM_CONSOLE_DRAIN_BURST_THRESHOLD (CONFIG_VM_CONSOLE_RINGBUF_SIZE / 2U)
 #endif
 #define VM_CONSOLE_DRAIN_BURST_THRESHOLD CONFIG_VM_CONSOLE_DRAIN_BURST_THRESHOLD
+#ifndef CONFIG_VM_CONSOLE_RX_BUDGET
+#define CONFIG_VM_CONSOLE_RX_BUDGET 4U
+#endif
+#define VM_CONSOLE_RX_BUDGET CONFIG_VM_CONSOLE_RX_BUDGET
+#ifndef CONFIG_VM_CONSOLE_RX_LOW_WATERMARK
+#define CONFIG_VM_CONSOLE_RX_LOW_WATERMARK 1U
+#endif
+#define VM_CONSOLE_RX_LOW_WATERMARK CONFIG_VM_CONSOLE_RX_LOW_WATERMARK
+#ifndef CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE
+#define CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE 64U
+#endif
+#if (CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE < 2U)
+#error "CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE must be at least 2 bytes"
+#endif
+#if ((CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE & (CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE - 1U)) != 0U)
+#error "CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE must be a power of two"
+#endif
+#define VM_CONSOLE_INPUT_BACKLOG_MASK (CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE - 1U)
+#define VM_CONSOLE_INPUT_BACKLOG_CAPACITY (CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE - 1U)
+#ifndef CONFIG_VM_CONSOLE_INPUT_COLLECT_BUDGET
+#define CONFIG_VM_CONSOLE_INPUT_COLLECT_BUDGET 64U
+#endif
+#define VM_CONSOLE_INPUT_COLLECT_BUDGET CONFIG_VM_CONSOLE_INPUT_COLLECT_BUDGET
 #define VM_CONSOLE_DRAIN_BUF_SIZE 1024U
 #define VM_CONSOLE_PREFIX_MAX_SIZE 16U
+#define VM_CONSOLE_CPR_QUERY_LEN 4U
 #define VM_CONSOLE_EXCEPTION_RINGBUF_SIZE 4096U
 #define VM_CONSOLE_EXCEPTION_RINGBUF_MASK (VM_CONSOLE_EXCEPTION_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_EXCEPTION_RINGBUF_CAPACITY (VM_CONSOLE_EXCEPTION_RINGBUF_SIZE - 1U)
@@ -79,6 +103,8 @@ struct vm_console_ringbuf {
 	bool draining;
 	bool line_start;
 	bool last_cr;
+	uint8_t terminal_query_len;
+	char terminal_query_buf[VM_CONSOLE_CPR_QUERY_LEN];
 	char buf[CONFIG_VM_CONSOLE_RINGBUF_SIZE];
 };
 
@@ -98,8 +124,16 @@ struct vm_exception_ringbuf {
 
 static struct vm_console_ringbuf vm_console_ringbufs[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
 static struct vm_exception_ringbuf vm_exception_ringbufs[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
+static char vm_console_input_backlog[CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE];
+static uint32_t vm_console_input_cons;
+static uint32_t vm_console_input_prod;
+static uint32_t vm_console_input_guest_budget;
+static uint16_t vm_console_input_vmid = ACRN_INVALID_VMID;
+static bool vm_console_input_last_enter;
 static char vm_console_drain_buf[VM_CONSOLE_DRAIN_BUF_SIZE];
 static char vm_console_output_buf[VM_CONSOLE_DRAIN_BUF_SIZE + 128U];
+static const char vm_console_cpr_query[] = "\033[6n";
+static const char vm_console_cpr_reply[] = "\033[1;1R";
 
 static void console_vm_ring_put(uint16_t vmid, char ch);
 static void console_vm_ring_drain_internal(uint16_t vmid);
@@ -197,6 +231,173 @@ static uint32_t console_ring_queued(uint32_t prod, uint32_t cons, uint32_t capac
 	uint32_t queued = prod - cons;
 
 	return (queued > capacity) ? capacity : queued;
+}
+
+static void console_vm_input_reset(uint16_t vmid)
+{
+	vm_console_input_vmid = vmid;
+	vm_console_input_cons = 0U;
+	vm_console_input_prod = 0U;
+	vm_console_input_guest_budget = 0U;
+	vm_console_input_last_enter = false;
+}
+
+static void console_vm_input_sync(uint16_t vmid)
+{
+	if (vm_console_input_vmid != vmid) {
+		console_vm_input_reset(vmid);
+	}
+}
+
+static bool console_vm_input_empty(void)
+{
+	return vm_console_input_prod == vm_console_input_cons;
+}
+
+static bool console_vm_input_has_non_enter(void)
+{
+	uint32_t queued = vm_console_input_prod - vm_console_input_cons;
+	bool has_non_enter = false;
+
+	if (queued > VM_CONSOLE_INPUT_BACKLOG_CAPACITY) {
+		queued = VM_CONSOLE_INPUT_BACKLOG_CAPACITY;
+	}
+	for (uint32_t idx = 0U; idx < queued; idx++) {
+		if (vm_console_input_backlog[(vm_console_input_cons + idx) &
+			VM_CONSOLE_INPUT_BACKLOG_MASK] != '\r') {
+			has_non_enter = true;
+			break;
+		}
+	}
+
+	return has_non_enter;
+}
+
+bool console_vm_input_get_stats(struct console_vm_input_stats *stats)
+{
+	bool valid = stats != NULL;
+
+	if (valid) {
+		/*
+		 * The console input backlog is producer/consumer state owned by the
+		 * host console timer. A best-effort snapshot is enough for live shell
+		 * diagnostics and avoids perturbing the timing-sensitive input path.
+		 */
+		stats->selected_vmid = console_vmid;
+		stats->input_vmid = vm_console_input_vmid;
+		stats->queued = console_ring_queued(vm_console_input_prod,
+			vm_console_input_cons, VM_CONSOLE_INPUT_BACKLOG_CAPACITY);
+		stats->capacity = VM_CONSOLE_INPUT_BACKLOG_CAPACITY;
+		stats->guest_budget = vm_console_input_guest_budget;
+		stats->last_enter = vm_console_input_last_enter;
+		stats->has_non_enter = console_vm_input_has_non_enter();
+	}
+
+	return valid;
+}
+
+static bool console_vm_input_put(char ch)
+{
+	bool stored = false;
+	uint32_t queued = vm_console_input_prod - vm_console_input_cons;
+
+	/*
+	 * Held Enter keys should behave like "there is a blank line pending", not
+	 * like an unbounded FIFO that can hide the next real command behind dozens
+	 * of empty submissions.
+	 */
+	if ((ch == '\r') && vm_console_input_last_enter) {
+		return true;
+	}
+
+	if (queued >= VM_CONSOLE_INPUT_BACKLOG_CAPACITY) {
+		/*
+		 * Prefer the newest host input over stale backlog. This keeps a command
+		 * typed after a key-repeat burst from being dropped just because old
+		 * blank lines filled the staging queue.
+		 */
+		vm_console_input_cons++;
+		queued--;
+	}
+	if (queued < VM_CONSOLE_INPUT_BACKLOG_CAPACITY) {
+		vm_console_input_backlog[vm_console_input_prod & VM_CONSOLE_INPUT_BACKLOG_MASK] = ch;
+		vm_console_input_prod++;
+		vm_console_input_last_enter = (ch == '\r');
+		stored = true;
+	}
+
+	return stored;
+}
+
+static char console_vm_input_peek(void)
+{
+	return vm_console_input_backlog[vm_console_input_cons & VM_CONSOLE_INPUT_BACKLOG_MASK];
+}
+
+static void console_vm_input_drop_one(void)
+{
+	char ch = console_vm_input_peek();
+
+	vm_console_input_cons++;
+	if (ch != '\r') {
+		vm_console_input_last_enter = false;
+	}
+}
+
+static void console_vm_input_collect(uint16_t target_vmid)
+{
+	uint32_t budget = VM_CONSOLE_INPUT_COLLECT_BUDGET;
+	char ch = -1;
+
+	console_vm_input_sync(target_vmid);
+	while (budget > 0U) {
+		ch = serial_getc();
+		if (ch == -1) {
+			if (console_vm_input_empty()) {
+				vm_console_input_last_enter = false;
+			}
+			break;
+		}
+		budget--;
+		if (ch == GUEST_CONSOLE_TO_HV_SWITCH_KEY) {
+			console_vm_ring_drain_internal(target_vmid);
+			console_vmid = ACRN_INVALID_VMID;
+			console_vm_input_reset(ACRN_INVALID_VMID);
+			printf("\r\n\r\n──────── [switch to BEAU shell] ────────\r\n");
+			break;
+		}
+		(void)console_vm_input_put(ch);
+	}
+}
+
+static bool console_vm_input_push_to_guest(struct acrn_vuart *vu)
+{
+	uint16_t target_vmid;
+	char ch;
+	bool pushed = false;
+
+	if ((vu != NULL) && (vu->vm != NULL)) {
+		target_vmid = vu->vm->vm_id;
+		if ((console_vmid == target_vmid) && (vm_console_input_guest_budget > 0U)) {
+			console_vm_input_sync(target_vmid);
+			if (!console_vm_input_empty() &&
+				(vuart_rx_numchars(vu) < VM_CONSOLE_RX_LOW_WATERMARK)) {
+				ch = console_vm_input_peek();
+				if (vuart_try_putchar(vu, ch)) {
+					console_vm_input_drop_one();
+					vm_console_input_guest_budget--;
+					pushed = true;
+				}
+			}
+		}
+	}
+
+	return pushed;
+}
+
+bool console_vm_rx_refill(struct acrn_vuart *vu)
+{
+	return console_vm_input_push_to_guest(vu);
 }
 
 static uint32_t console_vm_ring_drain_budget(struct vm_console_ringbuf *rb)
@@ -389,27 +590,24 @@ struct acrn_vuart *vm_console_vuart(struct acrn_vm *vm)
 static void vuart_console_rx_chars(struct acrn_vuart *vu)
 {
 	uint16_t target_vmid = console_vmid;
-	char ch = -1;
 	bool recv = false;
 
-	while (1) {
-		/* Get data from physical uart */
-		ch = serial_getc();
-		if (ch == -1)
-			break;
-
-		if (ch == GUEST_CONSOLE_TO_HV_SWITCH_KEY) {
-			console_vm_ring_drain_internal(target_vmid);
-			console_vmid = ACRN_INVALID_VMID;
-			printf("\r\n\r\n──────── [switch to BEAU shell] ────────\r\n");
-			goto exit;
-		} else if (vu != NULL) {
-			vuart_putchar(vu, ch);
-			recv = true;
-		}
+	console_vm_input_collect(target_vmid);
+	vm_console_input_guest_budget = VM_CONSOLE_RX_BUDGET;
+	while (console_vm_input_push_to_guest(vu)) {
+		recv = true;
+	}
+	if (!recv && (vu != NULL) && (console_vmid == target_vmid) &&
+		vuart_rx_pending(vu) && console_vm_input_has_non_enter()) {
+		/*
+		 * A stale blank Enter can occupy the guest RX FIFO while the real
+		 * command waits in the host backlog. Re-kick the already asserted
+		 * PL011 line so Linux drains that byte and refill can expose the
+		 * pending command, without replaying pure Enter key-repeat bursts.
+		 */
+		recv = true;
 	}
 
-exit:
 	if (recv && (vu != NULL) && (console_vmid == target_vmid)) {
 		vuart_notify_rx(vu);
 	}
@@ -517,6 +715,87 @@ static void console_vm_prefixed_write_bytes(char *out, uint32_t *out_len,
 	}
 }
 
+static void console_vm_ring_write_visible_byte(const char *prefix, uint32_t prefix_len,
+	struct vm_console_ringbuf *rb, char *out, uint32_t *out_len, char ch)
+{
+	if (rb->line_start) {
+		if (!rb->last_cr || (ch != '\n')) {
+			console_vm_prefixed_write_bytes(out, out_len, prefix, prefix_len);
+			rb->line_start = false;
+		}
+	}
+
+	console_vm_prefixed_write_byte(out, out_len, ch);
+	if (ch == '\r') {
+		rb->line_start = true;
+		rb->last_cr = true;
+	} else if (ch == '\n') {
+		rb->line_start = true;
+		rb->last_cr = false;
+	} else {
+		rb->last_cr = false;
+	}
+}
+
+static void console_vm_inject_cpr_reply(uint16_t vmid)
+{
+	struct acrn_vm *vm;
+	struct acrn_vuart *vu;
+	bool pushed = false;
+
+	if (vmid < CONFIG_MAX_VM_NUM) {
+		vm = get_vm_from_vmid(vmid);
+		if ((vm != NULL) && !is_paused_vm(vm) && !is_poweroff_vm(vm)) {
+			vu = vm_console_vuart(vm);
+			for (uint32_t idx = 0U; idx < (ARRAY_SIZE(vm_console_cpr_reply) - 1U); idx++) {
+				if (!vuart_try_putchar(vu, vm_console_cpr_reply[idx])) {
+					break;
+				}
+				pushed = true;
+			}
+			if (pushed) {
+				vuart_notify_rx(vu);
+			}
+		}
+	}
+}
+
+static void console_vm_flush_terminal_query(const char *prefix, uint32_t prefix_len,
+	struct vm_console_ringbuf *rb, char *out, uint32_t *out_len)
+{
+	for (uint32_t idx = 0U; idx < rb->terminal_query_len; idx++) {
+		console_vm_ring_write_visible_byte(prefix, prefix_len, rb, out, out_len,
+			rb->terminal_query_buf[idx]);
+	}
+	rb->terminal_query_len = 0U;
+}
+
+static bool console_vm_filter_terminal_query(uint16_t vmid, struct vm_console_ringbuf *rb,
+	const char *prefix, uint32_t prefix_len, char *out, uint32_t *out_len, char ch)
+{
+	bool consumed = false;
+
+	if ((rb->terminal_query_len != 0U) || (ch == vm_console_cpr_query[0U])) {
+		if (rb->terminal_query_len < VM_CONSOLE_CPR_QUERY_LEN) {
+			rb->terminal_query_buf[rb->terminal_query_len] = ch;
+			rb->terminal_query_len++;
+		}
+		consumed = true;
+
+		if (memcmp(rb->terminal_query_buf, vm_console_cpr_query,
+			rb->terminal_query_len) == 0) {
+			if (rb->terminal_query_len == VM_CONSOLE_CPR_QUERY_LEN) {
+				rb->terminal_query_len = 0U;
+				console_vm_inject_cpr_reply(vmid);
+			}
+		} else {
+			console_vm_flush_terminal_query(prefix, prefix_len, rb, out, out_len);
+		}
+	}
+
+	return consumed;
+}
+
 static void console_vm_ring_write_prefixed(uint16_t vmid, struct vm_console_ringbuf *rb,
 	const char *buf, uint32_t len)
 {
@@ -530,24 +809,19 @@ static void console_vm_ring_write_prefixed(uint16_t vmid, struct vm_console_ring
 	for (uint32_t idx = 0U; idx < len; idx++) {
 		char ch = buf[idx];
 
-		if (rb->line_start) {
-			if (!rb->last_cr || (ch != '\n')) {
-				console_vm_prefixed_write_bytes(vm_console_output_buf, &out_len,
-					prefix, (uint32_t)prefix_len);
-				rb->line_start = false;
-			}
+		/*
+		 * BusyBox ash queries terminal cursor position with ESC[6n after
+		 * prompt redraws. The BEAU vsh path is a console multiplexer, not a
+		 * transparent terminal, so answer the query internally and hide it
+		 * from the host serial stream.
+		 */
+		if (console_vm_filter_terminal_query(vmid, rb, prefix,
+			(uint32_t)prefix_len, vm_console_output_buf, &out_len, ch)) {
+			continue;
 		}
 
-		console_vm_prefixed_write_byte(vm_console_output_buf, &out_len, ch);
-		if (ch == '\r') {
-			rb->line_start = true;
-			rb->last_cr = true;
-		} else if (ch == '\n') {
-			rb->line_start = true;
-			rb->last_cr = false;
-		} else {
-			rb->last_cr = false;
-		}
+		console_vm_ring_write_visible_byte(prefix, (uint32_t)prefix_len,
+			rb, vm_console_output_buf, &out_len, ch);
 	}
 
 	console_vm_prefixed_write_flush(vm_console_output_buf, &out_len);
@@ -564,9 +838,9 @@ static void console_vm_ring_drain_internal(uint16_t vmid)
 		rb = &vm_console_ringbufs[vmid];
 		if (console_vm_ring_drain_begin(rb)) {
 			/*
-			 * Host serial output is synchronous. Start with a short drain
-			 * window, then allow a bounded burst when Linux has a deep
-			 * backlog so handoff remains smooth without starving output.
+			 * Host serial output is synchronous. Use a regular budget for
+			 * interactive output, then a bounded burst for deep boot-log
+			 * backlog so vsh handoff catches up without replaying forever.
 			 */
 			budget = console_vm_ring_drain_budget(rb);
 			do {
@@ -591,11 +865,14 @@ bool console_vm_kick(void)
 	bool handled = !console_is_hv();
 
 	if (handled) {
+		console_vm_input_sync(console_vmid);
 		vu = vuart_console_active();
 		vuart_console_rx_chars(vu);
 
 		if (vu != NULL) {
 			console_vm_ring_drain_internal(console_vmid);
+		} else {
+			console_vm_input_reset(console_vmid);
 		}
 	}
 
