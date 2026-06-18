@@ -23,6 +23,8 @@
 #define ARM64_GIC_PPI_PHYSICAL_TIMER	30U
 #define ARM64_GIC_PPI_VIRTUAL_TIMER	27U
 #define ARM64_GIC_SPURIOUS_INTID	1023U
+#define ARM64_GIC_PRIORITY_DEFAULT	0x80U
+#define ARM64_GIC_PRIORITY_MASKED	0xffU
 
 /*
  * Reserved space for the future GIC distributor domain. The first-stage
@@ -59,8 +61,10 @@ void arm64_gicv3_init(uint16_t pcpu_id);
 uint32_t arm64_gicv3_ack_irq(void);
 void arm64_gicv3_eoi_irq(uint32_t intid);
 void arm64_gicv3_enable_irq(uint32_t intid);
+void arm64_gicv3_unmask_irq(uint32_t intid);
 void arm64_gicv3_disable_irq(uint32_t intid);
 void arm64_gicv3_clear_irq(uint32_t intid);
+void arm64_gicv3_set_irq_priority(uint32_t intid, uint8_t priority);
 bool arm64_gicv3_has_its(void);
 void arm64_gicv3_get_local_irq_state(uint16_t pcpu_id, uint32_t intid,
 	struct arm64_gicv3_local_irq_state *state);

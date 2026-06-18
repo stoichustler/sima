@@ -47,6 +47,23 @@ static void run_timer(const struct hv_timer *timer)
 	TRACE_2L(TRACE_TIMER_ACTION_PCKUP, timer->timeout, 0UL);
 }
 
+static void advance_periodic_timer(struct hv_timer *timer, uint64_t now)
+{
+	uint64_t next;
+	uint64_t missed;
+
+	next = timer->timeout + timer->period_in_cycle;
+	if (next <= now) {
+		missed = ((now - next) / timer->period_in_cycle) + 1UL;
+		next += missed * timer->period_in_cycle;
+		if (next <= now) {
+			next = now + timer->period_in_cycle;
+		}
+	}
+
+	timer->timeout = next;
+}
+
 static inline void update_physical_timer(struct per_cpu_timers *cpu_timer)
 {
 	struct hv_timer *timer = NULL;
@@ -199,8 +216,14 @@ static void timer_softirq(uint16_t pcpu_id)
 			run_timer(timer);
 
 			if (timer->mode == TICK_MODE_PERIODIC) {
-				/* update periodic timer fire tsc */
-				timer->timeout += timer->period_in_cycle;
+				/*
+				 * Periodic timers are wall-clock ticks, not a backlog queue.
+				 * If softirq handling was delayed across multiple periods,
+				 * skip missed periods instead of programming CNTP to an
+				 * already-expired deadline and taking immediate IRQs again.
+				 */
+				current_tsc = cpu_ticks();
+				advance_periodic_timer(timer, current_tsc);
 				(void)local_add_timer(cpu_timer, timer);
 			} else {
 				timer->timeout = 0UL;

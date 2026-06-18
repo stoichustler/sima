@@ -61,8 +61,8 @@
 #define GIC_CFG_PER_REG		16U
 #define GIC_SPI_BASE			32U
 #define GIC_SPECIAL_INTID_BASE		1020U
-#define GIC_DEFAULT_PRIORITY		0x80U
-#define GIC_LOWEST_PRIORITY		0xffU
+#define GIC_DEFAULT_PRIORITY		ARM64_GIC_PRIORITY_DEFAULT
+#define GIC_LOWEST_PRIORITY		ARM64_GIC_PRIORITY_MASKED
 #define GIC_WAIT_RETRIES		1000000U
 
 static uint64_t gicr_base_by_pcpu[MAX_PCPU_NUM];
@@ -534,6 +534,26 @@ void arm64_gicv3_enable_irq(uint32_t intid)
 	}
 }
 
+void arm64_gicv3_unmask_irq(uint32_t intid)
+{
+	uint64_t rdist;
+
+	/*
+	 * Unlike the normal enable path, this preserves pending/active state.
+	 * Virtual timer masking keeps PPI27 enabled and changes only priority; on
+	 * vCPU load the enable bit may still need to be restored without clearing a
+	 * high physical line as stale initialization state.
+	 */
+	if (intid < GIC_SPI_BASE) {
+		rdist = gic_current_rdist();
+		gicr_enable_irq(rdist, intid);
+		gicr_wait_rwp(rdist);
+	} else if (gic_is_programmable_spi(intid)) {
+		gicd_write32(GICD_ISENABLER + gic_intid_reg(intid), gic_intid_mask(intid));
+		gicd_wait_rwp();
+	}
+}
+
 void arm64_gicv3_disable_irq(uint32_t intid)
 {
 	uint64_t rdist;
@@ -559,6 +579,18 @@ void arm64_gicv3_clear_irq(uint32_t intid)
 			gic_intid_mask(intid));
 	} else if (gic_is_programmable_spi(intid)) {
 		gicd_clear_pending_active(intid);
+	}
+}
+
+void arm64_gicv3_set_irq_priority(uint32_t intid, uint8_t priority)
+{
+	uint64_t rdist;
+
+	if (intid < GIC_SPI_BASE) {
+		rdist = gic_current_rdist();
+		gicr_set_priority(rdist, intid, priority);
+	} else if (gic_is_programmable_spi(intid)) {
+		gicd_set_priority(intid, priority);
 	}
 }
 

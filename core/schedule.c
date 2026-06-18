@@ -55,6 +55,11 @@ static inline bool is_running(const struct thread_object *obj)
 	return obj->status == THREAD_STS_RUNNING;
 }
 
+static inline bool is_runnable_or_running(const struct thread_object *obj)
+{
+	return (obj->status == THREAD_STS_RUNNING) || (obj->status == THREAD_STS_RUNNABLE);
+}
+
 static inline void set_thread_status(struct thread_object *obj, enum thread_object_state status)
 {
 	obj->status = status;
@@ -296,6 +301,57 @@ bool need_reschedule(uint16_t pcpu_id)
 	struct sched_control *ctl = &per_cpu(sched_ctl, pcpu_id);
 
 	return bitmap_test(NEED_RESCHEDULE, &ctl->flags);
+}
+
+static bool sched_current_is_only_runnable_locked(struct sched_control *ctl)
+{
+	struct thread_object *current = ctl->curr_obj;
+	struct thread_object *obj;
+	struct list_head *pos;
+	uint32_t runnable = 0U;
+
+	if ((current == NULL) || is_idle_thread(current) || current->be_blocking ||
+		!is_runnable_or_running(current)) {
+		return false;
+	}
+
+	list_for_each(pos, &thread_list) {
+		obj = container_of(pos, struct thread_object, node);
+		if ((obj->pcpu_id != ctl->pcpu_id) || is_idle_thread(obj) || obj->be_blocking ||
+			!is_runnable_or_running(obj)) {
+			continue;
+		}
+
+		runnable++;
+		if ((runnable > 1U) || (obj != current)) {
+			return false;
+		}
+	}
+
+	return runnable == 1U;
+}
+
+bool sched_clear_reschedule_if_current_only(uint16_t pcpu_id)
+{
+	struct sched_control *ctl = &per_cpu(sched_ctl, pcpu_id);
+	uint64_t rflag;
+	bool cleared = false;
+
+	obtain_schedule_lock(pcpu_id, &rflag);
+	if (bitmap_test(NEED_RESCHEDULE, &ctl->flags) &&
+		sched_current_is_only_runnable_locked(ctl)) {
+		/*
+		 * A scheduler tick can request a reschedule even when the runqueue
+		 * contains only the current thread. schedule() would just clear the
+		 * flag and pick the same object; do that cheaply when architecture
+		 * code must return to the current guest to retire a pending IRQ.
+		 */
+		bitmap_clear(NEED_RESCHEDULE, &ctl->flags);
+		cleared = true;
+	}
+	release_schedule_lock(pcpu_id, rflag);
+
+	return cleared;
 }
 
 void schedule(void)

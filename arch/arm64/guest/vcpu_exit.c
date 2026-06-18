@@ -170,11 +170,20 @@ static struct acrn_vcpu *schedule_without_guest_return_work(uint16_t pcpu_id,
 	struct acrn_vcpu *vcpu)
 {
 	refresh_current_vtimer(vcpu);
-	if (need_reschedule(pcpu_id) && !vcpu_has_pending_request(vcpu) &&
-		!vcpu_has_pending_guest_irq(vcpu)) {
-		schedule();
-		vcpu = get_exit_vcpu(pcpu_id);
-		refresh_current_vtimer(vcpu);
+	if (need_reschedule(pcpu_id) && !vcpu_has_pending_request(vcpu)) {
+		(void)sched_clear_reschedule_if_current_only(pcpu_id);
+	}
+
+	if (need_reschedule(pcpu_id) && !vcpu_has_pending_request(vcpu)) {
+		/*
+		 * On a shared pCPU, a deliverable virtual IRQ gets a bounded
+		 * guest-forward-progress window before IORR fairness resumes.
+		 */
+		if (!vcpu_has_pending_guest_irq(vcpu)) {
+			schedule();
+			vcpu = get_exit_vcpu(pcpu_id);
+			refresh_current_vtimer(vcpu);
+		}
 	}
 
 	return vcpu;
@@ -220,8 +229,12 @@ static void record_vcpu_return(struct acrn_vcpu *vcpu, uint32_t source)
 	struct arm64_gicv3_local_irq_state host_irq;
 	uint32_t virq = (gctx->timer_virq == 0U) ?
 		ARM64_GIC_PPI_VIRTUAL_TIMER : gctx->timer_virq;
+	uint64_t host_now = read_cntpct_el0();
+	uint64_t host_cval = read_cntp_cval_el0();
 	uint64_t now = read_cntvct_el0();
 	uint64_t cval = read_cntv_cval_el0();
+	uint32_t host_ctl = read_cntp_ctl_el0() &
+		(CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
 	uint32_t ctl = read_cntv_ctl_el0() &
 		(CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
 
@@ -231,6 +244,8 @@ static void record_vcpu_return(struct acrn_vcpu *vcpu, uint32_t source)
 	last->tsc = cpu_ticks();
 	last->elr = vcpu->arch.regs.elr;
 	last->spsr = vcpu->arch.regs.spsr;
+	last->cntpct = host_now;
+	last->cntp_cval = host_cval;
 	last->cntvct = now;
 	last->cntv_cval = cval;
 	last->hcr = read_ich_hcr_el2();
@@ -244,6 +259,7 @@ static void record_vcpu_return(struct acrn_vcpu *vcpu, uint32_t source)
 	last->sw_lr1 = (vcpu->arch.vgic.used_lrs > 1U) ? vcpu->arch.vgic.lr[1U] : 0UL;
 	last->live_lr0 = read_ich_lr_el2(0U);
 	last->live_lr1 = read_ich_lr_el2(1U);
+	last->cntp_ctl = host_ctl;
 	last->cntv_ctl = ctl;
 	last->source = source;
 	last->timer_virq = virq;
@@ -534,9 +550,14 @@ static void guest_timer_write_live_ctl(struct arm64_vcpu_guest_ctx *gctx)
 {
 	uint32_t ctl = (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
 		gctx->cntp_ctl_el0 : gctx->cntv_ctl_el0;
+	bool host_masked = gctx->cntv_el2_masked;
 
 	gctx->cntv_el2_masked = false;
 	write_cntv_ctl_el0(ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
+	if (host_masked) {
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_DEFAULT);
+	}
 }
 
 /*
@@ -795,8 +816,11 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 	should_yield = is_wfe || (!request_pending && !pending_irq);
 	if (!is_wfe && vcpu->arch.vtimer_wfi_rescue) {
 		if (pending_irq && irq_masked) {
-			vcpu->arch.vtimer_lr_rescue = true;
+			arm64_vgicv3_keep_vtimer_rescue(vcpu);
 			arm64_vgicv3_update_current_vtimer(vcpu);
+			if (vcpu->arch.vtimer_lr_rescue) {
+				arm64_vgicv3_keep_vtimer_rescue(vcpu);
+			}
 			/*
 			 * TWI is a one-shot wake assist for the WFI that raced an already
 			 * pending virtual timer. Once the timer LR has been preserved, let
@@ -804,15 +828,10 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 			 * turns a masked idle loop into repeated EL2 traps and can starve
 			 * Linux timer softirq progress.
 			 */
-			vcpu->arch.vtimer_wfi_rescue = false;
-			vcpu->arch.gctx.hcr_el2 &= ~HCR_TWI;
 			should_yield = false;
 		} else {
-			vcpu->arch.vtimer_wfi_rescue = false;
-			vcpu->arch.vtimer_lr_rescue = false;
-			vcpu->arch.gctx.hcr_el2 &= ~HCR_TWI;
+			arm64_vgicv3_clear_vtimer_rescue(vcpu);
 		}
-		write_hcr_el2(vcpu->arch.gctx.hcr_el2);
 	}
 
 	last->esr = vcpu->arch.regs.esr;

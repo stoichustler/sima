@@ -85,6 +85,7 @@
 #define BIT32(n)			(1U << (n))
 
 #define VGIC_VTIMER_STUCK_RESCUE_US	500U
+#define VGIC_VTIMER_LR_RESCUE_RESCHED_BUDGET	4U
 #define VGICD_CTLR			0x0000U
 #define VGICD_TYPER			0x0004U
 #define VGICD_IIDR			0x0008U
@@ -335,31 +336,35 @@ static void vgic_set_pending(struct arm64_vgicv3 *vgic, uint16_t vcpu_id,
 static uint32_t vgic_vtimer_guest_ctl(const struct arm64_vcpu_guest_ctx *gctx);
 
 /*
- * Host masking hands the live CNTV output to the software vGIC while a timer
- * LR owns guest delivery:
+ * Host masking hands the physical PPI27 delivery to the software vGIC while a
+ * timer LR owns guest delivery:
  *
- *   CNTV expires -> mask host PPI -> inject virtual timer LR
- *   guest EOI/reprogram -> resample CNTV -> unmask when the line is safe
+ *   CNTV expires -> priority-mask host PPI -> inject virtual timer LR
+ *   guest EOI/reprogram -> resample CNTV -> restore PPI priority when safe
+ *
+ * Do not set live CNTV_CTL.IMASK for this, and do not disable PPI27 at the
+ * redistributor. Some CPU models let EL1 read CNTV directly despite the intended
+ * trap configuration; exposing EL2's host mask there, or disabling the PPI line
+ * underneath the timer, can make Linux see no ISTATUS for an expired timer and
+ * suppress the timer-softirq path that should reprogram the deadline.
  */
 static void vgic_timer_set_host_mask(struct acrn_vcpu *vcpu, bool masked)
 {
 	struct arm64_vcpu_guest_ctx *gctx;
-	uint32_t ctl;
 
 	if ((vcpu == NULL) || (get_running_vcpu(get_pcpu_id()) != vcpu)) {
 		return;
 	}
 
 	gctx = &vcpu->arch.gctx;
-	ctl = read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
 	if (masked) {
 		gctx->cntv_el2_masked = true;
-		write_cntv_ctl_el0(ctl | CNTV_CTL_IMASK);
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_MASKED);
 	} else if (gctx->cntv_el2_masked) {
 		gctx->cntv_el2_masked = false;
-		ctl = (ctl & ~CNTV_CTL_IMASK) | (vgic_vtimer_guest_ctl(gctx) & CNTV_CTL_IMASK);
-		write_cntv_ctl_el0(ctl);
-		arm64_gicv3_enable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_DEFAULT);
 	}
 }
 
@@ -566,6 +571,10 @@ static void vgicv3_arm_vtimer_wfi_rescue(struct acrn_vcpu *vcpu)
 static void vgicv3_keep_vtimer_rescue(struct acrn_vcpu *vcpu)
 {
 	vcpu->arch.vtimer_wfi_rescue = false;
+	if (!vcpu->arch.vtimer_lr_rescue) {
+		vcpu->arch.vtimer_lr_rescue_budget =
+			VGIC_VTIMER_LR_RESCUE_RESCHED_BUDGET;
+	}
 	vcpu->arch.vtimer_lr_rescue = true;
 	/*
 	 * Preserve the pending-only timer LR, but do not keep TWI armed for the
@@ -583,9 +592,24 @@ static void vgicv3_clear_vtimer_rescue(struct acrn_vcpu *vcpu)
 {
 	vcpu->arch.vtimer_wfi_rescue = false;
 	vcpu->arch.vtimer_lr_rescue = false;
+	vcpu->arch.vtimer_lr_rescue_budget = 0U;
 	vcpu->arch.gctx.hcr_el2 &= ~HCR_TWI;
 	if (get_running_vcpu(get_pcpu_id()) == vcpu) {
 		write_hcr_el2(vcpu->arch.gctx.hcr_el2);
+	}
+}
+
+void arm64_vgicv3_keep_vtimer_rescue(struct acrn_vcpu *vcpu)
+{
+	if (vcpu != NULL) {
+		vgicv3_keep_vtimer_rescue(vcpu);
+	}
+}
+
+void arm64_vgicv3_clear_vtimer_rescue(struct acrn_vcpu *vcpu)
+{
+	if (vcpu != NULL) {
+		vgicv3_clear_vtimer_rescue(vcpu);
 	}
 }
 
@@ -774,8 +798,13 @@ static bool vgicv3_vtimer_live_stuck(struct acrn_vcpu *vcpu)
 	virq = (gctx->timer_virq == 0U) ? ARM64_GIC_PPI_VIRTUAL_TIMER : gctx->timer_virq;
 	desc = vgic_irq_desc(vcpu, virq);
 
+	/*
+	 * Once LR rescue owns a pending-only timer LR, the virtual interrupt is
+	 * already materialized for EL1. Re-arming TWI from the backup timer only
+	 * traps the Linux idle loop again before it can naturally reach daifclr.
+	 */
 	return (desc != NULL) && desc->level && desc->pending && !desc->active &&
-		vgicv3_vtimer_pending_only_lr(vcpu, virq);
+		!vcpu->arch.vtimer_lr_rescue && vgicv3_vtimer_pending_only_lr(vcpu, virq);
 }
 
 static void remove_lr(struct acrn_vcpu *vcpu, uint32_t idx)
@@ -1676,6 +1705,16 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 					desc, timer_line_asserted);
 				if (timer_line_asserted) {
 					vgicv3_keep_vtimer_rescue(vcpu);
+					if ((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL) {
+						/*
+						 * The LR disappeared without EOI while CNTV is still
+						 * due. QEMU can consume a pending-only vtimer LR as
+						 * the next WFI wake before Linux reaches daifclr; trap
+						 * one more WFI so EL2 can re-flush the LR after WFI
+						 * retires instead of letting WFI consume it again.
+						 */
+						vgicv3_arm_vtimer_wfi_rescue(vcpu);
+					}
 				} else {
 					vgicv3_clear_vtimer_rescue(vcpu);
 				}
@@ -1931,22 +1970,36 @@ bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu)
 	return pending;
 }
 
-static bool vgicv3_pending_lr_blocks_reschedule(const struct acrn_vcpu *vcpu,
-	uint64_t lr)
+static bool vgicv3_pending_vtimer_rescue_blocks_reschedule(struct acrn_vcpu *vcpu,
+	uint32_t virq)
+{
+	if (!vcpu->arch.vtimer_lr_rescue || !vgic_is_vtimer_irq(vcpu, virq) ||
+		((vcpu->arch.regs.spsr & DAIF_IRQ) == 0UL)) {
+		return true;
+	}
+
+	/*
+	 * Linux resumes from WFI with PSTATE.I still set and needs a short EL1
+	 * run window to reach local_irq_enable(). Let the rescued pending-only
+	 * timer LR block a few host reschedule decisions, then fall back to IORR
+	 * fairness if the timer line still has not been consumed.
+	 */
+	if (vcpu->arch.vtimer_lr_rescue_budget > 0U) {
+		vcpu->arch.vtimer_lr_rescue_budget--;
+		return true;
+	}
+
+	return false;
+}
+
+static bool vgicv3_pending_lr_blocks_reschedule(struct acrn_vcpu *vcpu, uint64_t lr)
 {
 	uint32_t virq = lr_vintid(lr);
 	uint32_t state = lr_state(lr);
 	bool blocks = (state & ICH_LR_STATE_PENDING) != 0U;
 
-	if (blocks && vcpu->arch.vtimer_lr_rescue && vgic_is_vtimer_irq(vcpu, virq) &&
-		((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL)) {
-		/*
-		 * A rescued pending-only timer LR may be visible for many WFI retry
-		 * windows while Linux keeps PSTATE.I set. Treat it as guest progress
-		 * for WFI, but do not let that single timer line monopolize the host
-		 * pCPU and starve sibling VMs or later UART/SGI requests.
-		 */
-		blocks = false;
+	if (blocks) {
+		blocks = vgicv3_pending_vtimer_rescue_blocks_reschedule(vcpu, virq);
 	}
 
 	return blocks;
@@ -1982,14 +2035,11 @@ bool arm64_vgicv3_pending_irq_blocks_reschedule(struct acrn_vcpu *vcpu)
 			uint32_t bit = (uint32_t)ffs64((uint64_t)bits);
 			uint32_t virq = (word * 32U) + bit;
 			struct arm64_vgic_irq *desc = &vgic->irq[vcpu->vcpu_id][virq];
-			bool timer_rescue = vcpu->arch.vtimer_lr_rescue &&
-				vgic_is_vtimer_irq(vcpu, virq) &&
-				((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL);
 
 			bits &= ~BIT32(bit);
 			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc) &&
 				(!desc->level || (find_lr_for_virq(vcpu, virq) < 0)) &&
-				!timer_rescue) {
+				vgicv3_pending_vtimer_rescue_blocks_reschedule(vcpu, virq)) {
 				blocks = true;
 				break;
 			}

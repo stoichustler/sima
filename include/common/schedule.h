@@ -170,6 +170,7 @@ void deinit_thread_data(struct thread_object *obj);
 
 void make_reschedule_request(uint16_t pcpu_id);
 bool need_reschedule(uint16_t pcpu_id);
+bool sched_clear_reschedule_if_current_only(uint16_t pcpu_id);
 
 void run_thread(struct thread_object *obj);
 void sleep_thread(struct thread_object *obj);

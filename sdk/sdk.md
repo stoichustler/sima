@@ -585,7 +585,7 @@ Status as of 2026-06-18:
   - some failing captures report `wfx:none`, meaning the observed stall can
     occur on the normal physical IRQ return path, not only inside the trapped
     WFI diagnostic path.
-- Current local fix attempt is limited to ARM64 guest exit/vGIC code:
+- Earlier local fix attempts were limited to ARM64 guest exit/vGIC code:
   - `handle_wfx()` no longer yields WFI when a virtual IRQ is already pending,
     even if the saved guest PSTATE still masks IRQs.
   - the sync-trap and physical-IRQ return paths now refresh the current vtimer
@@ -595,8 +595,13 @@ Status as of 2026-06-18:
     and unmask interrupts. Physical IRQ exits still run host softirq processing
     before this refresh/schedule decision; skipping host softirqs made the BEAU
     console nearly unresponsive when VM2 kept virq27 pending.
-- This attempt intentionally does not modify `core/` scheduler/timer/vCPU code and
-  does not modify `sdk/image/linux/beau-linux.dts`.
+- The 2026-06-18 follow-up is allowed to modify `core/schedule.c` while still
+  keeping IORR as the scheduler. The FreeBSD arm64 vmm I/O reference keeps
+  vtimer delivery as a vGIC pending/notify problem: vtimer sync asserts or
+  deasserts the virtual timer IRQ from the current timer condition, the vGIC
+  tracks active/pending IRQs in a queue, and queued injection notifies the vCPU.
+  BEAU therefore should not let a host scheduler tick repeatedly consume the
+  guest return window when there is no other runnable thread on that pCPU.
 - Validation status for the current local tree:
   `python3 -m py_compile scripts/regress.py`, `sh -n scripts/repack_initramfs.sh`,
   and `git diff --check` pass. The QEMU BEAU image rebuilds successfully with:
@@ -608,33 +613,68 @@ Status as of 2026-06-18:
 
   Updated outputs are `out/qemu_out/beau.debug.out` and
   `out/qemu_out/beau.debug.bin`.
-- Regression status: the standard VM2 root-console path and a short 40-enter
-  initial VM2 burst can pass, but the stress sequence is not fixed. A
-  `--stress-rounds 4 --stress-enters 80 --no-terminal-replies` run failed after
-  switching back to VM2 and running `id`, with Linux reporting
-  `Possible timer handling issue on cpu=0 timer-softirq=0`. A later
-  `--stress-rounds 2 --stress-enters 40 --no-terminal-replies` run failed while
-  waiting for the VM2 `uos` prompt after switching back to VM2, with the same
-  RCU signature. Treat the VM2 console pressure issue as open.
+- Regression status after the PPI27 priority-mask repair and the
+  `core/schedule.c` no-op reschedule clear: the standard VM0/VM1/VM2 root-console
+  path passes, and the VM console pressure gate
+  `--stress-vsh-switch --stress-rounds 4 --stress-enters 80
+  --no-terminal-replies` also passes without the previous VM2 Linux
+  `timer-softirq=0` RCU stall. Keep this stress gate in future validation; add
+  repeated cold boots or longer rounds before treating the path as fully aged.
 - A one-shot experiment that cleared TWI after converting WFI rescue into LR
   rescue did not solve the failure and made the 40-enter stress fail earlier.
   Do not treat "clear TWI after LR rescue" by itself as the next root fix.
+- Before the PPI27 priority-mask repair, the 2026-06-18 follow-up reproduced with
+  IORR unchanged: CPU0/CPU1 were reported idling around `default_idle_call()`,
+  RCU said `rcu_preempt kthread timer wakeup didn't happen`, and the warning
+  remained `Possible timer handling issue on cpu=0 timer-softirq=0`. This
+  supported the narrower forward-progress hypothesis: the pending-only vtimer LR
+  was present, but VM2/vCPU0 could still be preempted by host scheduling before
+  Linux ran far enough past `cpu_do_idle+8` to execute
+  `local_irq_enable()`/`daifclr`.
+- The current narrow fix keeps IORR and adds a bounded ARM64 vGIC-only
+  no-reschedule window for rescued pending-only virtual timer LRs. While
+  `vtimer_lr_rescue` is set and saved guest PSTATE still has DAIF.I masked,
+  the timer pending state can block a few host `need_reschedule()` decisions so
+  Linux gets a short EL1 run window. After that small budget is consumed, IORR
+  fairness is restored so a stuck timer line cannot monopolize a shared pCPU.
+  `dumpstat` now prints this as `rescue:... lr:<yes|no> budget:N`.
+- The next failing dumps after that change showed an expired CNTV deadline,
+  `cntv_el2_masked:Y`, a pending-only timer LR, and no later timer sysreg write.
+  A live CNTV_CTL sample could be `0x1` even though EL2 computed the deadline as
+  expired. That points to this QEMU CPU model not reliably trapping EL1 CNTV_CTL
+  reads and not reliably reporting ISTATUS while the physical PPI27 line is
+  disabled. The current repair therefore keeps PPI27 enabled and masks only its
+  host priority (`0xff`, below the host PMR threshold) while a virtual timer LR
+  owns delivery. When the guest reprograms/EOIs the timer, EL2 restores priority
+  `0x80`. Linux can still observe the architecturally expired CNTV timer, while
+  the host avoids repeated PPI27 IRQs.
+- The core scheduling follow-up adds a narrow no-op reschedule clear:
+  `sched_clear_reschedule_if_current_only()` clears `NEED_RESCHEDULE` only when
+  the current non-idle thread is the only runnable/running non-blocking object
+  on that pCPU. In the ARM64 guest-return path this clear happens before the
+  vGIC pending-IRQ check, so VM2/vCPU0 on its private pCPU does not burn the
+  bounded virtual-timer LR rescue budget on a scheduler tick that would have
+  selected the same thread. Shared pCPUs still keep the bounded pending-IRQ
+  window and then fall back to IORR fairness.
+- Do not replace IORR for this issue. A dynamic tick-gating experiment reduced
+  pCPU1 host physical timer callbacks but still failed the VM2 Linux stress path
+  and changed timing rather than fixing the underlying vtimer/vGIC lifecycle.
 
 ### RCU Stall Repair Strategy
 
 1. Preserve the fast root-console baseline first. Before any VM2 RCU experiment,
    run the standard QEMU regression and require VM0 Zephyr, VM1 LK, and VM2
    Linux root identity checks to pass.
-2. Do not change `core/` scheduler/timer/vCPU code or
-   `sdk/image/linux/beau-linux.dts` as part of the first RCU fix attempt.
-   Those areas require explicit human confirmation and are not the current
-   narrow failure boundary.
+2. Keep `sdk/image/linux/beau-linux.dts` unchanged. Core scheduler changes
+   require explicit confirmation; the approved scope for this follow-up is the
+   `core/schedule.c` no-op reschedule clear, not a scheduler algorithm switch.
 3. Reproduce the stall from VM2 root shell with the 4-vCPU configuration. On
    the first RCU warning, return to the BEAU shell and capture `dumpstat 2`,
    `vcpus`, `schedstat`, and `irqstat`.
 4. In `dumpstat 2`, compare vCPU0 against the other VM2 vCPUs: live CNTV_CTL,
    CNTV_CVAL, CNTVCT, `cntv_el2_masked`, timer virq, LR0/LR1, vGIC descriptor
-   pending/active/level bits, AP registers, and host PPI27 state.
+   pending/active/level bits, AP registers, host PPI27 state, and the
+   `rescue` LR budget.
 5. Fix in the ARM64 vGIC/vtimer lifecycle, not in Linux bootargs. The likely
    repair boundary is a narrow synchronization point where EL2 already knows a
    timer LR completed or a loaded vCPU is leaving/entering guest execution.
@@ -654,8 +694,16 @@ Status as of 2026-06-18:
 
 - Marking pending-only software timer LRs with EOI caused maintenance storms
   and broke AP bring-up.
+- Requesting underflow maintenance (`HCR.UIE`) for rescued pending-only timer
+  LRs caused an underflow maintenance storm: dumps showed `HCR.UIE`, `MISR.U`,
+  one still-valid pending timer LR, and hundreds of thousands of vGIC
+  maintenance interrupts while VM2 Linux timed out. Do not use UIE as a
+  re-flush mechanism for this rescued timer window.
 - Replacing EL2's live CNTV mask with broad host PPI27 enable/disable logic
-  slowed or stalled RTOS console validation and was reverted.
+  slowed or stalled RTOS console validation and was reverted. Disabling PPI27
+  at the redistributor can also make Linux-visible CNTV_CTL.ISTATUS unreliable
+  on the QEMU CPU model used here. The current accepted variant keeps the PPI
+  enabled and masks only host priority while a vGIC timer LR owns delivery.
 - Dropping stale pending-only timer LRs from WFI or broad vGIC sync paths made
   startup visibly slower and was reverted.
 - Rewriting the WFI pending-only timer LR as Active+Pending made forward
@@ -669,6 +717,10 @@ Status as of 2026-06-18:
 - Skipping host softirq processing on physical IRQ return when a guest IRQ is
   pending starved the BEAU shell/console during the VM2 held-Enter scenario and
   was reverted. Keep `do_softirq_no_irqenable()` on the physical IRQ exit path.
+- Dynamically disabling IORR scheduler ticks when only the current thread is
+  runnable is not the right fix. It can hide pCPU tick pressure but does not
+  guarantee VM2 timer forward progress and should stay reverted unless a broader
+  scheduler design is reviewed separately.
 - Expanding the vITS software model to a static 8192-LPI descriptor array
   caused QEMU to stop producing useful shell output for more than 60 seconds.
   Keep the compact active-window model unless dynamic allocation is added.
@@ -729,8 +781,9 @@ virtualization port.
   uses a loader/module path for `Image` and `Initramfs.cpio.gz`, while its Linux-on-BEAU
   DTB remains embedded.
 - VM2 Linux runs as a 4-vCPU guest. The path should reach the initramfs `uos`
-  shell during QEMU validation, but the 4-vCPU path is not stable under the
-  current held-Enter and `vsh` switch pressure test.
+  shell during QEMU validation. The held-Enter and `vsh` switch pressure test
+  is now part of the acceptance gate because it previously reproduced the VM2
+  RCU/vtimer failure.
 - VM2 Linux keeps `earlycon=pl011,0x09000000` so `vsh 2` can show Linux logs
   before the normal PL011 console driver is registered.
 - VM console output from SMP guests can interleave because multiple guest CPUs
@@ -738,15 +791,15 @@ virtualization port.
 - Stage-2 mapping is still static for the QEMU `virt` platform.
 - The regression harness covers the core multi-VM boot sequence and has a manual
   `--stress-vsh-switch` path for the current console pressure scenario. That
-  stress path currently reproduces the VM2 RCU/vtimer failure and should remain
+  stress path previously reproduced the VM2 RCU/vtimer failure and should remain
   part of the acceptance gate for future fixes.
 
 ## Next Steps
 
-1. Fix the VM2 Linux vtimer/vGIC/vCPU-exit forward-progress failure reproduced
-   by `--stress-vsh-switch --stress-rounds 4 --stress-enters 80
-   --no-terminal-replies`. A candidate fix must pass this stress gate without
-   Linux `timer-softirq=0` RCU stalls.
+1. Add longer/repeated VM2 Linux stress coverage around
+   `--stress-vsh-switch --stress-rounds 4 --stress-enters 80
+   --no-terminal-replies`, including repeated cold boots, to age the current
+   PPI27 priority-mask plus no-op-reschedule fix.
 2. Keep using `constat 2`, `dumpstat 2`, `vcpus`, `schedstat`, and `irqstat` on
    failures. If `constat 2` still shows empty input backlog, empty vUART RX, and
    SPI33 not pending, continue focusing on VM2 timer/vGIC state rather than

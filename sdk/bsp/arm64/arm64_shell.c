@@ -560,6 +560,10 @@ static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *deb
 		shell_item_line("       cntv_ctl:0x%08x cntv_cval:0x%016lx cntvct:0x%016lx expired:%s",
 			last_return->cntv_ctl, last_return->cntv_cval,
 			last_return->cntvct, shell_yes_no(last_return->cntv_expired));
+		shell_item_line("       cntp_ctl:0x%08x cntp_cval:0x%016lx cntpct:0x%016lx delta:%ld",
+			last_return->cntp_ctl, last_return->cntp_cval,
+			last_return->cntpct,
+			(int64_t)(last_return->cntp_cval - last_return->cntpct));
 		shell_item_line("          hcr:0x%016lx   vmcr:0x%016lx     misr:0x%016lx     eisr:0x%016lx elrsr:0x%016lx",
 			last_return->hcr, last_return->vmcr, last_return->misr,
 			last_return->eisr, last_return->elrsr);
@@ -767,6 +771,7 @@ struct dumpstat_snapshot {
 	uint64_t irqs_pending;
 	uint64_t irqs_pending_mask;
 	uint32_t live_cntv_ctl_el0;
+	uint8_t vtimer_lr_rescue_budget;
 	bool vtimer_stuck_rescue_armed;
 	bool vtimer_wfi_rescue;
 	bool vtimer_lr_rescue;
@@ -796,6 +801,8 @@ static void shell_dumpstat_capture(void *data)
 			snapshot->vcpu->arch.vtimer_stuck_rescue_armed;
 		snapshot->vtimer_wfi_rescue = snapshot->vcpu->arch.vtimer_wfi_rescue;
 		snapshot->vtimer_lr_rescue = snapshot->vcpu->arch.vtimer_lr_rescue;
+		snapshot->vtimer_lr_rescue_budget =
+			snapshot->vcpu->arch.vtimer_lr_rescue_budget;
 		if ((snapshot->vcpu->vm != NULL) &&
 			(snapshot->vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
 			(void)memcpy_s(snapshot->local_irq, sizeof(snapshot->local_irq),
@@ -869,6 +876,7 @@ static const struct cpu_regs *shell_dumpstat_get_regs(struct acrn_vcpu *vcpu,
 	snapshot->vtimer_stuck_rescue_armed = vcpu->arch.vtimer_stuck_rescue_armed;
 	snapshot->vtimer_wfi_rescue = vcpu->arch.vtimer_wfi_rescue;
 	snapshot->vtimer_lr_rescue = vcpu->arch.vtimer_lr_rescue;
+	snapshot->vtimer_lr_rescue_budget = vcpu->arch.vtimer_lr_rescue_budget;
 	snapshot->has_timer_irq = false;
 	if ((vcpu->vm != NULL) && (vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
 		(void)memcpy_s(&snapshot->timer_irq, sizeof(snapshot->timer_irq),
@@ -925,10 +933,11 @@ static void shell_dumpstat_timer_state(const struct dumpstat_snapshot *snapshot)
 	shell_item_line("       cntv_ctl:0x%08x cntv_cval:0x%016lx el2_masked:%s",
 		gctx->cntv_ctl_el0, gctx->cntv_cval_el0,
 		shell_yes_no(gctx->cntv_el2_masked));
-	shell_item_line("       rescue:stuck:%s wfi:%s lr:%s",
+	shell_item_line("       rescue:stuck:%s wfi:%s lr:%s budget:%u",
 		shell_yes_no(snapshot->vtimer_stuck_rescue_armed),
 		shell_yes_no(snapshot->vtimer_wfi_rescue),
-		shell_yes_no(snapshot->vtimer_lr_rescue));
+		shell_yes_no(snapshot->vtimer_lr_rescue),
+		snapshot->vtimer_lr_rescue_budget);
 	if (snapshot->has_live_timer) {
 		uint64_t guest_now = snapshot->live_cntvct_el0;
 		const struct arm64_gicv3_local_irq_state *host_irq = &snapshot->host_timer_irq;

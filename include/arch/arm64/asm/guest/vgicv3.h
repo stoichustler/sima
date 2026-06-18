@@ -161,6 +161,8 @@ void arm64_vgicv3_flush_current_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_sync_current_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_refresh_current_level_irq(struct acrn_vm *vm, uint32_t virq);
 void arm64_vgicv3_complete_wfi_irqs(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_keep_vtimer_rescue(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_clear_vtimer_rescue(struct acrn_vcpu *vcpu);
 bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu);
 bool arm64_vgicv3_pending_irq_blocks_reschedule(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_poll_current_vtimer(struct acrn_vcpu *vcpu);

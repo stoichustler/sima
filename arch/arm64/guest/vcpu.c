@@ -274,18 +274,22 @@ static void load_guest_timer(struct arm64_vcpu_guest_ctx *gctx)
 {
 	uint32_t ctl;
 
-	arm64_gicv3_enable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
-
 	write_cntv_ctl_el0(0U);
+	if (gctx->cntv_el2_masked) {
+		arm64_gicv3_unmask_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_MASKED);
+	} else {
+		arm64_gicv3_enable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_DEFAULT);
+	}
 	if (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
 		write_cntv_cval_el0(gctx->cntp_cval_el0);
 		ctl = gctx->cntp_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
 	} else {
 		write_cntv_cval_el0(gctx->cntv_cval_el0);
 		ctl = gctx->cntv_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
-	}
-	if (gctx->cntv_el2_masked) {
-		ctl |= CNTV_CTL_IMASK;
 	}
 	write_cntv_ctl_el0(ctl);
 }
@@ -300,8 +304,8 @@ static void save_guest_timer(struct arm64_vcpu_guest_ctx *gctx)
 	/*
 	 * Linux may access the EL1 virtual timer directly when the trap is not
 	 * taken by the CPU model. Keep the guest shadow synchronized on vCPU
-	 * switch-out. EL2 may temporarily set live CNTV_CTL.IMASK while a timer
-	 * interrupt is in flight; keep that host mask out of the guest shadow.
+	 * switch-out. EL2 may temporarily gate host PPI27 while a timer interrupt
+	 * is in flight; keep that host mask out of the guest shadow.
 	 */
 	cval = read_cntv_cval_el0();
 	ctl = read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
@@ -370,6 +374,8 @@ void unload_vcpu(__unused struct acrn_vcpu *vcpu)
 	arm64_vcpu_trace_vtimer_switch(vcpu, ARM64_VTIMER_TRACE_UNLOAD);
 	write_cntv_ctl_el0(0U);
 	arm64_gicv3_enable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+	arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+		ARM64_GIC_PRIORITY_DEFAULT);
 	arm64_vgicv3_save_vcpu(vcpu);
 	arm64_vgicv3_arm_vtimer_backup(vcpu);
 	write_hcr_el2(0UL);

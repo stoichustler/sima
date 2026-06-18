@@ -24,6 +24,10 @@ FATAL_PATTERNS = (
     "unexpected irq",
     "unhandled arm64 vcpu exit",
     "failed to handle arm64 vcpu exit",
+    "rcu_preempt detected stalls",
+    "rcu_preempt kthread timer wakeup didn't happen",
+    "possible timer handling issue",
+    "timer-softirq=0",
 )
 FATAL_DRAIN_TIMEOUT = 1.0
 
@@ -155,6 +159,7 @@ class QemuSession:
         self.decoder_finalized = False
         self.proc = None
         self.selector = selectors.DefaultSelector()
+        self.ignore_fatal = False
 
     def __enter__(self):
         self.proc = subprocess.Popen(
@@ -208,7 +213,8 @@ class QemuSession:
             self.output += self.decoder.decode(data)
             if not getattr(self, "disable_terminal_replies", False):
                 self.reply_terminal_queries()
-            self.check_fatal()
+            if not self.ignore_fatal:
+                self.check_fatal()
 
     def reply_terminal_queries(self):
         pending = self.output[self.cpr_scan_offset:]
@@ -292,6 +298,8 @@ class QemuSession:
 
     def capture_vm_diagnostics(self, label, vmid):
         print(f"[regress] diagnostics: {label}", flush=True)
+        old_ignore_fatal = self.ignore_fatal
+        self.ignore_fatal = True
         try:
             self.send(CTRL_D)
             self.expect(PROMPT, f"return to BEAU shell for {label}", timeout=5.0, keepalive=ENTER)
@@ -300,6 +308,8 @@ class QemuSession:
                 self.expect(PROMPT, f"{line} diagnostics", timeout=15.0, keepalive=ENTER)
         except Exception as err:
             print(f"[regress] diagnostics failed: {err}", flush=True)
+        finally:
+            self.ignore_fatal = old_ignore_fatal
 
 
 def vsh_enter(qemu, vmid, prompt, name, timeout=30.0):
@@ -311,20 +321,30 @@ def vsh_enter(qemu, vmid, prompt, name, timeout=30.0):
         raise
 
 
-def vsh_return(qemu, name):
+def vsh_return(qemu, name, vmid=None):
     qemu.send(CTRL_D)
-    qemu.expect(PROMPT, name, timeout=10.0, keepalive=ENTER)
+    try:
+        qemu.expect(PROMPT, name, timeout=10.0, keepalive=ENTER)
+    except Exception:
+        if vmid is not None:
+            qemu.capture_vm_diagnostics(name, vmid)
+        raise
 
 
-def send_enter_burst(qemu, count, delay, name):
+def send_enter_burst(qemu, count, delay, name, vmid=None):
     print(f"[regress] stress: {name}: {count} Enter keys", flush=True)
-    for idx in range(max(0, count)):
-        qemu.send(ENTER)
-        if delay > 0.0:
-            qemu.drain_for(delay)
-        elif (idx + 1) % 16 == 0:
-            qemu.drain_for(0.02)
-    qemu.drain_for(0.2)
+    try:
+        for idx in range(max(0, count)):
+            qemu.send(ENTER)
+            if delay > 0.0:
+                qemu.drain_for(delay)
+            elif (idx + 1) % 16 == 0:
+                qemu.drain_for(0.02)
+        qemu.drain_for(0.2)
+    except Exception:
+        if vmid is not None:
+            qemu.capture_vm_diagnostics(name, vmid)
+        raise
 
 
 def expect_vm2_id(qemu, name):
@@ -341,32 +361,32 @@ def run_vsh_switch_stress(qemu, args):
         return
 
     vsh_enter(qemu, 2, LINUX_PROMPT, "stress VM2 Linux shell", timeout=30.0)
-    send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay, "VM2 initial")
+    send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay, "VM2 initial", vmid=2)
     expect_vm2_id(qemu, "VM2 Linux identity after initial Enter burst")
-    vsh_return(qemu, "return from stress VM2 initial")
+    vsh_return(qemu, "return from stress VM2 initial", vmid=2)
 
     vsh_enter(qemu, 1, "beau ~>", "stress VM1 LK shell")
-    send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay, "VM1 LK")
-    vsh_return(qemu, "return from stress VM1")
+    send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay, "VM1 LK", vmid=1)
+    vsh_return(qemu, "return from stress VM1", vmid=1)
 
     for idx in range(args.stress_rounds):
         label = idx + 1
         vsh_enter(qemu, 0, "zero ~>", f"stress round {label}: VM0 Zephyr shell")
         send_enter_burst(qemu, max(1, args.stress_enters // 4),
-            args.stress_enter_delay, f"round {label} VM0")
-        vsh_return(qemu, f"stress round {label}: return from VM0")
+            args.stress_enter_delay, f"round {label} VM0", vmid=0)
+        vsh_return(qemu, f"stress round {label}: return from VM0", vmid=0)
 
         vsh_enter(qemu, 1, "beau ~>", f"stress round {label}: VM1 LK shell")
         send_enter_burst(qemu, max(1, args.stress_enters // 4),
-            args.stress_enter_delay, f"round {label} VM1")
-        vsh_return(qemu, f"stress round {label}: return from VM1")
+            args.stress_enter_delay, f"round {label} VM1", vmid=1)
+        vsh_return(qemu, f"stress round {label}: return from VM1", vmid=1)
 
         vsh_enter(qemu, 2, LINUX_PROMPT, f"stress round {label}: VM2 Linux shell",
             timeout=30.0)
         send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay,
-            f"round {label} VM2")
+            f"round {label} VM2", vmid=2)
         expect_vm2_id(qemu, f"stress round {label}: VM2 identity after switch")
-        vsh_return(qemu, f"stress round {label}: return from VM2")
+        vsh_return(qemu, f"stress round {label}: return from VM2", vmid=2)
 
     print("[pass] VM console switch stress complete", flush=True)
 
