@@ -214,6 +214,7 @@ boot logs settle to show the `console:\>` prompt.
   - `schedstat`
   - `vmap`
   - `irqstat`
+  - `constat [vm id]`
   - `dumpstat [vm id]`
   - `vsh <vm id>`
 - Press Tab in the BEAU shell to display `registered commands`; `help` is not
@@ -248,6 +249,11 @@ boot logs settle to show the `console:\>` prompt.
   entries are raw addresses because BEAU does not embed guest symbol tables. The
   debug image embeds the BEAU symbol table, so host stack return addresses are
   printed as `function+offset`. Offline vCPUs skip stack output.
+- `constat [vm id]` prints focused VM console state for live diagnostics:
+  selected/input VM IDs, host input backlog, async TX ring usage and drops,
+  vUART RX/TX state, vPL011 pending/assert/deassert counters, and the guest UART
+  SPI state in the vGIC. Use it with `dumpstat`, `vcpus`, `schedstat`, and
+  `irqstat` when debugging `vsh` responsiveness.
 - ARM64 host exception call traces resolve return addresses through the
   embedded BEAU symbol table and print `function+offset` beside the raw LR.
 - VM vPL011 TX output from the currently selected `vsh` VM is written into a
@@ -284,11 +290,10 @@ boot logs settle to show the `console:\>` prompt.
   calls or vCPU event requests to redeliver RX interrupts. Guest UART MMIO exits
   on an already asserted line refresh the current vGIC LR in place so active RX
   interrupts can become active+pending without a remote wakeup storm.
-- ARM64 vtimer stuck rescue keeps WFI trapping armed while a timer pending-only
-  LR remains stuck with EL1 IRQs masked, and clears that rescue state only when
-  timer EOI or a line-low resample proves the source is complete. This lets
-  Linux escape repeated WFI returns after heavy console RX traffic instead of
-  leaving CNTV host-masked with `pending:yes active:no`.
+- ARM64 vtimer stuck rescue has diagnostic plumbing for the pending-only timer
+  LR case where Linux reaches idle with EL1 IRQs still masked and CNTV remains
+  host-masked. This path is still under active investigation; it is not yet a
+  proven stability fix for VM2 Linux held-Enter/vsh-switch stress.
 - ARM64 vPL011 vio for guest PL011 MMIO and RX interrupt notification.
 - ARM64 vPL011 avoids running the vGIC level-deassert path for ordinary PL011
   polling reads, especially Linux's frequent `FR` reads around console output.
@@ -400,14 +405,90 @@ The following have been verified on QEMU with `-smp 8`:
   pending tables for CPU0-CPU3. This predates the switch to the direct
   initramfs `uos` shell.
 
+## Manual Regression
+
+Use these commands when validating the QEMU 3OS console, vGIC, vtimer, and
+vCPU-exit path manually. Set the toolchain path first:
+
+```bash
+export BEAU_TOOLCHAINS=$HOME/beau-cc/bin
+```
+
+For debug, shell, or console changes, remove stale debug artifacts before
+building so `libdebug.a` and the final linked image are refreshed:
+
+```bash
+rm -f out/qemu_out/modules/libdebug.a \
+      out/qemu_out/beau.out \
+      out/qemu_out/beau.debug.out \
+      out/qemu_out/beau.debug.bin
+PATH=${BEAU_TOOLCHAINS}:$PATH \
+make ARCH=arm64 PLATFORM=qemu CROSS_COMPILE=aarch64-none-elf- -j$(nproc)
+```
+
+Lightweight checks before booting:
+
+```bash
+python3 -m py_compile scripts/regress.py
+sh -n scripts/repack_initramfs.sh
+git diff --check
+```
+
+Standard QEMU smoke regression:
+
+```bash
+BEAU_TOOLCHAINS=${BEAU_TOOLCHAINS} \
+./scripts/regress.py --no-build --timeout 240
+```
+
+The smoke run should reach the BEAU shell, pass `vcpus`, `schedstat`, `vmap`,
+`irqstat`, `dumpstat 0`, enter and leave `vsh 0`, `vsh 1`, and `vsh 2`, and
+verify VM2 Linux root identity with `id` showing `gid=0`.
+
+VM console switch and held-Enter pressure regression:
+
+```bash
+BEAU_TOOLCHAINS=${BEAU_TOOLCHAINS} \
+./scripts/regress.py --no-build --timeout 300 \
+  --stress-vsh-switch \
+  --stress-rounds 4 \
+  --stress-enters 80 \
+  --no-terminal-replies
+```
+
+This stress run models the manual failure sequence: enter VM2 and press Enter
+repeatedly, switch to VM1 and press Enter, switch to VM0, then switch back to
+VM2 and run `id`. Passing means VM2 still reaches `uos ~`, `id` returns `gid=0`,
+no Linux RCU stall appears, and Ctrl-D still returns to `console:\>`.
+
+If a regression fails, the harness tries to return to the BEAU shell and capture
+`vcpus`, `schedstat`, `irqstat`, `constat <vmid>`, and `dumpstat <vmid>` into
+`out/qemu_out/regress.log`. If reproducing manually through `./scripts/kick.py`,
+run the same commands immediately after Ctrl-D:
+
+```text
+vcpus
+schedstat
+irqstat
+constat 2
+dumpstat 2
+```
+
+For the current VM2 issue, key failure indicators are Linux messages containing
+`rcu_preempt kthread timer wakeup didn't happen`,
+`Possible timer handling issue on cpu=0 timer-softirq=0`, VM2/vCPU0 stopped at
+`elr:0xffff800080f0fe4c`, virtual timer `virq:27` pending, and a pending-only
+timer LR such as `0x508000000000001b`.
+
 ## VM2 Linux Debug Snapshot
 
 Status as of 2026-06-18:
 
 - Current baseline: VM2 Linux uses `sdk/image/linux/Initramfs.cpio.gz` and
   `rdinit=/init`, enters the initramfs `uos` root shell on PL011, and the
-  regression checks root identity with `id`. This is the baseline to preserve
-  before making any further VM2 timer or vGIC change.
+  regression checks root identity with `id`. This basic root-console path is
+  working and is the baseline to preserve before making any further VM2 timer
+  or vGIC change.
 - The baseline was restored after reverting the stale pending-only timer LR
   drop experiment. That experiment made boot and VM console handoff visibly
   slower and must not be treated as the starting point for future work.
@@ -449,8 +530,10 @@ Status as of 2026-06-18:
 
 ### VM2 Linux RCU Stall Signature
 
-- The remaining issue is post-login SMP runtime stability, not pre-login boot:
-  VM2 can reach the root console, then later Linux may print RCU stall messages.
+- The remaining issue is post-login SMP runtime stability under VM console
+  pressure, not pre-login boot: VM2 can reach the root console and run `id`, but
+  the held-Enter plus `vsh 2 -> vsh 1 -> vsh 0 -> vsh 2` sequence can still
+  trigger Linux RCU stall messages.
 - The representative Linux log says
   `rcu_preempt kthread timer wakeup didn't happen`,
   `Possible timer handling issue on cpu=0 timer-softirq=0`, and shows target
@@ -477,7 +560,14 @@ Status as of 2026-06-18:
   still stops around Linux `cpu_do_idle()` return, but the virtual timer LR is
   visible as pending-only, for example `live_lr0:0x508000000000001b` for
   virtual INTID 27. The remaining stall is therefore no longer primarily "timer
-  LR disappeared"; it is a forward-progress window after WFI wakeup.
+  LR disappeared"; it is a forward-progress window after WFI wakeup and before
+  Linux handles the pending timer interrupt.
+- `constat 2` from failing stress runs shows the VM console input path is not
+  the immediate stuck point after Ctrl-D diagnostics: host input backlog is
+  empty, vUART RX is empty, vPL011 RX IRQ is not asserted, SPI33 is not pending,
+  and the async TX ring may have drops only from the heavy Linux log stream.
+  That points the active failure boundary back to VM2 vtimer/vGIC/vCPU-exit
+  progress rather than lost host-to-guest console bytes.
 - Symbolication for the active VM2 Linux image maps runtime
   `0xffff800080f0fe4c` to `cpu_do_idle+8`, the instruction after WFI and before
   `arch_cpu_idle()` returns toward `default_idle_call()`. Linux reaches this
@@ -494,7 +584,7 @@ Status as of 2026-06-18:
   - some failing captures report `wfx:none`, meaning the observed stall can
     occur on the normal physical IRQ return path, not only inside the trapped
     WFI diagnostic path.
-- Current local fix is limited to `arch/arm64/guest/vcpu_exit.c`:
+- Current local fix attempt is limited to ARM64 guest exit/vGIC code:
   - `handle_wfx()` no longer yields WFI when a virtual IRQ is already pending,
     even if the saved guest PSTATE still masks IRQs.
   - the sync-trap and physical-IRQ return paths now refresh the current vtimer
@@ -504,11 +594,11 @@ Status as of 2026-06-18:
     and unmask interrupts. Physical IRQ exits still run host softirq processing
     before this refresh/schedule decision; skipping host softirqs made the BEAU
     console nearly unresponsive when VM2 kept virq27 pending.
-- This fix intentionally does not modify `core/` scheduler/timer/vCPU code and
+- This attempt intentionally does not modify `core/` scheduler/timer/vCPU code and
   does not modify `sdk/image/linux/beau-linux.dts`.
-- Human-run validation completed for the local fix:
-  `git diff --check -- arch/arm64/guest/vcpu_exit.c` passed, and the QEMU BEAU
-  image rebuilt successfully with:
+- Validation status for the current local tree:
+  `python3 -m py_compile scripts/regress.py`, `sh -n scripts/repack_initramfs.sh`,
+  and `git diff --check` pass. The QEMU BEAU image rebuilds successfully with:
 
   ```bash
   PATH=${BEAU_TOOLCHAINS}:$PATH \
@@ -517,12 +607,17 @@ Status as of 2026-06-18:
 
   Updated outputs are `out/qemu_out/beau.debug.out` and
   `out/qemu_out/beau.debug.bin`.
-- Manual validation is still pending. The next run should rebuild/boot the
-  updated image, enter the VM2 Linux initramfs `uos` root shell, keep the
-  4-vCPU guest running past the previous RCU stall window, and confirm that
-  vCPU0 no longer remains at `cpu_do_idle+8` with virq 27 pending. If the stall
-  still appears, capture `dumpstat 2`, `vcpus`, `schedstat`, and `irqstat`
-  immediately.
+- Regression status: the standard VM2 root-console path and a short 40-enter
+  initial VM2 burst can pass, but the stress sequence is not fixed. A
+  `--stress-rounds 4 --stress-enters 80 --no-terminal-replies` run failed after
+  switching back to VM2 and running `id`, with Linux reporting
+  `Possible timer handling issue on cpu=0 timer-softirq=0`. A later
+  `--stress-rounds 2 --stress-enters 40 --no-terminal-replies` run failed while
+  waiting for the VM2 `uos` prompt after switching back to VM2, with the same
+  RCU signature. Treat the VM2 console pressure issue as open.
+- A one-shot experiment that cleared TWI after converting WFI rescue into LR
+  rescue did not solve the failure and made the 40-enter stress fail earlier.
+  Do not treat "clear TWI after LR rescue" by itself as the next root fix.
 
 ### RCU Stall Repair Strategy
 
@@ -633,33 +728,38 @@ virtualization port.
   uses a loader/module path for `Image` and `Initramfs.cpio.gz`, while its Linux-on-BEAU
   DTB remains embedded.
 - VM2 Linux runs as a 4-vCPU guest. The path should reach the initramfs `uos`
-  shell during QEMU validation; repeated cold-boot coverage is still needed
-  before calling the 4-vCPU path stable.
+  shell during QEMU validation, but the 4-vCPU path is not stable under the
+  current held-Enter and `vsh` switch pressure test.
 - VM2 Linux keeps `earlycon=pl011,0x09000000` so `vsh 2` can show Linux logs
   before the normal PL011 console driver is registered.
 - VM console output from SMP guests can interleave because multiple guest CPUs
   write concurrently to the same PL011 console.
 - Stage-2 mapping is still static for the QEMU `virt` platform.
-- The regression harness covers the core multi-VM boot sequence when run
-  manually, but broader stress and overflow coverage is still pending.
+- The regression harness covers the core multi-VM boot sequence and has a manual
+  `--stress-vsh-switch` path for the current console pressure scenario. That
+  stress path currently reproduces the VM2 RCU/vtimer failure and should remain
+  part of the acceptance gate for future fixes.
 
 ## Next Steps
 
-1. Add repeated cold-boot and initramfs-shell coverage for VM2 Linux 4-vCPU/SMP,
+1. Fix the VM2 Linux vtimer/vGIC/vCPU-exit forward-progress failure reproduced
+   by `--stress-vsh-switch --stress-rounds 4 --stress-enters 80
+   --no-terminal-replies`. A candidate fix must pass this stress gate without
+   Linux `timer-softirq=0` RCU stalls.
+2. Keep using `constat 2`, `dumpstat 2`, `vcpus`, `schedstat`, and `irqstat` on
+   failures. If `constat 2` still shows empty input backlog, empty vUART RX, and
+   SPI33 not pending, continue focusing on VM2 timer/vGIC state rather than
+   host-to-guest console input.
+3. Add repeated cold-boot and initramfs-shell coverage for VM2 Linux 4-vCPU/SMP,
    with diagnostics for timer, SGI, and pending/active LR state on failures.
-2. Validate the bounded console drain and vPL011 IRQ-line throttling against
-   `vsh 2` handoff smoothness. If VM2 is still visibly slow, capture
-   `dumpstat 2`, `irqstat`, and `schedstat`, then compare the VM2 guest UART IRQ
-   count against scheduler/timer progress before changing vGICv3, vtimer, or
-   vCPU-exit code.
-3. Extend `scripts/regress.py` with more VM2 Linux initramfs-shell commands, reboot
+4. Extend `scripts/regress.py` with more VM2 Linux initramfs-shell commands, reboot
    coverage, repeated cold boots, and saved log artifacts suitable for CI.
-4. Audit ARM64 abort handling to confirm whether guest instruction aborts are
+5. Audit ARM64 abort handling to confirm whether guest instruction aborts are
    trapped and diagnosed correctly. Cover instruction fetch aborts separately
    from data abort MMIO paths, document the expected ESR/FAR/HPFAR trigger
    scenarios, and update comments so instruction abort, data abort, and broader
    memory abort terminology are not conflated.
-5. Move QEMU platform memory and device discovery toward host-FDT-derived data
+6. Move QEMU platform memory and device discovery toward host-FDT-derived data
    where it helps reduce static board assumptions.
-6. Bring up rk356x hardware manually, then capture the validated RAM, UART,
+7. Bring up rk356x hardware manually, then capture the validated RAM, UART,
    GIC, and boot-image placement assumptions back into the platform files.

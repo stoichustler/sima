@@ -796,16 +796,16 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 	if (!is_wfe && vcpu->arch.vtimer_wfi_rescue) {
 		if (pending_irq && irq_masked) {
 			vcpu->arch.vtimer_lr_rescue = true;
-			vcpu->arch.gctx.hcr_el2 |= HCR_TWI;
 			arm64_vgicv3_update_current_vtimer(vcpu);
 			/*
-			 * Keep TWI armed while the pending-only timer rescue is active.
-			 * Linux may return from this WFI with IRQs masked, do idle-exit
-			 * bookkeeping, and then loop into WFI again before daifclr. The
-			 * rescue marker protects the LR contents; TWI guarantees that a
-			 * repeated WFI cannot sleep behind the same pending virtual timer.
+			 * TWI is a one-shot wake assist for the WFI that raced an already
+			 * pending virtual timer. Once the timer LR has been preserved, let
+			 * EL1 run with architectural WFI semantics again; keeping TWI armed
+			 * turns a masked idle loop into repeated EL2 traps and can starve
+			 * Linux timer softirq progress.
 			 */
 			vcpu->arch.vtimer_wfi_rescue = false;
+			vcpu->arch.gctx.hcr_el2 &= ~HCR_TWI;
 			should_yield = false;
 		} else {
 			vcpu->arch.vtimer_wfi_rescue = false;

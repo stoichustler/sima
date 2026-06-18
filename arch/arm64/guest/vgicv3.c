@@ -568,11 +568,12 @@ static void vgicv3_keep_vtimer_rescue(struct acrn_vcpu *vcpu)
 	vcpu->arch.vtimer_wfi_rescue = false;
 	vcpu->arch.vtimer_lr_rescue = true;
 	/*
-	 * Keep trapping WFI while EL2 is preserving a pending-only timer LR for an
-	 * expired CNTV source. The clear path disables TWI once the timer line drops
-	 * or guest EOI proves the interrupt has completed.
+	 * Preserve the pending-only timer LR, but do not keep TWI armed for the
+	 * entire rescue window. TWI is only used to break one WFI sleep; after that,
+	 * a permanently trapped idle loop prevents the guest from reaching the timer
+	 * unmask/softirq path that clears the source.
 	 */
-	vcpu->arch.gctx.hcr_el2 |= HCR_TWI;
+	vcpu->arch.gctx.hcr_el2 &= ~HCR_TWI;
 	if (get_running_vcpu(get_pcpu_id()) == vcpu) {
 		write_hcr_el2(vcpu->arch.gctx.hcr_el2);
 	}
