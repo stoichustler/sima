@@ -1,14 +1,14 @@
 # BEAU HYPERVISOR
 
 ```text
-__________ ___________   _____    ____ ___
-\______   \\_   _____/  /  _  \  |    |   \
- |    |  _/ |    __)_  /  /_\  \ |    |   /
- |    |   \ |        \/    |    \|    |  /
- |______  //_______  /\____|__  /|______/ (os 2026)
-        \/         \/         \/
-
+888 88b, 888'Y88     e Y8b     8888 8888     e88 88e    dP"8
+888 88P' 888 ,'Y    d8b Y8b    8888 8888    d888 888b  C8b Y
+888 8K   888C8     d888b Y8b   8888 8888   C8888 8888D  Y8b
+888 88b, 888 ",d  d888888888b  8888 8888    Y888 888P  b Y8D
+888 88P' 888,d88 d8888888b Y8b 'Y88 88P'     "88 88"   8edP (2026)
 ```
+
+## Introduction
 
 BEAU is a compact ARM64 hypervisor bring-up project for QEMU `virt` and rk356x
 hardware. It runs at EL2 and focuses on a small, readable virtualization base
@@ -23,51 +23,6 @@ for mixed RTOS and Linux guests.
 │ VM2 Linux    │ prelaunch VM  │
 └──────────────┴───────────────┘
 ```
-
-## Completed
-
-| Area | Feature |
-| --- | --- |
-| Platform | ARM64 QEMU `virt`; rk356x hardware-platform skeleton |
-| Boot | Static raw-image guests with `kick.py` toolchain and Linux image loader selection |
-| Guests | Zephyr, LK, and Linux boot as 3 concurrent OS instances |
-| vCPU | EL1 guest entry/exit, shared-pCPU scheduling, PSCI CPU_ON |
-| Memory | Static guest RAM windows, stage-2 identity mapping, zero-page guard |
-| GICv3 | vGICv3 distributor, per-vCPU redistributor, list registers |
-| Interrupts | SGI/PPI/SPI routing, timer injection, vGIC maintenance handling |
-| Console | vPL011, async VM console buffer, `vsh` guest shell switching |
-| Debug | `vcpus`, `threads`, `schedstat`, `vmap`, `irqstat`, `dumpstat`, `vsh` |
-| Tests | `scripts/regress.py` validates BEAU shell and all guest consoles |
-| Docs | SDK notes, ARM64 assembly comments, concise architecture references |
-
-LK and Zephyr stay as repository-local `.incbin` guest images under
-`sdk/image`. VM2 Linux uses `sdk/image/linux/Image` and `sdk/image/linux/Initramfs.cpio.gz`, which
-QEMU stages with `-device loader`; BEAU then copies them into the VM2 RAM window.
-The Linux device tree remains repository-local as `sdk/image/linux/beau-linux.dtb`.
-
-```text
-┌────────────┬────────────┬────────────┬────────────┐
-│ CPU/vCPU   │ Stage-2    │ vGICv3     │ vPL011     │
-├────────────┼────────────┼────────────┼────────────┤
-│ EL1 guest  │ RAM guard  │ GICD/GICR  │ vsh switch │
-│ PSCI boot  │ 1:1 map    │ LRs/timer  │ ring buf   │
-└────────────┴────────────┴────────────┴────────────┘
-```
-
-## To Optimize
-
-| Area | Work |
-| --- | --- |
-| VM config | Make VM2/VM3 additions more data-driven and less board-specific |
-| Loader | Generalize the Linux module/image loader path beyond QEMU staging |
-| vGICv3 | Improve priority, pending/active state, MSI/LPI, ITS readiness |
-| Redistributor | Harden multi-vCPU GICR state save/restore and migration paths |
-| Memory | Add richer stage-2 attributes, dynamic regions, and fault reporting |
-| Devices | Generalize MMIO emulation beyond vPL011 and virtual GIC devices |
-| Scheduling | Refine shared-pCPU policy, accounting, and latency visibility |
-| Regression | Add longer SMP Linux, interrupt, console overflow, and reboot tests |
-| Portability | Derive more platform data from FDT instead of static QEMU tables |
-| Documentation | Keep docs aligned with implemented behavior and test coverage |
 
 ## Source Base And License
 

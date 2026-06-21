@@ -2,6 +2,15 @@
  * Copyright (C) 2026 Hustler Lo.
  *
  * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * ──────────────────────────────────────────────────────────────
+ *   888 88b, 888'Y88     e Y8b     8888 8888     e88 88e    dP"8
+ *   888 88P' 888 ,'Y    d8b Y8b    8888 8888    d888 888b  C8b Y
+ *   888 8K   888C8     d888b Y8b   8888 8888   C8888 8888D  Y8b
+ *   888 88b, 888 ",d  d888888888b  8888 8888    Y888 888P  b Y8D
+ *   888 88P' 888,d88 d8888888b Y8b 'Y88 88P'     "88 88"   8edP
+ *
+ * XXX: BEAU OS entry point.
  */
 
 #include <asm/cpu.h>
