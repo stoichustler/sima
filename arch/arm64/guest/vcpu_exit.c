@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <logmsg.h>
 #include <io_req.h>
+#include <guest_memory.h>
 #include <acrn_common.h>
 #include <softirq.h>
 #include <ticks.h>
@@ -40,6 +41,7 @@
  */
 #define HPFAR_EL2_FIPA_MASK	0xfffffffff0UL
 #define FAR_EL2_PAGE_MASK	0xfffUL
+#define VM_STACK_TRACE_DEPTH	16U
 
 #define PSCI_0_2_FN_PSCI_VERSION	0x84000000U
 #define PSCI_0_2_FN_CPU_SUSPEND	0x84000001U
@@ -97,6 +99,11 @@
 #define SYSREG_CNTV_TVAL_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 3UL, 0UL)
 #define SYSREG_CNTVCT_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 0UL, 2UL)
 
+struct arm64_guest_stack_frame {
+	uint64_t fp;
+	uint64_t lr;
+};
+
 static uint32_t guest_timer_ctl_value(uint32_t ctl, uint64_t cval, uint64_t now)
 {
 	uint32_t value = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
@@ -125,6 +132,54 @@ static uint64_t arm64_fault_ipa(const struct cpu_regs *regs)
 static uint32_t arm64_abort_fsc(uint64_t esr)
 {
 	return (uint32_t)(esr & ESR_ABORT_FSC_MASK);
+}
+
+static void dump_vm_stack_trace(struct acrn_vcpu *vcpu, const struct cpu_regs *regs,
+	const char *reason)
+{
+	struct arm64_guest_stack_frame frame;
+	uint64_t fp = regs->x29;
+	uint64_t lr = regs->lr;
+	uint32_t idx;
+
+	/*
+	 * This is a raw AArch64 frame-pointer unwind. AAPCS64 frames save the
+	 * previous x29 and return address at [x29, x29 + 8]. BEAU reads those
+	 * words through stage-2 guest memory, so the trace is available only when
+	 * the saved guest FP values are directly readable as GPAs, which matches
+	 * the current static 1:1 RTOS layout. Guests using high virtual kernel
+	 * stacks need guest VA translation before deeper frames can be decoded.
+	 */
+	pr_err("arm64 %s vm%u:vcpu%u stack pc=0x%lx sp=0x%lx fp=0x%lx lr=0x%lx",
+		reason, vcpu->vm->vm_id, vcpu->vcpu_id, regs->elr, regs->sp, fp, lr);
+
+	if ((fp == 0UL) && (lr == 0UL)) {
+		pr_err("arm64 %s vm%u:vcpu%u stack trace unavailable: empty frame registers",
+			reason, vcpu->vm->vm_id, vcpu->vcpu_id);
+		return;
+	}
+
+	for (idx = 0U; idx < VM_STACK_TRACE_DEPTH; idx++) {
+		pr_err("arm64 %s vm%u:vcpu%u frame[%02u] fp=0x%lx lr=0x%lx",
+			reason, vcpu->vm->vm_id, vcpu->vcpu_id, idx, fp, lr);
+
+		if (fp == 0UL) {
+			break;
+		}
+
+		if (copy_from_gpa(vcpu->vm, &frame, fp, sizeof(frame)) != 0) {
+			pr_err("arm64 %s vm%u:vcpu%u stack trace stopped: guest fp is not directly readable as GPA",
+				reason, vcpu->vm->vm_id, vcpu->vcpu_id);
+			break;
+		}
+
+		if ((frame.fp == 0UL) || (frame.fp <= fp)) {
+			break;
+		}
+
+		fp = frame.fp;
+		lr = frame.lr;
+	}
 }
 
 static struct acrn_vcpu *get_exit_vcpu(uint16_t pcpu_id)
@@ -402,6 +457,24 @@ static int32_t handle_instruction_abort(struct acrn_vcpu *vcpu)
 	pr_err("arm64 instruction abort vm%u:vcpu%u ipa=0x%lx far=0x%lx hpfar=0x%lx fsc=0x%x esr=0x%lx elr=0x%lx",
 		vcpu->vm->vm_id, vcpu->vcpu_id, ipa, regs->far, regs->hpfar,
 		fsc, regs->esr, regs->elr);
+	dump_vm_stack_trace(vcpu, regs, "instruction abort");
+
+	return -EFAULT;
+}
+
+static int32_t handle_serror(struct acrn_vcpu *vcpu)
+{
+	const struct cpu_regs *regs = &vcpu->arch.regs;
+
+	/*
+	 * Guest SError is asynchronous and may be reported after the instruction
+	 * that caused it. The ELR/SP/FP snapshot still identifies where the VM was
+	 * interrupted, which is usually the best handoff point for manual triage.
+	 */
+	pr_err("arm64 serror vm%u:vcpu%u esr=0x%lx elr=0x%lx far=0x%lx hpfar=0x%lx",
+		vcpu->vm->vm_id, vcpu->vcpu_id, regs->esr, regs->elr, regs->far,
+		regs->hpfar);
+	dump_vm_stack_trace(vcpu, regs, "serror");
 
 	return -EFAULT;
 }
@@ -889,6 +962,9 @@ int32_t vcpu_exit_handler(struct acrn_vcpu *vcpu)
 	switch (ec) {
 	case ESR_EL2_EC_IABT_LOW:
 		ret = handle_instruction_abort(vcpu);
+		break;
+	case ESR_EL2_EC_SERROR:
+		ret = handle_serror(vcpu);
 		break;
 	case ESR_EL2_EC_DABT_LOW:
 		ret = handle_mmio_abort(vcpu);

@@ -29,6 +29,7 @@
 #define ESR_EL2_EC_IABT_CUR	0x21UL
 #define ESR_EL2_EC_DABT_LOW	0x24UL
 #define ESR_EL2_EC_DABT_CUR	0x25UL
+#define ESR_EL2_EC_SERROR	0x2fUL
 
 /*
  * For EC=0x01, ISS.TI distinguishes WFI from WFE. WFI waits for an interrupt;
