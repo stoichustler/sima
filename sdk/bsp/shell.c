@@ -567,15 +567,15 @@ static int32_t shell_process_cmd(const char *p_input_line)
 		/* See if command is in cmds supported */
 		p_cmd = shell_find_cmd(cmd_argv[0]);
 		if (p_cmd == NULL) {
-			shell_puts("\r\nerror: invalid command.\r\n");
+			shell_puts("\r\n[ERR] Invalid Command.\r\n");
 			return -EINVAL;
 		}
 
 		status = p_cmd->fcn(cmd_argc, &cmd_argv[0]);
 		if (status == -EINVAL) {
-			shell_puts("\r\nerror: invalid parameters.\r\n");
+			shell_puts("\r\n[INF] Invalid Parameters.\r\n");
 		} else if (status != 0) {
-			shell_puts("\r\ncommand launch failed.\r\n");
+			shell_puts("\r\n[ERR] Command launch failed.\r\n");
 		} else {
 			/* No other state currently, do nothing */
 		}
@@ -1083,7 +1083,7 @@ static void shell_print_irq_cpu_counts(uint32_t irq, uint16_t pcpu_num, uint32_t
 		if (count == UINT64_MAX) {
 			snprintf(token, sizeof(token), "cpu%hu:sat", pcpu_id);
 		} else {
-			snprintf(token, sizeof(token), "cpu%hu:%lu", pcpu_id, count);
+			snprintf(token, sizeof(token), "cpu%hu:%016lu", pcpu_id, count);
 		}
 		token_len = IRQ_STATS_CPU_TOKEN_WIDTH;
 		if ((line_len + token_len + (printed ? 1U : 0U)) > IRQ_STATS_COMPACT_WIDTH) {

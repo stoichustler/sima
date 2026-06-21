@@ -505,7 +505,7 @@ void run_idle_thread(void)
 	struct sched_params idle_params = {0};
 	char idle_name[16];
 
-	snprintf(idle_name, 16U, "idle%02hu", pcpu_id);
+	snprintf(idle_name, 16U, "idle-%02hu", pcpu_id);
 	(void)strncpy_s(idle->name, 16U, idle_name, 16U);
 	idle->pcpu_id = pcpu_id;
 	idle->thread_entry = default_idle;

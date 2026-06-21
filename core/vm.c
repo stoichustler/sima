@@ -471,7 +471,7 @@ int32_t create_vm(uint16_t vm_id, uint64_t pcpu_bitmap, struct acrn_vm_config *v
 
 	if (vm_config->name[0] == '\0') {
 		/* if VM name is not configured, specify with VM ID */
-		snprintf(vm_config->name, 16, "acrn vm_%d", vm_id);
+		snprintf(vm_config->name, 16, "BEAU vm_%d", vm_id);
 	}
 
 	(void)memcpy_s(&vm->name[0], MAX_VM_NAME_LEN, &vm_config->name[0], MAX_VM_NAME_LEN);
