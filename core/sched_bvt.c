@@ -231,6 +231,47 @@ static uint64_t p2v(uint64_t phy_time, uint64_t ratio)
 	return (uint64_t)(phy_time * ratio);
 }
 
+static void sched_bvt_snapshot(const struct thread_object *obj,
+	struct sched_bvt_stats *stats)
+{
+	const struct sched_bvt_data *data = (const struct sched_bvt_data *)obj->data;
+	uint64_t now_tsc = cpu_ticks();
+	uint64_t residual = data->residual;
+	uint64_t delta_mcu = 0U;
+
+	*stats = (struct sched_bvt_stats) {
+		.weight = data->weight,
+		.vt_ratio = data->vt_ratio,
+		.avt = data->avt,
+		.evt = data->evt,
+	};
+
+	if ((obj->status == THREAD_STS_RUNNING) && !is_idle_thread(obj) &&
+		(now_tsc > data->start_tsc)) {
+		uint64_t v_delta = p2v(now_tsc - data->start_tsc, data->vt_ratio) + residual;
+
+		delta_mcu = (uint64_t)(v_delta / data->mcu);
+		stats->avt += (int64_t)delta_mcu;
+		stats->evt = stats->avt;
+	}
+}
+
+bool sched_get_bvt_stats(const struct thread_object *obj, struct sched_bvt_stats *stats)
+{
+	bool valid = false;
+	uint64_t rflags;
+
+	if ((obj != NULL) && (stats != NULL) && (obj->sched_ctl != NULL) &&
+		(obj->sched_ctl->scheduler == &sched_bvt)) {
+		obtain_schedule_lock(obj->pcpu_id, &rflags);
+		sched_bvt_snapshot(obj, stats);
+		release_schedule_lock(obj->pcpu_id, rflags);
+		valid = true;
+	}
+
+	return valid;
+}
+
 static void update_vt(struct thread_object *obj)
 {
 	struct sched_bvt_data *data;

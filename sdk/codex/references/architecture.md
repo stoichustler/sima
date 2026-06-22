@@ -151,7 +151,8 @@ Useful BEAU shell commands:
 
 - `vcpus`: VM/vCPU pCPU binding and state.
 - `schedstat`: scheduler algorithm plus per-pCPU timer, switch, reschedule,
-  runnable-thread, and current-thread statistics.
+  runnable-thread, current-thread statistics, and BVT `weight`/`avt`/`evt`
+  thread stats when BVT is active.
 - `vmap`: host stage-1 and VM stage-2 maps.
 - `dumpstat [vm id]`: ARM64 VM/vCPU register, scheduler state, raw guest stack,
   and saved host stack for the vCPU thread on its bound pCPU. Guest stack
@@ -171,6 +172,7 @@ Useful BEAU shell commands:
   thread. A tick may not switch; wake/sleep/yield can also switch.
 - `resched`: number of requests raised through `make_reschedule_request()`.
 - `runqueue`: number of runnable threads currently bound to the pCPU.
+- `weight`/`avt`/`evt`: BVT thread weight and virtual-time ordering values.
 
 ## Runtime Checklist
 
@@ -179,7 +181,7 @@ For VM/scheduler/console changes, validate:
 1. QEMU finishes boot logs; pressing Enter prints `console:\>`.
 2. VM0, VM1, and VM2 autostart.
 3. `vcpus` shows VM0 on pCPU0,2,3,4, VM1 on pCPU3,5,6,7, and VM2 on pCPU1,4,6,7.
-4. `schedstat` shows `sched_iorr`; pCPU3 context switches grow when VM0 and VM1 run.
+4. `schedstat` shows `sched_bvt`; shared pCPU context switches grow when multiple bound VMs run.
 5. `vsh 0` reaches `zero ~>` and the switch banner appears before replayed VM0
    logs.
 6. `vsh 1` reaches `beau ~>`.

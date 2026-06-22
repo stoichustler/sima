@@ -407,8 +407,8 @@ def run_qemu(args, cmd):
         qemu.expect(PROMPT, "BEAU shell prompt", keepalive=ENTER)
         qemu.command("vcpus", ["vmid", "vcpu", "pcpu_mode", "isolate", "shared", "switches", "since.us"])
         qemu.command("schedstat", [
-            "schedstat algorithm:sched_iorr",
-            "tick:1ms",
+            "schedstat algorithm:sched_bvt",
+            "mcu:1ms",
             "pcpu",
             "timer",
             "switches",

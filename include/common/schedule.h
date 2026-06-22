@@ -52,6 +52,13 @@ struct sched_latency_stats {
 	uint64_t runnable_since;
 };
 
+struct sched_bvt_stats {
+	uint8_t weight;
+	uint64_t vt_ratio;
+	int64_t avt;
+	int64_t evt;
+};
+
 struct thread_object;
 typedef void (*thread_entry_t)(struct thread_object *obj);
 typedef void (*switch_t)(struct thread_object *obj);
@@ -157,6 +164,7 @@ uint64_t sched_get_context_switches(uint16_t pcpu_id);
 uint64_t sched_get_reschedule_requests(uint16_t pcpu_id);
 void sched_account_tick(struct sched_control *ctl);
 void sched_get_latency(const struct thread_object *obj, struct sched_latency_stats *stats);
+bool sched_get_bvt_stats(const struct thread_object *obj, struct sched_bvt_stats *stats);
 
 void init_sched(uint16_t pcpu_id);
 void deinit_sched(uint16_t pcpu_id);

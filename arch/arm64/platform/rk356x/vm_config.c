@@ -54,6 +54,9 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 		.name = "zephyr",
 		.cpu_affinity = AFFINITY_CPU(0),
 		.guest_flags = GUEST_FLAG_STATIC_VM | GUEST_FLAG_NO_FW,
+		.sched_params = {
+			.bvt_weight = 128U,
+		},
 		.memory = {
 			.size = RK356X_ZEPHYR_RAM_SIZE,
 			.region_num = ARRAY_SIZE(zephyr_memory_regions),
@@ -85,6 +88,9 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 		.name = "lk",
 		.cpu_affinity = AFFINITY_CPU(1),
 		.guest_flags = GUEST_FLAG_STATIC_VM | GUEST_FLAG_NO_FW,
+		.sched_params = {
+			.bvt_weight = 16U,
+		},
 		.memory = {
 			.size = RK356X_LK_RAM_SIZE,
 			.region_num = ARRAY_SIZE(lk_memory_regions),
@@ -116,6 +122,9 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 		.name = "linux",
 		.cpu_affinity = AFFINITY_CPU(2),
 		.guest_flags = GUEST_FLAG_STATIC_VM | GUEST_FLAG_NO_FW,
+		.sched_params = {
+			.bvt_weight = 64U,
+		},
 		.memory = {
 			.size = RK356X_LINUX_RAM_SIZE,
 			.region_num = ARRAY_SIZE(linux_memory_regions),

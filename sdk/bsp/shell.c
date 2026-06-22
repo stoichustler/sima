@@ -573,7 +573,7 @@ static int32_t shell_process_cmd(const char *p_input_line)
 
 		status = p_cmd->fcn(cmd_argc, &cmd_argv[0]);
 		if (status == -EINVAL) {
-			shell_puts("\r\n[INF] Invalid Parameters.\r\n");
+			shell_puts("\r\n[ERR] Invalid Parameters.\r\n");
 		} else if (status != 0) {
 			shell_puts("\r\n[ERR] Command launch failed.\r\n");
 		} else {
@@ -978,9 +978,12 @@ static uint32_t shell_sched_runqueue_count(uint16_t pcpu_id)
 
 static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 {
+	const struct list_head *head = sched_get_thread_list();
 	char temp_str[MAX_STR_SIZE];
+	struct list_head *pos;
 	uint16_t pcpu_id;
 	uint16_t pcpu_num = get_pcpu_nums();
+	bool has_bvt_stats = false;
 	const char *algorithm = (pcpu_num != 0U) ? sched_get_scheduler_name(0U) : "none";
 	const char *params = (pcpu_num != 0U) ? sched_get_scheduler_stat_desc(0U) : "";
 
@@ -988,7 +991,7 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 		"\r\nschedstat algorithm:%s %s pcpus:%hu\r\n", algorithm, params, pcpu_num);
 	shell_puts(temp_str);
 	shell_puts("pcpu  timer  switches  resched  runqueue  thread\r\n");
-	shell_puts("────  ─────  ────────  ───────  ────────  ────────────────\r\n");
+	shell_puts("────  ─────  ────────  ───────  ────────  ─────────────────\r\n");
 
 	for (pcpu_id = 0U; pcpu_id < pcpu_num; pcpu_id++) {
 		struct thread_object *current = sched_get_current(pcpu_id);
@@ -1003,6 +1006,39 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 			shell_sched_runqueue_count(pcpu_id),
 			name);
 		shell_puts(temp_str);
+	}
+
+	list_for_each(pos, head) {
+		struct thread_object *thread = container_of(pos, struct thread_object, node);
+		struct sched_bvt_stats bvt;
+
+		if (sched_get_bvt_stats(thread, &bvt)) {
+			has_bvt_stats = true;
+			break;
+		}
+	}
+
+	if (has_bvt_stats) {
+		shell_puts("\r\nbvt thread stats:\r\n");
+		shell_puts("name             pcpu  state     weight  avt       evt\r\n");
+		shell_puts("───────────────  ────  ────────  ──────  ────────  ────────\r\n");
+
+		list_for_each(pos, head) {
+			struct thread_object *thread = container_of(pos, struct thread_object, node);
+			struct sched_bvt_stats bvt;
+
+			if (sched_get_bvt_stats(thread, &bvt)) {
+				snprintf(temp_str, MAX_STR_SIZE,
+					"%-15s  %-4hu  %-8s  %-6u  %-8ld  %-8ld\r\n",
+					thread->name,
+					thread->pcpu_id,
+					thread_state_str(thread->status),
+					(uint32_t)bvt.weight,
+					bvt.avt,
+					bvt.evt);
+				shell_puts(temp_str);
+			}
+		}
 	}
 
 	return 0;

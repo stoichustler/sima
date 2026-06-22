@@ -188,7 +188,9 @@ boot logs settle to show the `console:\>` prompt.
   `SYSTEM_OFF`, and `SYSTEM_RESET`.
 - BEAU shell `reboot` command wired to host PSCI system reset.
 - PSCI-based host secondary CPU bring-up with `MAX_PCPU_NUM=8`.
-- VM0 and VM1 vCPUs share pCPU3 through the existing `sched_iorr` scheduler.
+- VM0 and VM1 vCPUs share pCPU3 through the existing `sched_bvt` scheduler.
+  Current QEMU BVT weights are VM0 Zephyr `128`, VM1 LK `16`, and VM2 Linux
+  `128`. The rk356x static configuration keeps VM2 Linux at `64`.
   VM0 uses ordinary-core pCPU0, pCPU2, pCPU3, and pCPU4; VM1 uses mixed pCPU3,
   pCPU5, pCPU6, and pCPU7. VM2 uses pCPU1, pCPU4, pCPU6, and pCPU7. The
   vCPU0/BSP pCPUs are private to each VM.
@@ -223,13 +225,90 @@ boot logs settle to show the `console:\>` prompt.
   Ctrl-D switches back to the BEAU shell.
 - `schedstat` prints the scheduler algorithm and one physical-CPU row with
   `pcpu`, scheduler `timer` callbacks, context `switches`, `resched` requests,
-  runnable-thread count, and current `thread`.
+  runnable-thread count, and current `thread`. When BVT is active, it also
+  prints a thread table with BVT `weight`, `avt`, and `evt`.
   - `timer` is the number of scheduler timer callbacks observed on that pCPU.
   - `switches` is the number of times `schedule()` actually selected a
     different thread.
   - `resched` counts requests raised through `make_reschedule_request()`,
     including tick, wake, yield, and remote reschedule paths.
   - `runqueue` is the current count of runnable threads bound to that pCPU.
+  - `weight`, `avt`, and `evt` expose BVT share and virtual-time ordering;
+    running threads are sampled against current host ticks for a live view.
+
+### BVT Scheduler Progress, 2026-06-22
+
+Current BVT status:
+
+- The ARM64 default scheduler is being switched to `sched_bvt` for the static
+  QEMU/rk356x flow. A valid `schedstat` header should report
+  `schedstat algorithm:sched_bvt mcu:1ms csa:5 weight:1-128 pcpus:8`.
+- The BVT `schedstat` thread table exposes `weight`, `avt`, and `evt`.
+  Lower virtual time has scheduling priority. `evt` currently equals `avt`
+  because the BVT warp fields exist but are not active in the default setup.
+- The user-provided `schedstat` samples show VM2 Linux vCPUs at `weight 128`.
+  VM2/vCPU0 and VM2/vCPU1 advance by about 80k virtual-time ticks between the
+  two samples; VM2/vCPU2 and VM2/vCPU3 move from runnable to running and also
+  advance. This is not direct evidence of BVT starvation for VM2 Linux.
+- If the observed lag is BEAU shell or `vsh 2` responsiveness, pCPU0 is a
+  likely pressure point: `shell` currently falls back to BVT weight `1`, while
+  `vm0:vcpu1` on the same pCPU has weight `128`. Raising only the shell
+  thread's BVT weight is the narrowest way to test host-console responsiveness.
+- If Linux still reports internal stalls while VM2 vCPUs continue to advance,
+  keep debugging VM2 vtimer/vGIC forward progress with `dumpstat 2`, `irqstat`,
+  `constat 2`, and consecutive `schedstat` captures.
+- One sample also shows pCPU4 staying on `vm2:vcpu1` while `vm0:vcpu3` is
+  runnable with stale low `avt` and pCPU4 timer/switch counters do not advance
+  between captures. Treat that as a BVT timer/runqueue fairness follow-up, not
+  as evidence that VM2 is losing CPU time.
+
+How to change BVT weight:
+
+- BVT weight is per scheduler thread and is clamped to `1-128` by
+  `sched_bvt_init_data()`. A zeroed `struct sched_params` therefore becomes
+  weight `1`.
+- To change all vCPU threads of one VM, update that VM's
+  `.sched_params.bvt_weight` in the platform VM config:
+  `arch/arm64/platform/qemu/vm_config.c` or
+  `arch/arm64/platform/rk356x/vm_config.c`. `core/vcpu.c:init_vcpu_thread()`
+  passes `get_vm_config(vm->vm_id)->sched_params` to every vCPU thread of that
+  VM.
+
+```c
+.sched_params = {
+	.bvt_weight = 64U,
+},
+```
+
+- To change one non-VM scheduler thread, set the field in that thread's local
+  `struct sched_params` before `init_thread_data()`. For example, the BEAU
+  shell is created in `sdk/bsp/shell.c:shell_start()`:
+
+```c
+struct sched_params shell_params = {0U};
+
+shell_params.prio = PRIO_LOW;
+shell_params.bvt_weight = 64U;
+init_thread_data(&shell_thread, &shell_params);
+```
+
+- To test one specific vCPU thread without adding a new platform config model,
+  make a local copy of the VM scheduler parameters in
+  `core/vcpu.c:init_vcpu_thread()`, override by VM/vCPU ID, and pass that copy
+  to `init_thread_data()`:
+
+```c
+struct sched_params params = get_vm_config(vm->vm_id)->sched_params;
+
+if ((vm->vm_id == 2U) && (vcpu->vcpu_id == 1U)) {
+	params.bvt_weight = 64U;
+}
+init_thread_data(&vcpu->thread_obj, &params);
+```
+
+  This is a core scheduling behavior change and should be reviewed before it is
+  kept. For a persistent per-vCPU policy, add an explicit per-vCPU scheduler
+  configuration instead of hiding one-off overrides in the common vCPU path.
 - `irqstat` prints a short IRQ name/purpose column when the architecture can
   decode it. ARM64 maps ACRN IRQ numbers back to GIC SGI/PPI/SPI sources and
   names the EL2-owned SMP-call, physical-timer, virtual-timer, and
@@ -359,8 +438,10 @@ The following have been verified on QEMU with `-smp 8`:
 - Boot logs show each VM stage-2 RAM map as identity mapped:
   VM0 `ipa[0x42000000-0x48000000]:pa[0x42000000-0x48000000]` and VM1
   `ipa[0x40000000-0x42000000]:pa[0x40000000-0x42000000]`.
-- `schedstat` reports `sched_iorr`, per-pCPU scheduler timer callbacks,
-  reschedule requests, runnable-thread counts, and context switch counters.
+- Before the default BVT switch, `schedstat` reported the configured scheduler,
+  per-pCPU scheduler timer callbacks, reschedule requests, runnable-thread
+  counts, and context switch counters. After the BVT switch, QEMU validation
+  must confirm that it reports `sched_bvt`.
 - `vcpus` reports all three VMs and nine guest vCPUs. VM0 uses pCPU0, pCPU2,
   pCPU3, and pCPU4; VM1 uses pCPU3, pCPU5, pCPU6, and pCPU7; VM2 Linux uses
   pCPU1, pCPU4, pCPU6, and pCPU7.
@@ -616,8 +697,8 @@ Important rules:
 BEAU separates host timekeeping from guest timer ABI:
 
 1. Host scheduler tick:
-   CNTP/PPI30 drives `SOFTIRQ_TIMER` and IORR scheduling. It is local to each
-   pCPU and must remain owned by EL2.
+   CNTP/PPI30 drives `SOFTIRQ_TIMER` and the configured scheduler. It is local
+   to each pCPU and must remain owned by EL2.
 2. Loaded guest timer:
    Hardware CNTV is loaded with the guest vCPU timer state. When CNTV expires,
    physical PPI27 arrives at EL2 and `arm64_vgicv3_virtual_timer_irq_handler()`
@@ -656,8 +737,8 @@ The scheduler should remain architecture-neutral:
   call it before a guest return when the current non-idle object is the only
   runnable object on that pCPU. It clears a no-op tick request that would have
   selected the same vCPU and consumed a pending timer rescue window.
-- Shared pCPUs still fall back to IORR fairness. Do not replace IORR or disable
-  scheduler ticks to hide vtimer bugs.
+- Shared pCPUs still fall back to the configured scheduler's fairness model.
+  Do not disable scheduler ticks to hide vtimer bugs.
 
 ### Debugging Checklist
 
@@ -822,13 +903,13 @@ Status as of 2026-06-18:
     and unmask interrupts. Physical IRQ exits still run host softirq processing
     before this refresh/schedule decision; skipping host softirqs made the BEAU
     console nearly unresponsive when VM2 kept virq27 pending.
-- The 2026-06-18 follow-up is allowed to modify `core/schedule.c` while still
-  keeping IORR as the scheduler. The FreeBSD arm64 vmm I/O reference keeps
-  vtimer delivery as a vGIC pending/notify problem: vtimer sync asserts or
-  deasserts the virtual timer IRQ from the current timer condition, the vGIC
-  tracks active/pending IRQs in a queue, and queued injection notifies the vCPU.
-  BEAU therefore should not let a host scheduler tick repeatedly consume the
-  guest return window when there is no other runnable thread on that pCPU.
+- The 2026-06-18 follow-up modified `core/schedule.c` without changing the
+  scheduler algorithm. The FreeBSD arm64 vmm I/O reference keeps vtimer delivery
+  as a vGIC pending/notify problem: vtimer sync asserts or deasserts the virtual
+  timer IRQ from the current timer condition, the vGIC tracks active/pending
+  IRQs in a queue, and queued injection notifies the vCPU. BEAU therefore should
+  not let a host scheduler tick repeatedly consume the guest return window when
+  there is no other runnable thread on that pCPU.
 - Validation status for the current local tree:
   `python3 -m py_compile scripts/regress.py`, `sh -n scripts/repack_initramfs.sh`,
   and `git diff --check` pass. The QEMU BEAU image rebuilds successfully with:
@@ -850,21 +931,21 @@ Status as of 2026-06-18:
 - A one-shot experiment that cleared TWI after converting WFI rescue into LR
   rescue did not solve the failure and made the 40-enter stress fail earlier.
   Do not treat "clear TWI after LR rescue" by itself as the next root fix.
-- Before the PPI27 priority-mask repair, the 2026-06-18 follow-up reproduced with
-  IORR unchanged: CPU0/CPU1 were reported idling around `default_idle_call()`,
-  RCU said `rcu_preempt kthread timer wakeup didn't happen`, and the warning
-  remained `Possible timer handling issue on cpu=0 timer-softirq=0`. This
-  supported the narrower forward-progress hypothesis: the pending-only vtimer LR
-  was present, but VM2/vCPU0 could still be preempted by host scheduling before
-  Linux ran far enough past `cpu_do_idle+8` to execute
-  `local_irq_enable()`/`daifclr`.
-- The current narrow fix keeps IORR and adds a bounded ARM64 vGIC-only
-  no-reschedule window for rescued pending-only virtual timer LRs. While
-  `vtimer_lr_rescue` is set and saved guest PSTATE still has DAIF.I masked,
-  the timer pending state can block a few host `need_reschedule()` decisions so
-  Linux gets a short EL1 run window. After that small budget is consumed, IORR
-  fairness is restored so a stuck timer line cannot monopolize a shared pCPU.
-  `dumpstat` now prints this as `rescue:... lr:<yes|no> budget:N`.
+- Before the PPI27 priority-mask repair, the 2026-06-18 follow-up reproduced
+  without changing the scheduler: CPU0/CPU1 were reported idling around
+  `default_idle_call()`, RCU said `rcu_preempt kthread timer wakeup didn't
+  happen`, and the warning remained `Possible timer handling issue on cpu=0
+  timer-softirq=0`. This supported the narrower forward-progress hypothesis:
+  the pending-only vtimer LR was present, but VM2/vCPU0 could still be
+  preempted by host scheduling before Linux ran far enough past `cpu_do_idle+8`
+  to execute `local_irq_enable()`/`daifclr`.
+- The current narrow fix adds a bounded ARM64 vGIC-only no-reschedule window
+  for rescued pending-only virtual timer LRs. While `vtimer_lr_rescue` is set
+  and saved guest PSTATE still has DAIF.I masked, the timer pending state can
+  block a few host `need_reschedule()` decisions so Linux gets a short EL1 run
+  window. After that small budget is consumed, scheduler fairness is restored so
+  a stuck timer line cannot monopolize a shared pCPU. `dumpstat` now prints this
+  as `rescue:... lr:<yes|no> budget:N`.
 - The next failing dumps after that change showed an expired CNTV deadline,
   `cntv_el2_masked:Y`, a pending-only timer LR, and no later timer sysreg write.
   A live CNTV_CTL sample could be `0x1` even though EL2 computed the deadline as
@@ -882,10 +963,10 @@ Status as of 2026-06-18:
   vGIC pending-IRQ check, so VM2/vCPU0 on its private pCPU does not burn the
   bounded virtual-timer LR rescue budget on a scheduler tick that would have
   selected the same thread. Shared pCPUs still keep the bounded pending-IRQ
-  window and then fall back to IORR fairness.
-- Do not replace IORR for this issue. A dynamic tick-gating experiment reduced
-  pCPU1 host physical timer callbacks but still failed the VM2 Linux stress path
-  and changed timing rather than fixing the underlying vtimer/vGIC lifecycle.
+  window and then fall back to the configured scheduler's fairness model.
+- A dynamic tick-gating experiment reduced pCPU1 host physical timer callbacks
+  but still failed the VM2 Linux stress path and changed timing rather than
+  fixing the underlying vtimer/vGIC lifecycle.
 
 ### RCU Stall Repair Strategy
 
@@ -944,10 +1025,10 @@ Status as of 2026-06-18:
 - Skipping host softirq processing on physical IRQ return when a guest IRQ is
   pending starved the BEAU shell/console during the VM2 held-Enter scenario and
   was reverted. Keep `do_softirq_no_irqenable()` on the physical IRQ exit path.
-- Dynamically disabling IORR scheduler ticks when only the current thread is
-  runnable is not the right fix. It can hide pCPU tick pressure but does not
-  guarantee VM2 timer forward progress and should stay reverted unless a broader
-  scheduler design is reviewed separately.
+- Dynamically disabling scheduler ticks when only the current thread is runnable
+  is not the right fix. It can hide pCPU tick pressure but does not guarantee
+  VM2 timer forward progress and should stay reverted unless a broader scheduler
+  design is reviewed separately.
 - Expanding the vITS software model to a static 8192-LPI descriptor array
   caused QEMU to stop producing useful shell output for more than 60 seconds.
   Keep the compact active-window model unless dynamic allocation is added.

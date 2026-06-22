@@ -279,6 +279,12 @@ void sched_get_latency(const struct thread_object *obj, struct sched_latency_sta
 	}
 }
 
+__attribute__((weak)) bool sched_get_bvt_stats(__unused const struct thread_object *obj,
+	__unused struct sched_bvt_stats *stats)
+{
+	return false;
+}
+
 void sched_account_tick(struct sched_control *ctl)
 {
 	if (ctl != NULL) {

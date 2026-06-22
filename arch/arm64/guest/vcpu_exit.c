@@ -232,7 +232,7 @@ static struct acrn_vcpu *schedule_without_guest_return_work(uint16_t pcpu_id,
 	if (need_reschedule(pcpu_id) && !vcpu_has_pending_request(vcpu)) {
 		/*
 		 * On a shared pCPU, a deliverable virtual IRQ gets a bounded
-		 * guest-forward-progress window before IORR fairness resumes.
+		 * guest-forward-progress window before scheduler fairness resumes.
 		 */
 		if (!vcpu_has_pending_guest_irq(vcpu)) {
 			schedule();

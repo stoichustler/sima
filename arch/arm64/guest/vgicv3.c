@@ -1989,8 +1989,8 @@ static bool vgicv3_pending_vtimer_rescue_blocks_reschedule(struct acrn_vcpu *vcp
 	/*
 	 * Linux resumes from WFI with PSTATE.I still set and needs a short EL1
 	 * run window to reach local_irq_enable(). Let the rescued pending-only
-	 * timer LR block a few host reschedule decisions, then fall back to IORR
-	 * fairness if the timer line still has not been consumed.
+	 * timer LR block a few host reschedule decisions, then fall back to
+	 * scheduler fairness if the timer line still has not been consumed.
 	 */
 	if (vcpu->arch.vtimer_lr_rescue_budget > 0U) {
 		vcpu->arch.vtimer_lr_rescue_budget--;
