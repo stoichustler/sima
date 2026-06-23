@@ -546,8 +546,6 @@ static void
 charmem(size_t cmd, const char *s_arg, uint32_t sz, struct snprint_param *param)
 {
 	const char *s = s_arg;
-	/* pointer to the destination */
-	char *p = param->dst + param->wrtn;
 	/* characters actually written */
 	uint32_t n = 0U;
 
@@ -555,10 +553,11 @@ charmem(size_t cmd, const char *s_arg, uint32_t sz, struct snprint_param *param)
 	if (cmd == PRINT_CMD_COPY) {
 		if (sz > 0U) {
 			while (((*s) != '\0') && (n < sz)) {
-				if (n < (param->sz - param->wrtn)) {
-					*p = *s;
+				uint32_t pos = param->wrtn + n;
+
+				if ((pos >= param->wrtn) && (pos < param->sz)) {
+					param->dst[pos] = *s;
 				}
-				p++;
 				s++;
 				n++;
 			}
@@ -568,9 +567,13 @@ charmem(size_t cmd, const char *s_arg, uint32_t sz, struct snprint_param *param)
 	}
 	/* fill mode */
 	else {
-		n = (sz < (param->sz - param->wrtn)) ? sz : 0U;
+		if (param->wrtn < param->sz) {
+			uint32_t room = param->sz - param->wrtn;
+
+			n = (sz < room) ? sz : room;
+			(void)memset(param->dst + param->wrtn, (uint8_t)*s, n);
+		}
 		param->wrtn += sz;
-		(void)memset(p, (uint8_t)*s, n);
 	}
 
 }
@@ -600,11 +603,12 @@ size_t vsnprintf(char *dst_arg, size_t sz_arg, const char *fmt, va_list args)
 	do_print(fmt, &param, args);
 
 	/* ensure the written string is NULL terminated */
-	if (snparam.wrtn < sz) {
-		snparam.dst[snparam.wrtn] = '\0';
-	}
-	else {
-		snparam.dst[sz - 1] = '\0';
+	if (sz != 0U) {
+		if (snparam.wrtn < sz) {
+			snparam.dst[snparam.wrtn] = '\0';
+		} else {
+			snparam.dst[sz - 1U] = '\0';
+		}
 	}
 
 	/* return the number of chars which would be written */

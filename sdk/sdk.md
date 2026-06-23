@@ -201,6 +201,10 @@ boot logs settle to show the `console:\>` prompt.
 - BEAU shell `symtab` command lists the built-in debug symbol table as
   `offset symbol` rows. `offset` is relative to `dbg_symbol_text_start`, which
   keeps symbol dumps comparable when the final text load address changes.
+- ARM64 BEAU shell `vmstat` command lists all configured VMs without requiring a
+  VM ID. It reports configured and runtime vCPU counts, affinity, VM/vCPU state,
+  scheduler parameters and BVT runtime stats, guest RAM, console, GIC, ITS, and
+  timer basics.
 - PSCI-based host secondary CPU bring-up with `MAX_PCPU_NUM=8`.
 - VM0 and VM1 vCPUs share pCPU3 through the existing `sched_bvt` scheduler.
   Current QEMU BVT weights are VM0 Zephyr `128`, VM1 LK `16`, and VM2 Linux

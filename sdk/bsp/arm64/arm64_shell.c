@@ -29,7 +29,7 @@
 #include <asm/sysreg.h>
 #include "../shell_priv.h"
 
-#define SHELL_CMD_MEM_MAP		"vmap"
+#define SHELL_CMD_MEM_MAP		"mmap"
 #define SHELL_CMD_MEM_MAP_PARAM		NULL
 #define SHELL_CMD_MEM_MAP_HELP		"list arm64 host stage-1 and vm stage-2 memory mappings"
 #define SHELL_CMD_DUMPSTAT		"dumpstat"
@@ -38,6 +38,9 @@
 #define SHELL_CMD_CONSTAT		"constat"
 #define SHELL_CMD_CONSTAT_PARAM		"[vm id]"
 #define SHELL_CMD_CONSTAT_HELP		"dump vm console and vpl011 state"
+#define SHELL_CMD_VMSTAT		"vmstat"
+#define SHELL_CMD_VMSTAT_PARAM		NULL
+#define SHELL_CMD_VMSTAT_HELP		"list arm64 vm state"
 #define SHELL_CMD_REBOOT		"reboot"
 #define SHELL_CMD_REBOOT_PARAM		NULL
 #define SHELL_CMD_REBOOT_HELP		"trigger a system reboot (immediately)"
@@ -57,6 +60,7 @@
 static int32_t shell_list_mem(__unused int32_t argc, __unused char **argv);
 static int32_t shell_dumpstat(int32_t argc, char **argv);
 static int32_t shell_constat(int32_t argc, char **argv);
+static int32_t shell_vmstat(int32_t argc, __unused char **argv);
 static int32_t shell_reboot(__unused int32_t argc, __unused char **argv);
 
 struct shell_cmd arch_shell_cmds[] = {
@@ -77,6 +81,12 @@ struct shell_cmd arch_shell_cmds[] = {
 		.cmd_param	= SHELL_CMD_CONSTAT_PARAM,
 		.help_str	= SHELL_CMD_CONSTAT_HELP,
 		.fcn		= shell_constat,
+	},
+	{
+		.str		= SHELL_CMD_VMSTAT,
+		.cmd_param	= SHELL_CMD_VMSTAT_PARAM,
+		.help_str	= SHELL_CMD_VMSTAT_HELP,
+		.fcn		= shell_vmstat,
 	},
 	{
 		.str		= SHELL_CMD_REBOOT,
@@ -1217,6 +1227,230 @@ static void shell_constat_vgic_uart(const struct acrn_vm *vm, uint32_t irq)
 			shell_yes_no(desc->active), shell_yes_no(desc->level),
 			vcpu->arch.vgic.used_lrs, lrs);
 	}
+}
+
+static const char *shell_vm_state_to_str(enum vm_state state)
+{
+	const char *str;
+
+	switch (state) {
+	case VM_POWERED_OFF:
+		str = "poweroff";
+		break;
+	case VM_CREATED:
+		str = "created";
+		break;
+	case VM_RUNNING:
+		str = "running";
+		break;
+	case VM_READY_TO_POWEROFF:
+		str = "ready-off";
+		break;
+	case VM_PAUSED:
+		str = "paused";
+		break;
+	default:
+		str = "unknown";
+		break;
+	}
+
+	return str;
+}
+
+static const char *shell_vcpu_state_to_str(enum vcpu_state state)
+{
+	const char *str;
+
+	switch (state) {
+	case VCPU_OFFLINE:
+		str = "offline";
+		break;
+	case VCPU_INIT:
+		str = "init";
+		break;
+	case VCPU_RUNNING:
+		str = "running";
+		break;
+	case VCPU_ZOMBIE:
+		str = "zombie";
+		break;
+	default:
+		str = "unknown";
+		break;
+	}
+
+	return str;
+}
+
+static bool shell_vm_config_present(const struct acrn_vm_config *vm_config)
+{
+	return (vm_config->name[0] != '\0') || (vm_config->cpu_affinity != 0UL) ||
+		((vm_config->guest_flags & GUEST_FLAG_STATIC_VM) != 0UL);
+}
+
+static void shell_print_cpu_bitmap(uint64_t bitmap)
+{
+	char temp_str[MAX_STR_SIZE];
+	bool first = true;
+	uint16_t cpu_id;
+
+	for (cpu_id = 0U; cpu_id < MAX_PCPU_NUM; cpu_id++) {
+		if ((bitmap & (1UL << cpu_id)) != 0UL) {
+			(void)snprintf(temp_str, MAX_STR_SIZE, "%spcpu%hu", first ? "" : ",", cpu_id);
+			shell_puts(temp_str);
+			first = false;
+		}
+	}
+
+	if (first) {
+		shell_puts("-");
+	}
+}
+
+static uint32_t shell_cpu_bitmap_weight(uint64_t bitmap)
+{
+	uint32_t weight = 0U;
+	uint16_t cpu_id;
+
+	for (cpu_id = 0U; cpu_id < MAX_PCPU_NUM; cpu_id++) {
+		if ((bitmap & (1UL << cpu_id)) != 0UL) {
+			weight++;
+		}
+	}
+
+	return weight;
+}
+
+static void shell_vmstat_sched_config(const struct sched_params *params)
+{
+	shell_item_line("sched-config:prio:%u bvt-weight:%u warp-value:%d warp-limit:%u unwarp:%u",
+		params->prio, params->bvt_weight, params->bvt_warp_value,
+		params->bvt_warp_limit, params->bvt_unwarp_period);
+}
+
+static void shell_vmstat_vm_config(uint16_t vm_id, const struct acrn_vm_config *vm_config,
+	const struct acrn_vm *vm)
+{
+	const struct arch_vm_config *arch = &vm_config->arch;
+	const struct arm64_vgicv3 *vgic = &vm->arch_vm.vgic;
+	struct console_vm_ring_stats ring = { 0U };
+	struct acrn_vuart *vu = NULL;
+	char temp_str[MAX_STR_SIZE];
+
+	(void)console_vm_ring_get_stats(vm_id, &ring);
+	if (!is_poweroff_vm(vm)) {
+		vu = vm_console_vuart((struct acrn_vm *)vm);
+	}
+
+	shell_item_line("vcpus:configured:%u created:%hu state:%s flags:0x%016lx load:%u",
+		shell_cpu_bitmap_weight(vm_config->cpu_affinity), vm->hw.created_vcpus,
+		shell_vm_state_to_str(vm->state), vm_config->guest_flags,
+		(uint32_t)vm_config->load_order);
+	shell_puts("│   affinity-config:");
+	shell_print_cpu_bitmap(vm_config->cpu_affinity);
+	shell_puts(" runtime:");
+	shell_print_cpu_bitmap(vm->hw.cpu_affinity);
+	shell_puts("\r\n");
+
+	shell_vmstat_sched_config(&vm_config->sched_params);
+
+	shell_item_line("guest-ram:ipa:0x%016lx hpa:0x%016lx size:0x%016lx regions:%lu root-s2:%s",
+		arch->guest_ram_start, arch->guest_ram_hpa, arch->guest_ram_size,
+		vm_config->memory.region_num, shell_yes_no(vm->root_stg2ptp != NULL));
+	shell_item_line("gic:gicd:0x%016lx/0x%lx gicr:0x%016lx/0x%lx stride:0x%lx",
+		arch->guest_gicd_base, arch->guest_gicd_size,
+		arch->guest_gicr_base, arch->guest_gicr_size,
+		arch->guest_gicr_stride);
+	shell_item_line("    initialized:%s vcpus:%hu rdist:%hu lr-count:%u vmcr:0x%08x ctlr:0x%08x",
+		shell_yes_no(vgic->initialized), vgic->vcpu_count,
+		vgic->rdist_count, vgic->lr_count, vgic->vmcr, vgic->gicd_ctlr);
+	shell_item_line("its:base:0x%016lx size:0x%lx enabled:%s typer:0x%016lx ctlr:0x%08x",
+		arch->guest_its_base, arch->guest_its_size,
+		shell_yes_no(vgic->its_enabled), vgic->its.typer, vgic->its.ctlr);
+	shell_item_line("timer:virt-ppi:%u maint-ppi:%u phys-ppi:%u time-delta:%ld",
+		ARM64_GIC_PPI_VIRTUAL_TIMER, ARM64_GIC_PPI_VGIC_MAINTENANCE,
+		ARM64_GIC_PPI_PHYSICAL_TIMER, vm->arch_vm.time_delta);
+	shell_item_line("console:uart:0x%016lx/0x%lx irq:%u selected:%s ring:%u/%u pending:%s",
+		arch->guest_uart_base, arch->guest_uart_size, arch->guest_uart_irq,
+		shell_yes_no(console_vmid == vm_id), ring.queued, ring.capacity,
+		shell_yes_no(ring.pending));
+	if (vu != NULL) {
+		shell_item_line("        vuart:active:%s irq:%u rx:%u tx:%u ier:0x%02x lsr:0x%02x",
+			shell_yes_no(vu->active), vu->irq, vuart_rx_numchars(vu),
+			vu->txfifo.num, vu->ier, vu->lsr);
+	}
+
+	(void)snprintf(temp_str, MAX_STR_SIZE, "boot:kernel:%s entry:0x%016lx load:0x%016lx",
+		vm_config->os_config.name, vm_config->os_config.kernel_entry_addr,
+		vm_config->os_config.kernel_load_addr);
+	shell_item_line("%s", temp_str);
+}
+
+static void shell_vmstat_vcpus(const struct acrn_vm *vm)
+{
+	uint16_t vcpu_id;
+
+	if (vm->hw.created_vcpus == 0U) {
+		shell_item_line("vcpu:none");
+		return;
+	}
+
+	shell_item_section("vcpu state");
+	shell_item_line("vcpu  pcpu  vcpu     thread    cur  req-mask");
+	shell_item_line("────  ────  ───────  ────────  ───  ──────────────────");
+	for (vcpu_id = 0U; vcpu_id < vm->hw.created_vcpus; vcpu_id++) {
+		struct acrn_vcpu *vcpu = vcpu_from_vid((struct acrn_vm *)vm, vcpu_id);
+		struct sched_bvt_stats bvt = { 0U };
+		struct thread_object *current;
+		bool has_bvt;
+
+		current = sched_get_current(vcpu->thread_obj.pcpu_id);
+		has_bvt = sched_get_bvt_stats(&vcpu->thread_obj, &bvt);
+		shell_item_line("%-4hu  %-4hu  %-7s  %-8s  %-3s  0x%016lx",
+			vcpu->vcpu_id, vcpu->thread_obj.pcpu_id,
+			shell_vcpu_state_to_str(vcpu->state),
+			thread_state_to_str(vcpu->thread_obj.status),
+			shell_yes_no(current == &vcpu->thread_obj),
+			vcpu->pending_req);
+		shell_item_line("      bvt:weight:%u avt:%ld evt:%ld", has_bvt ? bvt.weight : 0U,
+			has_bvt ? bvt.avt : 0L, has_bvt ? bvt.evt : 0L);
+		shell_item_line("      timer:virq:%u cntv_ctl:0x%08x cntv_cval:0x%016lx rescue:stuck:%s wfi:%s lr:%s",
+			vcpu->arch.gctx.timer_virq, vcpu->arch.gctx.cntv_ctl_el0,
+			vcpu->arch.gctx.cntv_cval_el0,
+			shell_yes_no(vcpu->arch.vtimer_stuck_rescue_armed),
+			shell_yes_no(vcpu->arch.vtimer_wfi_rescue),
+			shell_yes_no(vcpu->arch.vtimer_lr_rescue));
+		shell_item_line("      cpuif:used-lrs:%u hcr:0x%016lx vmcr:0x%016lx pmr:0x%016lx",
+			vcpu->arch.vgic.used_lrs, vcpu->arch.vgic.hcr,
+			vcpu->arch.vgic.vmcr, vcpu->arch.vgic.pmr);
+	}
+}
+
+static int32_t shell_vmstat(int32_t argc, __unused char **argv)
+{
+	uint16_t vm_id;
+
+	if (argc != 1) {
+		return -EINVAL;
+	}
+
+	for (vm_id = 0U; vm_id < CONFIG_MAX_VM_NUM; vm_id++) {
+		struct acrn_vm_config *vm_config = get_vm_config(vm_id);
+		struct acrn_vm *vm = get_vm_from_vmid(vm_id);
+
+		if (!shell_vm_config_present(vm_config) &&
+			(vm->hw.created_vcpus == 0U) && is_poweroff_vm(vm)) {
+			continue;
+		}
+
+		shell_item_begin("vmstat vm%hu:%s", vm_id,
+			(vm->name[0] != '\0') ? vm->name : vm_config->name);
+		shell_vmstat_vm_config(vm_id, vm_config, vm);
+		shell_vmstat_vcpus(vm);
+		shell_item_end();
+	}
+
+	return 0;
 }
 
 static int32_t shell_constat(int32_t argc, char **argv)

@@ -63,11 +63,11 @@ struct shell {
 #define SHELL_CMD_SYMTAB_PARAM		NULL
 #define SHELL_CMD_SYMTAB_HELP		"list debug symbol offsets and names"
 
-#define SHELL_CMD_LOG_LVL		"log"
+#define SHELL_CMD_LOG_LVL		"loglevel"
 #define SHELL_CMD_LOG_LVL_PARAM		"[<console_loglevel> [<mem_loglevel> [npk_loglevel]]]"
 #define SHELL_CMD_LOG_LVL_HELP		"loglevel {0-6}"
 
-#define SHELL_CMD_DUMP_HOST_MEM		"mem"
+#define SHELL_CMD_DUMP_HOST_MEM		"xmem"
 #define SHELL_CMD_DUMP_HOST_MEM_PARAM	"<addr, length>"
 #define SHELL_CMD_DUMP_HOST_MEM_HELP	"dump host memory: address(hex), size(dec in bytes)"
 
