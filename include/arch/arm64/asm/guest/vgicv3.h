@@ -170,6 +170,7 @@ int32_t arm64_vgicv3_handle_sgi1r(struct acrn_vcpu *vcpu, uint64_t value);
 void arm64_vgicv3_flush_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_sync_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_flush_current_vcpu(struct acrn_vcpu *vcpu);
+void arm64_vgicv3_flush_current_vcpu_with_lock(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_sync_current_vcpu(struct acrn_vcpu *vcpu);
 void arm64_vgicv3_refresh_current_level_irq(struct acrn_vm *vm, uint32_t virq);
 void arm64_vgicv3_complete_wfi_irqs(struct acrn_vcpu *vcpu);

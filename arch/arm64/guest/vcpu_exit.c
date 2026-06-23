@@ -208,6 +208,30 @@ static bool vcpu_has_pending_guest_irq(struct acrn_vcpu *vcpu)
 	return arm64_vgicv3_pending_irq_blocks_reschedule(vcpu);
 }
 
+static void prepare_current_guest_return(struct acrn_vcpu *vcpu)
+{
+	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
+	/*
+	 * This is a last-chance synchronization point, not a scheduler policy.
+	 * Linux can return from WFI with DAIF.I still masked after a pending-only
+	 * virtual timer LR woke the CPU. A host IRQ or scheduling decision may have
+	 * synced LRs meanwhile and left only the software vGIC timer state pending.
+	 * If EL2 returns without re-materializing that pending timer in a hardware
+	 * LR, the next guest idle path can sleep with timer softirq progress still
+	 * blocked. Restrict the extra flush to the timer-rescue/host-masked cases so
+	 * ordinary guest exits keep the existing lightweight return path.
+	 */
+	bool timer_needs_flush = vcpu->arch.vtimer_lr_rescue ||
+		(gctx->cntv_el2_masked && arm64_vtimer_guest_expired(vcpu));
+
+	if (!timer_needs_flush) {
+		return;
+	}
+
+	refresh_current_vtimer(vcpu);
+	arm64_vgicv3_flush_current_vcpu_with_lock(vcpu);
+}
+
 static struct acrn_vcpu *schedule_without_guest_return_work(uint16_t pcpu_id,
 	struct acrn_vcpu *vcpu)
 {
@@ -867,6 +891,7 @@ void dispatch_vcpu_trap(struct cpu_regs *regs)
 		schedule();
 	}
 
+	prepare_current_guest_return(vcpu);
 	record_vcpu_return(vcpu, ARM64_VCPU_DEBUG_EXIT_SYNC);
 	restore_exit_regs(regs, vcpu);
 }
@@ -911,6 +936,7 @@ void dispatch_vcpu_irq(struct cpu_regs *regs)
 		schedule();
 	}
 
+	prepare_current_guest_return(vcpu);
 	record_vcpu_return(vcpu, ARM64_VCPU_DEBUG_EXIT_IRQ);
 	restore_exit_regs(regs, vcpu);
 }

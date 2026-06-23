@@ -362,9 +362,16 @@ def send_enter_burst(qemu, count, delay, name, vmid=None):
 
 
 def expect_vm2_id(qemu, name):
-	qemu.send("id" + ENTER)
+	token = f"__beau_vm2_id_{int(time.monotonic() * 1000000)}__"
+
+	# The VM console can replay old output and echo the command line before the
+	# guest has executed it. A unique token plus the "[vmid 2]" output marker makes
+	# this check wait for fresh VM2 command output instead of a stale "gid=0".
+	qemu.send(f"echo {token}; id; echo {token}_done" + ENTER)
 	try:
-		qemu.expect("gid=0", name, timeout=20.0, keepalive=ENTER)
+		text = qemu.expect(f"[vmid 2] {token}_done", name, timeout=20.0, keepalive=ENTER)
+		if "gid=0" not in text:
+			raise RuntimeError(f"{name}: id output missing gid=0")
 	except Exception:
 		qemu.capture_vm_diagnostics(name, 2)
 		raise

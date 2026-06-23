@@ -1977,6 +1977,25 @@ void arm64_vgicv3_flush_current_vcpu(struct acrn_vcpu *vcpu)
 	}
 }
 
+void arm64_vgicv3_flush_current_vcpu_with_lock(struct acrn_vcpu *vcpu)
+{
+	if ((vcpu != NULL) && (vcpu->vm != NULL) && vcpu->vm->arch_vm.vgic.initialized) {
+		struct arm64_vgicv3 *vgic = &vcpu->vm->arch_vm.vgic;
+		uint64_t flags;
+
+		/*
+		 * Most vGIC flush callers already hold vgic->lock. The guest-return
+		 * final-sync path deliberately sits outside those call chains: it only
+		 * knows that the current vCPU must have any pending timer line made
+		 * resident in live LRs before ERET. Keep the lock acquisition here so the
+		 * caller does not need to know descriptor/LR ownership rules.
+		 */
+		spinlock_irqsave_obtain(&vgic->lock, &flags);
+		vgicv3_flush_vcpu(vcpu, true);
+		spinlock_irqrestore_release(&vgic->lock, flags);
+	}
+}
+
 static void vgicv3_flush_target_vcpu(struct acrn_vcpu *current_vcpu,
 	struct acrn_vcpu *target_vcpu)
 {

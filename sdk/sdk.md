@@ -1015,12 +1015,13 @@ Status as of 2026-06-18:
   Updated outputs are `out/qemu_out/beau.debug.out` and
   `out/qemu_out/beau.debug.bin`.
 - Regression status after the PPI27 priority-mask repair and the
-  `core/schedule.c` no-op reschedule clear: the standard VM0/VM1/VM2 root-console
-  path passes, and the VM console pressure gate
+  `core/schedule.c` no-op reschedule clear: the standard VM0/VM1/VM2
+  root-console path has passed, but the VM console pressure gate
   `--stress-vsh-switch --stress-rounds 4 --stress-enters 80
-  --no-terminal-replies` also passes without the previous VM2 Linux
-  `timer-softirq=0` RCU stall. Keep this stress gate in future validation; add
-  repeated cold boots or longer rounds before treating the path as fully aged.
+  --no-terminal-replies` remains the active failure reproducer. On 2026-06-23
+  it still reached VM2 round 2 and then tripped Linux
+  `rcu_preempt detected stalls`. Do not mark the VM2 RCU issue fixed until
+  this pressure gate passes repeatedly.
 - A one-shot experiment that cleared TWI after converting WFI rescue into LR
   rescue did not solve the failure and made the 40-enter stress fail earlier.
   Do not treat "clear TWI after LR rescue" by itself as the next root fix.
@@ -1057,9 +1058,65 @@ Status as of 2026-06-18:
   bounded virtual-timer LR rescue budget on a scheduler tick that would have
   selected the same thread. Shared pCPUs still keep the bounded pending-IRQ
   window and then fall back to the configured scheduler's fairness model.
+- A later two-layer experiment added a stronger BVT urgent boost for vtimer
+  events and raised `VTIMER_LR_RESCUE_RESCHED_BUDGET` from 4 to 16. It did not
+  remove the VM2 RCU stall under the pressure gate and expanded common scheduler
+  ABI without proving root-cause coverage. Keep that experiment reverted in
+  submit-ready patches.
+- The retained narrow code experiment is an ARM64-local final flush before
+  returning to EL1: when `vtimer_lr_rescue` is active, or CNTV is still
+  EL2-masked and expired, refresh the current vtimer and flush the current vGIC
+  LRs under the VM vGIC lock immediately before ERET. This is not a complete
+  fix by itself, but it is a useful low-risk sync point because it removes the
+  "software pending but not resident in an LR at return" failure class.
 - A dynamic tick-gating experiment reduced pCPU1 host physical timer callbacks
   but still failed the VM2 Linux stress path and changed timing rather than
   fixing the underlying vtimer/vGIC lifecycle.
+
+### VM2 Linux RCU Stall Current Analysis, 2026-06-23
+
+The most likely stall chain is:
+
+1. VM2 Linux enters the idle path and executes WFI with saved guest DAIF.I still
+   masked.
+2. The virtual timer deadline is already due, so BEAU has a pending virtual
+   timer IRQ for guest INTID 27 and may have a pending-only timer LR resident.
+3. QEMU can use that pending-only LR only as the architectural WFI wake event.
+   Linux has returned from WFI, but it has not yet reached
+   `local_irq_enable()`/`daifclr`, so the EL1 timer handler and timer softirq
+   have not run.
+4. A host physical timer tick, shared-pCPU scheduling point, or VM console
+   switch can take the vCPU away during this short masked-IRQ window.
+5. On a later sync, the live LR may be gone without EOI evidence while CNTV is
+   still expired and `cntv_el2_masked` remains true. If EL2 does not rebuild a
+   guest-visible timer LR before the next guest idle point, Linux can keep
+   sleeping with its timer softirq starved.
+6. Linux eventually reports RCU stalls such as
+   `rcu_preempt kthread timer wakeup didn't happen` and
+   `Possible timer handling issue on cpu=0 timer-softirq=0`.
+
+This is related to vCPU scheduling latency, but the failed urgent-BVT
+experiment shows that scheduler preference alone is not sufficient. The root
+fix should preserve the virtual timer line across the pending-only-LR/WFI
+window and rebuild guest-visible delivery at bounded vGIC/vtimer sync points.
+
+Feasible next repair:
+
+1. Keep `HCR_EL2.TWI` one-shot only. Do not leave WFI trapping enabled across
+   normal Linux idle loops.
+2. Keep the pre-ERET final vtimer/vGIC flush for the current vCPU when the
+   timer is in LR rescue or CNTV is EL2-masked and expired.
+3. Add a narrow second rescue condition, not a broad scheduler boost: if
+   `vtimer_lr_rescue` is set, saved guest DAIF.I is still masked, CNTV is
+   expired, the software vGIC timer descriptor is pending, and the live LR no
+   longer contains a pending timer entry after the bounded LR-rescue budget is
+   exhausted, arm one more TWI trap so the next WFI exits to EL2 and the timer
+   LR can be rebuilt.
+4. Clear that second rescue immediately once Linux EOIs/reprograms the timer,
+   CNTV moves to the future, or DAIF.I is observed unmasked.
+5. Keep common scheduler changes out of the submit patch unless a later log
+   proves VM2 vCPUs are runnable but not selected for a long enough interval to
+   explain the RCU warning.
 
 ### RCU Stall Repair Strategy
 
