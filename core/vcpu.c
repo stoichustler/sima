@@ -116,6 +116,12 @@ void kick_vcpu(struct acrn_vcpu *vcpu)
 void vcpu_make_request(struct acrn_vcpu *vcpu, uint16_t eventid)
 {
 	bitmap_set(eventid, &vcpu->pending_req);
+	/*
+	 * Interrupt injection may already hold architecture interrupt locks. Ask the
+	 * scheduler for best-effort event priority through a deferred request instead
+	 * of editing scheduler runqueue state directly from this path.
+	 */
+	request_thread_priority(&vcpu->thread_obj);
 	kick_vcpu(vcpu);
 }
 

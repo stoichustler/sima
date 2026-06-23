@@ -37,11 +37,11 @@ enum thread_priority {
 struct sched_params {
 	uint32_t prio;		/* The priority of a thread */
 
-	/* per thread parameters for bvt scheduler */
-	uint8_t bvt_weight;	/* the weight of a thread */
-	int32_t bvt_warp_value; /* the warp reduce effective VT to boost priority */
-	uint32_t bvt_warp_limit;	/* max time in one warp */
-	uint32_t bvt_unwarp_period;	/* min unwarp time after a warp */
+	/* per-thread parameters for the BVT scheduler */
+	uint8_t bvt_weight;	/* CPU share weight, clamped by sched_bvt */
+	int32_t bvt_warp_value;	/* EVT credit in MCU units while warp is active */
+	uint32_t bvt_warp_limit;	/* max charged MCU units for one warp window */
+	uint32_t bvt_unwarp_period;	/* cooldown in MCU units after a warp ends */
 };
 
 struct sched_latency_stats {
@@ -71,6 +71,12 @@ struct thread_object {
 	volatile enum thread_object_state status;
 	bool be_blocking;
 	bool is_vcpu;
+	/*
+	 * One-shot request consumed by schedule() under scheduler_lock. Event
+	 * injection paths can ask for priority treatment without taking scheduler_lock
+	 * inside IRQ/vCPU locks; schedulers that do not implement .prioritize ignore it.
+	 */
+	volatile bool priority_pending;
 
 	uint64_t host_sp;
 	switch_t switch_out;
@@ -116,7 +122,7 @@ struct acrn_scheduler {
 	void	(*wake)(struct thread_object *obj);
 	/* yield current thread object */
 	void	(*yield)(struct sched_control *ctl);
-	/* prioritize the thread object */
+	/* Optional event boost with the common scheduler lock already held. */
 	void	(*prioritize)(struct thread_object *obj);
 	/* deinit private data of scheduler */
 	void	(*deinit_data)(struct thread_object *obj);
@@ -184,6 +190,11 @@ void run_thread(struct thread_object *obj);
 void sleep_thread(struct thread_object *obj);
 void sleep_thread_sync(struct thread_object *obj);
 void wake_thread(struct thread_object *obj);
+/*
+ * Request best-effort scheduler-specific priority treatment. This always raises
+ * NEED_RESCHEDULE; only schedulers with .prioritize attach extra ordering state.
+ */
+void request_thread_priority(struct thread_object *obj);
 void yield_current(void);
 void schedule(void);
 

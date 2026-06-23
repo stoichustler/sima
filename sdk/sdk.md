@@ -104,7 +104,7 @@ Current QEMU VM layout:
   - Raw image tag: `zephyr`
   - Load address and entry: `0x42000000`
   - Identity RAM window: `0x42000000-0x48000000`
-  - vCPUs: 4, running on ordinary-core pCPU0, pCPU2, pCPU3, and pCPU4
+  - vCPUs: 4, running on ordinary-core pCPU0, pCPU2, pCPU3, and pCPU5
 - VM1 is the LK pre-launched VM.
   - Image: `sdk/image/lk.bin`
   - Raw image tag: `lk`
@@ -122,17 +122,18 @@ Current QEMU VM layout:
   - Initramfs load address: `0x4c000000`
   - DTB image: `sdk/image/linux/beau-linux.dtb`
   - DTB module tag: `beau-linux-dtb`
-  - Boot console: `console=ttyAMA0 rdinit=/init earlycon=pl011,0x09000000`
+  - Boot console: `console=ttyAMA0 rdinit=/init loglevel=4`
   - Identity RAM window: `0x48000000-0x50000000`
   - vCPUs: 4, running on pCPU1, pCPU4, pCPU6, and pCPU7
   - QEMU vITS window: `0x08080000-0x0809ffff`
   - Initramfs shell: `uos` prompt as root
 - pCPU0-pCPU5 model ordinary cores.
 - pCPU6-pCPU7 model performance cores.
-- VM0 uses ordinary cores only. VM1 may mix ordinary and performance cores; the
-  static QEMU scenario uses pCPU3 as the shared ordinary core plus pCPU5-pCPU7.
-  Each VM's vCPU0/BSP is kept on a pCPU that no other VM uses: VM0 on pCPU2,
-  VM1 on pCPU5, and VM2 on pCPU1.
+- VM0 uses ordinary cores only. VM1 may mix ordinary and performance cores.
+  The static QEMU scenario keeps VM2 on pCPU1, pCPU4, pCPU6, and pCPU7 while
+  VM0 still has four vCPUs. Shared-core behavior is expressed only by platform
+  `cpu_affinity`; common VM creation must not add QEMU-specific pCPU ordering
+  rules.
 
 The generated `out/qemu_out/beau.debug.out` has been boot-tested on QEMU. The
 build also emits `out/qemu_out/beau.out` as the base link image and
@@ -192,13 +193,19 @@ boot logs settle to show the `console:\>` prompt.
 - PSCI virtualization for guest `CPU_ON`, `CPU_OFF`, `AFFINITY_INFO`,
   `SYSTEM_OFF`, and `SYSTEM_RESET`.
 - BEAU shell `reboot` command wired to host PSCI system reset.
+- BEAU shell supports command-name Tab completion. Empty-line Tab lists all
+  commands, a unique command prefix completes the command and adds a trailing
+  space, and ambiguous prefixes print matching command names before redrawing the
+  prompt. Completion is intentionally limited to the first command token; command
+  parameters remain command-specific and are not completed by the common shell.
 - PSCI-based host secondary CPU bring-up with `MAX_PCPU_NUM=8`.
 - VM0 and VM1 vCPUs share pCPU3 through the existing `sched_bvt` scheduler.
   Current QEMU BVT weights are VM0 Zephyr `128`, VM1 LK `16`, and VM2 Linux
-  `128`. The rk356x static configuration keeps VM2 Linux at `64`.
-  VM0 uses ordinary-core pCPU0, pCPU2, pCPU3, and pCPU4; VM1 uses mixed pCPU3,
-  pCPU5, pCPU6, and pCPU7. VM2 uses pCPU1, pCPU4, pCPU6, and pCPU7. The
-  vCPU0/BSP pCPUs are private to each VM.
+  `128`. VM2 additionally enables bounded BVT warp on vCPU event requests to
+  reduce shared-core wakeup latency. The rk356x static configuration keeps VM2
+  Linux at `64`. VM0 uses ordinary-core pCPU0, pCPU2, pCPU3, and pCPU5; VM1
+  uses mixed pCPU3, pCPU5, pCPU6, and pCPU7. VM2 uses pCPU1, pCPU4, pCPU6, and
+  pCPU7.
 - ARM64 vCPU switch-in/out now saves and restores guest EL1 translation,
   exception, timer, TPIDR, and vGIC state, so two VMs can time-share one pCPU
   without inheriting each other's EL1 address-space context.
@@ -249,8 +256,8 @@ Current BVT status:
   QEMU/rk356x flow. A valid `schedstat` header should report
   `schedstat algorithm:sched_bvt mcu:1ms csa:5 weight:1-128 pcpus:8`.
 - The BVT `schedstat` thread table exposes `weight`, `avt`, and `evt`.
-  Lower virtual time has scheduling priority. `evt` currently equals `avt`
-  because the BVT warp fields exist but are not active in the default setup.
+  Lower virtual time has scheduling priority. `evt` is `avt` unless bounded
+  warp is enabled for the thread by its platform `sched_params`.
 - The user-provided `schedstat` samples show VM2 Linux vCPUs at `weight 128`.
   VM2/vCPU0 and VM2/vCPU1 advance by about 80k virtual-time ticks between the
   two samples; VM2/vCPU2 and VM2/vCPU3 move from runnable to running and also
@@ -262,10 +269,30 @@ Current BVT status:
 - If Linux still reports internal stalls while VM2 vCPUs continue to advance,
   keep debugging VM2 vtimer/vGIC forward progress with `dumpstat 2`, `irqstat`,
   `constat 2`, and consecutive `schedstat` captures.
-- One sample also shows pCPU4 staying on `vm2:vcpu1` while `vm0:vcpu3` is
-  runnable with stale low `avt` and pCPU4 timer/switch counters do not advance
-  between captures. Treat that as a BVT timer/runqueue fairness follow-up, not
-  as evidence that VM2 is losing CPU time.
+- Earlier samples showed pCPU4 contention when VM0 also used pCPU4. The current
+  QEMU static layout keeps VM2's pCPU1 and pCPU4 private while preserving four
+  VM0 vCPUs; shared-core latency should now be checked on pCPU6 and pCPU7.
+
+Bounded BVT warp design:
+
+- BVT keeps long-term fairness in `avt` and sorts runnable threads by `evt`.
+  Normally `evt == avt`; when warp is active, `evt = avt - bvt_warp_value`, so
+  the thread moves earlier in the runqueue without receiving permanent AVT
+  credit.
+- `bvt_warp_value` is the temporary EVT credit in MCU units. Larger values reduce
+  event wake latency more aggressively, but can temporarily push peer threads
+  further back.
+- `bvt_warp_limit` is the maximum charged runtime for one warp window, also in
+  MCU units. The window is charged only while the boosted thread actually runs.
+- `bvt_unwarp_period` is the cooldown after a warp ends, in MCU units. It keeps
+  an interrupt-heavy vCPU from re-entering warp immediately after every event.
+- `request_thread_priority()` is the common scheduler entry point. It always
+  raises `NEED_RESCHEDULE`; only schedulers that implement `.prioritize`, such
+  as `sched_bvt`, attach extra ordering state. This keeps vCPU/GIC event paths
+  from directly editing a scheduler runqueue while they may hold unrelated locks.
+- VM2 QEMU currently uses `bvt_warp_value = 8`, `bvt_warp_limit = 2`, and
+  `bvt_unwarp_period = 4`. These values are platform policy, not common scheduler
+  defaults.
 
 How to change BVT weight:
 
@@ -425,18 +452,21 @@ init_thread_data(&vcpu->thread_obj, &params);
   virtualization code now includes English comments for module responsibilities,
   design boundaries, and key state transitions.
 
-## Verified
+## QEMU Validation Notes
 
-The following have been verified on QEMU with `-smp 8`:
+The following are the current QEMU `-smp 8` validation expectations. Items that
+changed with the VM2 shared-core optimization need a fresh manual QEMU run before
+being treated as verified results:
 
 - The hypervisor accepts Enter after boot and prints the `console:\>` shell
   prompt.
 - VM0 Zephyr autostarts as the service VM.
 - VM1 LK autostarts as a pre-launched VM.
 - VM2 Linux autostarts as a pre-launched VM.
-- VM0 Zephyr vCPU0-vCPU3 bind to ordinary-core pCPU2, pCPU0, pCPU3, and pCPU4.
-- VM1 LK vCPU0-vCPU3 bind to mixed pCPU5, pCPU3, pCPU6, and pCPU7, sharing
-  pCPU3 with VM0.
+- VM0 Zephyr vCPU0-vCPU3 bind to ordinary-core pCPU0, pCPU2, pCPU3, and pCPU5
+  in ascending `cpu_affinity` order.
+- VM1 LK vCPU0-vCPU3 bind to mixed pCPU3, pCPU5, pCPU6, and pCPU7, sharing
+  pCPU3 and pCPU5 with VM0.
 - VM2 Linux vCPU0-vCPU3 bind to pCPU1, pCPU4, pCPU6, and pCPU7.
 - VM0 Zephyr enters EL1 at `0x42000000`.
 - VM1 LK enters EL1 at `0x40100000`.
@@ -447,8 +477,8 @@ The following have been verified on QEMU with `-smp 8`:
   per-pCPU scheduler timer callbacks, reschedule requests, runnable-thread
   counts, and context switch counters. After the BVT switch, QEMU validation
   must confirm that it reports `sched_bvt`.
-- `vcpus` reports all three VMs and nine guest vCPUs. VM0 uses pCPU0, pCPU2,
-  pCPU3, and pCPU4; VM1 uses pCPU3, pCPU5, pCPU6, and pCPU7; VM2 Linux uses
+- `vcpus` reports all three VMs and twelve guest vCPUs. VM0 uses pCPU0, pCPU2,
+  pCPU3, and pCPU5; VM1 uses pCPU3, pCPU5, pCPU6, and pCPU7; VM2 Linux uses
   pCPU1, pCPU4, pCPU6, and pCPU7.
 - `vsh 0` enters the Zephyr console and reaches `zero ~>`.
 - `vsh 1` enters the LK console and reaches `beau ~>`.
@@ -1133,8 +1163,8 @@ virtualization port.
   shell during QEMU validation. The held-Enter and `vsh` switch pressure test
   is now part of the acceptance gate because it previously reproduced the VM2
   RCU/vtimer failure.
-- VM2 Linux keeps `earlycon=pl011,0x09000000` so `vsh 2` can show Linux logs
-  before the normal PL011 console driver is registered.
+- VM2 Linux currently omits `earlycon=pl011,0x09000000` and uses `loglevel=4`
+  to reduce shared-core console pressure during the VM2 latency investigation.
 - VM console output from SMP guests can interleave because multiple guest CPUs
   write concurrently to the same PL011 console.
 - Stage-2 mapping is still static for the QEMU `virt` platform.

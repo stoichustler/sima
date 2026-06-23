@@ -204,6 +204,7 @@ void init_thread_data(struct thread_object *obj, struct sched_params *params)
 	}
 	/* initial as BLOCKED status, so we can wake it up to run */
 	set_thread_status(obj, THREAD_STS_BLOCKED);
+	obj->priority_pending = false;
 	obj->latency.state_since = cpu_ticks();
 	register_thread_object(obj);
 	release_schedule_lock(obj->pcpu_id, rflag);
@@ -374,15 +375,34 @@ void schedule(void)
 {
 	uint16_t pcpu_id = get_pcpu_id();
 	struct sched_control *ctl = &per_cpu(sched_ctl, pcpu_id);
+	struct acrn_scheduler *scheduler = ctl->scheduler;
 	struct thread_object *next = &per_cpu(idle, pcpu_id);
 	struct thread_object *prev = ctl->curr_obj;
+	struct thread_object *obj;
+	struct list_head *pos;
 	uint64_t rflag;
 	uint64_t now;
 	char name[16];
 
 	obtain_schedule_lock(pcpu_id, &rflag);
-	if (ctl->scheduler->pick_next != NULL) {
-		next = ctl->scheduler->pick_next(ctl);
+	/*
+	 * Consume one-shot priority requests before pick_next(). The request may be
+	 * raised from IRQ/vCPU paths that already hold unrelated locks, so those paths
+	 * only set a flag and request reschedule. The scheduler-specific callback runs
+	 * here under the scheduler lock, preserving a single lock owner for runqueue
+	 * ordering changes.
+	 */
+	list_for_each(pos, &thread_list) {
+		obj = container_of(pos, struct thread_object, node);
+		if ((obj->pcpu_id == pcpu_id) && obj->priority_pending) {
+			obj->priority_pending = false;
+			if ((scheduler->prioritize != NULL) && is_runnable_or_running(obj) && !obj->be_blocking) {
+				scheduler->prioritize(obj);
+			}
+		}
+	}
+	if (scheduler->pick_next != NULL) {
+		next = scheduler->pick_next(ctl);
 	}
 	bitmap_clear(NEED_RESCHEDULE, &ctl->flags);
 
@@ -465,6 +485,21 @@ void wake_thread(struct thread_object *obj)
 		obj->be_blocking = false;
 	}
 	release_schedule_lock(pcpu_id, rflag);
+}
+
+void request_thread_priority(struct thread_object *obj)
+{
+	struct acrn_scheduler *scheduler = get_scheduler(obj->pcpu_id);
+
+	/*
+	 * The flag is meaningful only for schedulers that opt in via .prioritize.
+	 * NEED_RESCHEDULE is still useful for all schedulers because the target pCPU
+	 * may need to leave idle or re-check pending vCPU requests.
+	 */
+	if (scheduler->prioritize != NULL) {
+		obj->priority_pending = true;
+	}
+	make_reschedule_request(obj->pcpu_id);
 }
 
 void yield_current(void)

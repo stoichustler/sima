@@ -35,6 +35,7 @@ extern uint32_t arch_shell_cmds_sz;
  */
 
 static void shell_print_registered_commands(void);
+static void shell_handle_tab_key(void);
 static int32_t shell_version(__unused int32_t argc, __unused char **argv);
 static int32_t shell_loglevel(int32_t argc, char **argv);
 static int32_t shell_dump_host_mem(int32_t argc, char **argv);
@@ -186,19 +187,31 @@ static int32_t string_to_argv(char *argv_str, void *p_argv_mem,
 	return 0;
 }
 
+static uint32_t shell_cmd_total(void)
+{
+	return p_shell->cmd_count + p_shell->arch_cmd_count;
+}
+
+static struct shell_cmd *shell_cmd_at(uint32_t idx)
+{
+	struct shell_cmd *p_cmd;
+
+	if (idx < p_shell->cmd_count) {
+		p_cmd = &p_shell->cmds[idx];
+	} else {
+		p_cmd = &p_shell->arch_cmds[idx - p_shell->cmd_count];
+	}
+
+	return p_cmd;
+}
+
 static struct shell_cmd *shell_find_cmd(const char *cmd_str)
 {
 	uint32_t i;
 	struct shell_cmd *p_cmd = NULL;
 
-	for (i = 0U; i < p_shell->cmd_count; i++) {
-		p_cmd = &p_shell->cmds[i];
-		if (strcmp(p_cmd->str, cmd_str) == 0) {
-			return p_cmd;
-		}
-	}
-	for (i = 0U; i < p_shell->arch_cmd_count; i++) {
-		p_cmd = &p_shell->arch_cmds[i];
+	for (i = 0U; i < shell_cmd_total(); i++) {
+		p_cmd = shell_cmd_at(i);
 		if (strcmp(p_cmd->str, cmd_str) == 0) {
 			return p_cmd;
 		}
@@ -283,6 +296,153 @@ static void shell_restore_input_line(void)
 	if (p_shell->input_line_len > 0U) {
 		shell_puts(p_shell->buffered_line[p_shell->input_line_active]);
 		set_cursor_pos(p_shell->input_line_len - p_shell->cursor_offset);
+	}
+}
+
+static bool shell_cmd_matches_prefix(const struct shell_cmd *p_cmd, const char *prefix, uint32_t prefix_len)
+{
+	return (strnlen_s(p_cmd->str, SHELL_CMD_MAX_LEN) >= prefix_len) &&
+		(strncmp(p_cmd->str, prefix, prefix_len) == 0);
+}
+
+static uint32_t shell_common_prefix_len(const char *a, const char *b, uint32_t min_len)
+{
+	uint32_t len = 0U;
+
+	while ((len < min_len) && (a[len] != '\0') && (b[len] != '\0') &&
+		(a[len] == b[len])) {
+		len++;
+	}
+
+	return len;
+}
+
+static uint32_t shell_find_cmd_matches(const char *prefix, uint32_t prefix_len,
+	const struct shell_cmd **first_match, uint32_t *common_len)
+{
+	const struct shell_cmd *p_cmd;
+	uint32_t count = 0U;
+	uint32_t i;
+
+	*first_match = NULL;
+	*common_len = 0U;
+	for (i = 0U; i < shell_cmd_total(); i++) {
+		p_cmd = shell_cmd_at(i);
+		if (!shell_cmd_matches_prefix(p_cmd, prefix, prefix_len)) {
+			continue;
+		}
+
+		if (count == 0U) {
+			*first_match = p_cmd;
+			*common_len = (uint32_t)strnlen_s(p_cmd->str, SHELL_CMD_MAX_LEN);
+		} else {
+			*common_len = shell_common_prefix_len((*first_match)->str, p_cmd->str, *common_len);
+		}
+		count++;
+	}
+
+	return count;
+}
+
+static void shell_append_completion(const char *completion, uint32_t completion_len)
+{
+	char *line = p_shell->buffered_line[p_shell->input_line_active];
+	uint32_t appended = 0U;
+	uint32_t idx;
+
+	for (idx = 0U; (idx < completion_len) && (p_shell->input_line_len < SHELL_CMD_MAX_LEN);
+		idx++) {
+		line[p_shell->input_line_len] = completion[idx];
+		p_shell->input_line_len++;
+		p_shell->cursor_offset++;
+		appended++;
+	}
+	line[p_shell->input_line_len] = '\0';
+	(void)console_write(completion, appended);
+}
+
+static void shell_print_cmd_matches(const char *prefix, uint32_t prefix_len)
+{
+	struct shell_cmd *p_cmd;
+	uint32_t i;
+
+	shell_puts("\r\n");
+	for (i = 0U; i < shell_cmd_total(); i++) {
+		p_cmd = shell_cmd_at(i);
+		if (shell_cmd_matches_prefix(p_cmd, prefix, prefix_len)) {
+			shell_puts("  ");
+			shell_puts(p_cmd->str);
+			shell_puts("\r\n");
+		}
+	}
+	shell_restore_input_line();
+}
+
+static bool shell_cursor_on_command_tail(uint32_t *cmd_start, uint32_t *prefix_len)
+{
+	char *line = p_shell->buffered_line[p_shell->input_line_active];
+	uint32_t idx = 0U;
+
+	/*
+	 * Completion is intentionally limited to the command token. Parameter
+	 * completion would need command-specific parsers, while the command token can
+	 * be completed safely from the common command tables.
+	 */
+	if (p_shell->cursor_offset != p_shell->input_line_len) {
+		return false;
+	}
+
+	while ((idx < p_shell->input_line_len) && (line[idx] == ' ')) {
+		idx++;
+	}
+	*cmd_start = idx;
+	while (idx < p_shell->cursor_offset) {
+		if ((line[idx] == ' ') || (line[idx] == ',')) {
+			return false;
+		}
+		idx++;
+	}
+	*prefix_len = p_shell->cursor_offset - *cmd_start;
+
+	return true;
+}
+
+static void shell_handle_tab_key(void)
+{
+	const struct shell_cmd *first_match;
+	char *line = p_shell->buffered_line[p_shell->input_line_active];
+	uint32_t cmd_start;
+	uint32_t prefix_len;
+	uint32_t common_len;
+	uint32_t match_count;
+	uint32_t first_len;
+
+	if (!shell_cursor_on_command_tail(&cmd_start, &prefix_len)) {
+		return;
+	}
+	if (prefix_len == 0U) {
+		shell_print_registered_commands();
+		shell_restore_input_line();
+		return;
+	}
+
+	match_count = shell_find_cmd_matches(&line[cmd_start], prefix_len, &first_match, &common_len);
+	if (match_count == 0U) {
+		return;
+	}
+
+	if (match_count == 1U) {
+		first_len = (uint32_t)strnlen_s(first_match->str, SHELL_CMD_MAX_LEN);
+		if (first_len > prefix_len) {
+			shell_append_completion(&first_match->str[prefix_len], first_len - prefix_len);
+		}
+		if (p_shell->input_line_len < SHELL_CMD_MAX_LEN) {
+			shell_append_completion(" ", 1U);
+		}
+	} else if (common_len > prefix_len) {
+		shell_append_completion(&first_match->str[prefix_len], common_len - prefix_len);
+	} else {
+		shell_print_cmd_matches(&line[cmd_start], prefix_len);
 	}
 }
 
@@ -486,8 +646,7 @@ static bool shell_input_line(void)
 		break;
 
 	case SHELL_ASCII_TAB:
-		shell_print_registered_commands();
-		shell_restore_input_line();
+		shell_handle_tab_key();
 		break;
 
 	/* Carriage-return */
@@ -712,7 +871,7 @@ static void shell_print_registered_commands(void)
 	struct shell_cmd *p_cmd = NULL;
 
 	char str[MAX_STR_SIZE];
-	uint32_t cmd_cnt = p_shell->cmd_count + p_shell->arch_cmd_count;
+	uint32_t cmd_cnt = shell_cmd_total();
 	/* Print title */
 	shell_puts("\r\n\r\n────────── [BEAU commands] ──────────\r\n\r\n");
 
@@ -727,11 +886,7 @@ static void shell_print_registered_commands(void)
 			const char *cmd_param;
 			const char *help_str;
 
-			if (j < p_shell->cmd_count) {
-				p_cmd = &p_shell->cmds[j];
-			} else {
-				p_cmd = &p_shell->arch_cmds[j - p_shell->cmd_count];
-			}
+			p_cmd = shell_cmd_at(j);
 
 			cmd_param = (p_cmd->cmd_param == NULL) ? " " : p_cmd->cmd_param;
 			(void)memset(str, ' ', sizeof(str));

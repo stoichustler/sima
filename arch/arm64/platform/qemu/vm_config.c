@@ -66,8 +66,13 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 	[0] = {
 		CONFIG_SERVICE_VM,
 		.name = "Zephyr",
+		/*
+		 * VM0 must stay a 4-vCPU service VM. pCPU4 is left out of VM0 so VM2
+		 * keeps pCPU1/pCPU4 as private ordinary cores; VM0 still uses four
+		 * ordinary cores through pCPU0/pCPU2/pCPU3/pCPU5.
+		 */
 		.cpu_affinity = AFFINITY_CPU(0) | AFFINITY_CPU(2) |
-			AFFINITY_CPU(3) | AFFINITY_CPU(4),
+			AFFINITY_CPU(3) | AFFINITY_CPU(5),
 		.guest_flags = GUEST_FLAG_STATIC_VM | GUEST_FLAG_NO_FW,
 		.sched_params = {
 			.bvt_weight = 128U,
@@ -141,6 +146,15 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 		.guest_flags = GUEST_FLAG_STATIC_VM,
 		.sched_params = {
 			.bvt_weight = 128U,
+			/*
+			 * VM2 is latency-sensitive under shared-core pressure. A vCPU event
+			 * request gives it an EVT credit of 8 MCU units, charged for at most
+			 * 2 MCU units, then blocked from re-warping for 4 MCU units. The
+			 * values improve wakeup latency without changing long-term BVT share.
+			 */
+			.bvt_warp_value = 8,
+			.bvt_warp_limit = 2U,
+			.bvt_unwarp_period = 4U,
 		},
 		.memory = {
 			.size = QEMU_LINUX_RAM_SIZE,

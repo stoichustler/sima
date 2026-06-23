@@ -218,70 +218,17 @@ static inline uint16_t get_vm_launch_pcpu_id(const struct acrn_vm_config *vm_con
 #endif
 }
 
-#if defined(CONFIG_ARM64)
-static uint16_t get_first_non_pcpu(uint64_t pcpu_bitmap, uint16_t excluded_pcpu_id)
-{
-	bitmap_clear_non_atomic(excluded_pcpu_id, &pcpu_bitmap);
-	return ffs64(pcpu_bitmap);
-}
-
-/*
- * Static affinity is the only placement policy here. The helper finds the
- * first pCPU that a pre-launched VM would share with the service VM so the BSP
- * creation path can keep that shared pCPU for an AP vCPU instead. Sharing AP
- * vCPUs is easier to reason about during early boot because each VM's BSP can
- * make progress on a private pCPU before the scheduler starts time-slicing the
- * shared one.
- */
-static uint16_t get_shared_pcpu_with_service_vm(uint64_t pcpu_bitmap)
-{
-	const struct acrn_vm_config *service_config = service_vm_config;
-	uint64_t shared = 0UL;
-
-	if (service_config != NULL) {
-		shared = pcpu_bitmap & service_config->cpu_affinity;
-	}
-
-	return (shared != 0UL) ? ffs64(shared) : MAX_PCPU_NUM;
-}
-#endif
-
 static int32_t create_vm_vcpus(struct acrn_vm *vm, uint64_t pcpu_bitmap)
 {
 	uint64_t tmp64 = pcpu_bitmap;
 	uint16_t pcpu_id;
 	int32_t status = 0;
 
-#if defined(CONFIG_ARM64)
 	/*
-	 * create_vcpu() assigns vCPU IDs in creation order, so the first created
-	 * vCPU becomes vCPU0/BSP. For the ARM64 QEMU SDK layout we keep the logic
-	 * simple and deterministic:
-	 * - The service VM may use pCPU0, but its BSP is placed on another ordinary
-	 *   pCPU. pCPU0 still runs host shell/console work, and using it only as a
-	 *   service AP avoids making early boot depend on the most contended core.
-	 * - A pre-launched VM BSP avoids the pCPU shared with the service VM. The
-	 *   shared pCPU is therefore used by AP vCPUs, which validates scheduler
-	 *   time-slicing without coupling both guests' boot CPUs to one pCPU.
+	 * vCPU IDs follow ascending pCPU bits in cpu_affinity. Platform-specific
+	 * topology policy belongs in vm_configs[].cpu_affinity; common VM creation
+	 * must not reorder vCPUs for a QEMU board layout or a particular shared core.
 	 */
-	if (is_service_vm(vm) && bitmap_test(BSP_CPU_ID, &tmp64)) {
-		pcpu_id = get_first_non_pcpu(tmp64, BSP_CPU_ID);
-		if (pcpu_id < MAX_PCPU_NUM) {
-			bitmap_clear_non_atomic(pcpu_id, &tmp64);
-			status = create_vcpu(vm, pcpu_id);
-		}
-	} else if (is_prelaunched_vm(vm)) {
-		uint16_t shared_pcpu = get_shared_pcpu_with_service_vm(tmp64);
-
-		pcpu_id = (shared_pcpu < MAX_PCPU_NUM) ? get_first_non_pcpu(tmp64, shared_pcpu) :
-			MAX_PCPU_NUM;
-		if (pcpu_id < MAX_PCPU_NUM) {
-			bitmap_clear_non_atomic(pcpu_id, &tmp64);
-			status = create_vcpu(vm, pcpu_id);
-		}
-	}
-#endif
-
 	while ((status == 0) && (tmp64 != 0UL)) {
 		pcpu_id = ffs64(tmp64);
 		bitmap_clear_non_atomic(pcpu_id, &tmp64);

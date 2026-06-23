@@ -38,6 +38,11 @@
  */
 #define BVT_VT_RATIO_MIN	8U
 #define BVT_VT_RATIO_MAX	(BVT_WEIGHT_MAX * BVT_VT_RATIO_MIN / BVT_WEIGHT_MIN)
+/*
+ * A zero warp limit in static configuration still means "enable a bounded
+ * boost" rather than "boost forever". One MCU is the minimum useful window.
+ */
+#define BVT_WARP_LIMIT_DEFAULT	1U
 
 struct sched_bvt_data {
 	/* keep list as the first item */
@@ -48,10 +53,18 @@ struct sched_bvt_data {
 	uint8_t weight;
 	/* virtual time advance variable, proportional to 1 / weight */
 	uint64_t vt_ratio;
+	/*
+	 * BVT orders runnable threads by effective virtual time (EVT). A warp is a
+	 * temporary negative offset applied as EVT = AVT - warp_value, giving a
+	 * recently woken or event-targeted thread an earlier position in the runqueue.
+	 * warp_left is charged in MCU units; last_unwarp_tsc enforces cooldown.
+	 */
 	bool warp_on;
 	int32_t warp_value;
 	uint32_t warp_limit;
 	uint32_t unwarp_period;
+	uint32_t warp_left;
+	uint64_t last_unwarp_tsc;
 	/* actual virtual time in units of mcu */
 	int64_t avt;
 	/* effective virtual time in units of mcu */
@@ -61,6 +74,9 @@ struct sched_bvt_data {
 	uint64_t start_tsc;
 };
 
+static void runqueue_add(struct thread_object *obj);
+static void runqueue_remove(struct thread_object *obj);
+
 /*
  * @pre obj != NULL
  * @pre obj->data != NULL
@@ -69,6 +85,73 @@ static bool is_inqueue(struct thread_object *obj)
 {
 	struct sched_bvt_data *data = (struct sched_bvt_data *)obj->data;
 	return !list_empty(&data->list);
+}
+
+static void update_evt(struct sched_bvt_data *data)
+{
+	/* AVT is the fairness ledger; EVT is only the ordering key. */
+	data->evt = data->avt;
+	if (data->warp_on) {
+		data->evt -= (int64_t)data->warp_value;
+	}
+}
+
+static bool bvt_can_warp(const struct sched_bvt_data *data, uint64_t now_tsc)
+{
+	bool can_warp = data->warp_value > 0;
+
+	/*
+	 * unwarp_period is configured in MCU units. A non-zero value prevents an
+	 * interrupt-heavy vCPU from immediately re-entering warp after each charge.
+	 */
+	if (can_warp && (data->unwarp_period != 0U) && (data->last_unwarp_tsc != 0UL)) {
+		can_warp = (now_tsc - data->last_unwarp_tsc) >=
+			((uint64_t)data->unwarp_period * data->mcu);
+	}
+
+	return can_warp;
+}
+
+static void bvt_start_warp(struct thread_object *obj)
+{
+	struct sched_bvt_data *data = (struct sched_bvt_data *)obj->data;
+
+	/* Repeated events during one active window do not stack extra credit. */
+	if (data->warp_on) {
+		return;
+	}
+
+	if (bvt_can_warp(data, cpu_ticks())) {
+		data->warp_on = true;
+		data->warp_left = (data->warp_limit != 0U) ?
+			data->warp_limit : BVT_WARP_LIMIT_DEFAULT;
+		update_evt(data);
+		if (is_inqueue(obj)) {
+			/* The runqueue is sorted by EVT, so a changed EVT must be reinserted. */
+			runqueue_remove(obj);
+			runqueue_add(obj);
+		}
+	}
+}
+
+static void bvt_update_warp_after_charge(struct sched_bvt_data *data,
+	uint64_t charged_mcu, uint64_t now_tsc)
+{
+	if (!data->warp_on || (charged_mcu == 0U)) {
+		return;
+	}
+
+	/*
+	 * Warp duration is paid for by actual CPU execution, not wall time. A boosted
+	 * thread that does not run yet keeps its window until the scheduler selects it.
+	 */
+	if (charged_mcu >= data->warp_left) {
+		data->warp_on = false;
+		data->warp_left = 0U;
+		data->last_unwarp_tsc = now_tsc;
+	} else {
+		data->warp_left -= (uint32_t)charged_mcu;
+	}
 }
 
 /*
@@ -207,11 +290,18 @@ static void sched_bvt_init_data(struct thread_object *obj, struct sched_params *
 	data = (struct sched_bvt_data *)obj->data;
 	INIT_LIST_HEAD(&data->list);
 	data->mcu = BVT_MCU_MS * TICKS_PER_MS;
+	/*
+	 * weight controls long-term share. warp_* controls short-term wakeup/event
+	 * latency and must not alter AVT accounting, otherwise boosted guests would
+	 * receive extra long-term CPU share.
+	 */
 	data->weight = clamp(params->bvt_weight, BVT_WEIGHT_MIN, BVT_WEIGHT_MAX);
 	data->warp_value = params->bvt_warp_value;
 	data->warp_limit = params->bvt_warp_limit;
 	data->unwarp_period = params->bvt_unwarp_period;
 	data->warp_on = false;	/* warp disabled by default */
+	data->warp_left = 0U;
+	data->last_unwarp_tsc = 0UL;
 	data->vt_ratio = BVT_VT_RATIO_MAX / data->weight;
 	data->residual = 0U;
 }
@@ -253,6 +343,9 @@ static void sched_bvt_snapshot(const struct thread_object *obj,
 		delta_mcu = (uint64_t)(v_delta / data->mcu);
 		stats->avt += (int64_t)delta_mcu;
 		stats->evt = stats->avt;
+		if (data->warp_on) {
+			stats->evt -= (int64_t)data->warp_value;
+		}
 	}
 }
 
@@ -280,15 +373,15 @@ static void update_vt(struct thread_object *obj)
 
 	data = (struct sched_bvt_data *)obj->data;
 
-	/* update current thread's avt and evt */
+	/* Charge the current thread before comparing it with the runqueue again. */
 	if (now_tsc > data->start_tsc) {
 		v_delta = p2v(now_tsc - data->start_tsc, data->vt_ratio) + data->residual;
 		delta_mcu = (uint64_t)(v_delta / data->mcu);
 		data->residual = v_delta % data->mcu;
 	}
 	data->avt += delta_mcu;
-	/* TODO: evt = avt - (warp ? warpback : 0U) */
-	data->evt = data->avt;
+	bvt_update_warp_after_charge(data, delta_mcu, now_tsc);
+	update_evt(data);
 
 	if (is_inqueue(obj)) {
 		runqueue_remove(obj);
@@ -366,21 +459,33 @@ static void sched_bvt_wake(struct thread_object *obj)
 	threshold = svt - BVT_CSA_MCU;
 	/* adjusting AVT for a thread after a long sleep */
 	data->avt = (data->avt > threshold) ? data->avt : svt;
-	/* TODO: evt = avt - (warp ? warpback : 0U) */
-	data->evt = data->avt;
+	/*
+	 * Wakeup boost and explicit event boost use the same bounded warp primitive.
+	 * For a sleeping vCPU this reduces timer/IRQ wake latency without changing
+	 * long-term AVT fairness.
+	 */
+	bvt_start_warp(obj);
+	update_evt(data);
 	/* add to runqueue in order */
 	runqueue_add(obj);
 
 }
 
+static void sched_bvt_prioritize(struct thread_object *obj)
+{
+	/* Called from schedule() after a generic priority request is consumed. */
+	bvt_start_warp(obj);
+}
+
 struct acrn_scheduler sched_bvt = {
 	.name		= "sched_bvt",
-	.stat_desc	= "mcu:1ms csa:5 weight:1-128",
+	.stat_desc	= "mcu:1ms csa:5 weight:1-128 warp:on-event",
 	.init		= sched_bvt_init,
 	.init_data	= sched_bvt_init_data,
 	.pick_next	= sched_bvt_pick_next,
 	.sleep		= sched_bvt_sleep,
 	.wake		= sched_bvt_wake,
+	.prioritize	= sched_bvt_prioritize,
 	.deinit		= sched_bvt_deinit,
 	/* Now suspend is just to do del_timer and add_timer will be delayed to
 	 * shedule after resume.
