@@ -233,7 +233,8 @@ boot logs settle to show the `console:\>` prompt.
   - `vcpus`
   - `threads`
   - `schedstat`
-  - `vmap`
+  - `mmap`
+  - `xmem <addr, length>`
   - `irqstat`
   - `constat [vm id]`
   - `dumpstat [vm id]`
@@ -506,7 +507,7 @@ being treated as verified results:
 - Five repeated QEMU cold boots also covered the later `vcpu_exit_return`
   restore-frame issue where EL2 `sp` could drift to guest RAM and fault at
   `far:0x80000000`.
-- `vmap` shows VM0/VM1/VM2 stage-2 RAM identity mappings plus vGICD, vGICR,
+- `mmap` shows VM0/VM1/VM2 stage-2 RAM identity mappings plus vGICD, vGICR,
   and vPL011 vio windows.
 - Boot logs show each VM image copied to 1:1 RAM.
 - `irqstat` uses a narrow-screen-friendly format and shows the virtual timer
@@ -582,7 +583,7 @@ BEAU_TOOLCHAINS=${BEAU_TOOLCHAINS} \
 ./scripts/regress.py --no-build --timeout 240
 ```
 
-The smoke run should reach the BEAU shell, pass `vcpus`, `schedstat`, `vmap`,
+The smoke run should reach the BEAU shell, pass `vcpus`, `schedstat`, `mmap`,
 `irqstat`, `dumpstat 0`, enter and leave `vsh 0`, `vsh 1`, and `vsh 2`, and
 verify VM2 Linux root identity with `id` showing `gid=0`.
 
@@ -601,6 +602,20 @@ This stress run models the manual failure sequence: enter VM2 and press Enter
 repeatedly, switch to VM1 and press Enter, switch to VM0, then switch back to
 VM2 and run `id`. Passing means VM2 still reaches `uos ~`, `id` returns `gid=0`,
 no Linux RCU stall appears, and Ctrl-D still returns to `console:\>`.
+
+VM console switch and `help` command pressure regression:
+
+```bash
+BEAU_TOOLCHAINS=${BEAU_TOOLCHAINS} \
+./scripts/regress.py --no-build --timeout 300 \
+  --stress-vsh-help \
+  --stress-help-rounds 100 \
+  --no-terminal-replies
+```
+
+This stress run switches between VM0, VM1, and VM2 for each round, runs `help`
+inside the selected guest shell, waits for the guest prompt to return, and then
+uses Ctrl-D to return to the BEAU shell before switching to the next VM.
 
 If a regression fails, the harness tries to return to the BEAU shell and capture
 `vcpus`, `schedstat`, `irqstat`, `constat <vmid>`, and `dumpstat <vmid>` into

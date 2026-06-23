@@ -153,7 +153,7 @@ Useful BEAU shell commands:
 - `schedstat`: scheduler algorithm plus per-pCPU timer, switch, reschedule,
   runnable-thread, current-thread statistics, and BVT `weight`/`avt`/`evt`
   thread stats when BVT is active.
-- `vmap`: host stage-1 and VM stage-2 maps.
+- `mmap`: host stage-1 and VM stage-2 maps.
 - `dumpstat [vm id]`: ARM64 VM/vCPU register, scheduler state, raw guest stack,
   and saved host stack for the vCPU thread on its bound pCPU. Guest stack
   entries remain raw addresses because guest symbols are not embedded. Host

@@ -14,6 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 CWD = Path.cwd()
 PROMPT = "console:\\>"
 LINUX_PROMPT = "uos "
+HELP_STRESS_TARGETS = (
+    (0, "sos ~", "VM0 Zephyr", 30.0),
+    (1, "[κ] uos ~", "VM1 LK", 30.0),
+    (2, LINUX_PROMPT, "VM2 Linux", 60.0),
+)
 ENTER = "\r"
 CTRL_D = b"\x04"
 LINUX_IMAGE_STAGE_ADDR = "0x70000000"
@@ -28,6 +33,9 @@ FATAL_PATTERNS = (
     "rcu_preempt kthread timer wakeup didn't happen",
     "possible timer handling issue",
     "timer-softirq=0",
+    "assertion failed",
+    "stack check fails",
+    "fatal error",
 )
 FATAL_DRAIN_TIMEOUT = 1.0
 
@@ -86,7 +94,13 @@ def parse_args():
         action="store_true",
         help="Run the VM console switch/Enter pressure sequence after the standard smoke checks.",
     )
+    parser.add_argument(
+        "--stress-vsh-help",
+        action="store_true",
+        help="Repeatedly switch VM consoles and run help in each VM shell after the standard smoke checks.",
+    )
     parser.add_argument("--stress-rounds", type=int, default=4)
+    parser.add_argument("--stress-help-rounds", type=int, default=100)
     parser.add_argument("--stress-enters", type=int, default=80)
     parser.add_argument("--stress-enter-delay", type=float, default=0.0)
     parser.add_argument(
@@ -303,7 +317,7 @@ class QemuSession:
         try:
             self.send(CTRL_D)
             self.expect(PROMPT, f"return to BEAU shell for {label}", timeout=5.0, keepalive=ENTER)
-            for line in ("vcpus", "schedstat", "irqstat", f"constat {vmid}", f"dumpstat {vmid}"):
+            for line in ("vcpus", "schedstat", "vmstat", "irqstat", f"constat {vmid}", f"dumpstat {vmid}"):
                 self.send(line + ENTER)
                 self.expect(PROMPT, f"{line} diagnostics", timeout=15.0, keepalive=ENTER)
         except Exception as err:
@@ -356,6 +370,31 @@ def expect_vm2_id(qemu, name):
 		raise
 
 
+def run_guest_help(qemu, vmid, prompt, name, timeout):
+    print(f"[regress] stress: {name}: help", flush=True)
+    qemu.send("help" + ENTER)
+    try:
+        qemu.expect(prompt, f"{name}: help returns", timeout=timeout, keepalive=ENTER)
+    except Exception:
+        qemu.capture_vm_diagnostics(f"{name}: help", vmid)
+        raise
+
+
+def run_vsh_help_stress(qemu, args):
+    if args.stress_help_rounds < 1:
+        return
+
+    for idx in range(args.stress_help_rounds):
+        label = idx + 1
+        for vmid, prompt, guest_name, timeout in HELP_STRESS_TARGETS:
+            name = f"help stress round {label}: {guest_name}"
+            vsh_enter(qemu, vmid, prompt, f"{name} shell", timeout=timeout)
+            run_guest_help(qemu, vmid, prompt, name, timeout)
+            vsh_return(qemu, f"{name}: return to BEAU shell", vmid=vmid)
+
+    print("[pass] VM console help stress complete", flush=True)
+
+
 def run_vsh_switch_stress(qemu, args):
     if args.stress_rounds < 1:
         return
@@ -365,18 +404,18 @@ def run_vsh_switch_stress(qemu, args):
     expect_vm2_id(qemu, "VM2 Linux identity after initial Enter burst")
     vsh_return(qemu, "return from stress VM2 initial", vmid=2)
 
-    vsh_enter(qemu, 1, "beau ~>", "stress VM1 LK shell")
+    vsh_enter(qemu, 1, "[κ] uos ~", "stress VM1 LK shell")
     send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay, "VM1 LK", vmid=1)
     vsh_return(qemu, "return from stress VM1", vmid=1)
 
     for idx in range(args.stress_rounds):
         label = idx + 1
-        vsh_enter(qemu, 0, "zero ~>", f"stress round {label}: VM0 Zephyr shell")
+        vsh_enter(qemu, 0, "sos ~", f"stress round {label}: VM0 Zephyr shell")
         send_enter_burst(qemu, max(1, args.stress_enters // 4),
             args.stress_enter_delay, f"round {label} VM0", vmid=0)
         vsh_return(qemu, f"stress round {label}: return from VM0", vmid=0)
 
-        vsh_enter(qemu, 1, "beau ~>", f"stress round {label}: VM1 LK shell")
+        vsh_enter(qemu, 1, "[κ] uos ~", f"stress round {label}: VM1 LK shell")
         send_enter_burst(qemu, max(1, args.stress_enters // 4),
             args.stress_enter_delay, f"round {label} VM1", vmid=1)
         vsh_return(qemu, f"stress round {label}: return from VM1", vmid=1)
@@ -415,7 +454,28 @@ def run_qemu(args, cmd):
             "resched",
             "runqueue",
         ])
-        qemu.command("vmap", ["arm64 memory mappings", "vm-0 s2", "vm-1 s2", "vm-2 s2"])
+        qemu.command(
+            "vmstat",
+            [
+                "┌─  vmstat vm0:Zephyr",
+                "┌─  vmstat vm1:LK",
+                "┌─  vmstat vm2:Linux",
+                "vcpus:configured:4 created:4",
+                "│   affinity-config:",
+                "runtime:",
+                "sched-config:",
+                "guest-ram:",
+                "gic:gicd:",
+                "its:base:",
+                "timer:virt-ppi:27",
+                "console:uart:",
+                "├─  vcpu state",
+                "bvt:weight:",
+                "cpuif:used-lrs:",
+            ],
+            ["assertion failed", "stack check fails", "fatal error"],
+        )
+        qemu.command("mmap", ["arm64 memory mappings", "vm-0 s2", "vm-1 s2", "vm-2 s2"])
         qemu.command("irqstat", ["irqstat:"])
         qemu.command(
             "dumpstat 0",
@@ -443,12 +503,12 @@ def run_qemu(args, cmd):
         )
 
         qemu.send("vsh 0" + ENTER)
-        qemu.expect("zero ~>", "VM0 Zephyr shell", keepalive=ENTER)
+        qemu.expect("sos ~", "VM0 Zephyr shell", keepalive=ENTER)
         qemu.send(CTRL_D)
         qemu.expect(PROMPT, "return from VM0 shell")
 
         qemu.send("vsh 1" + ENTER)
-        qemu.expect("beau ~>", "VM1 LK shell", keepalive=ENTER)
+        qemu.expect("[κ] uos ~", "VM1 LK shell", keepalive=ENTER)
         qemu.send(CTRL_D)
         qemu.expect(PROMPT, "return from VM1 shell")
 
@@ -464,6 +524,8 @@ def run_qemu(args, cmd):
 
         if args.stress_vsh_switch:
             run_vsh_switch_stress(qemu, args)
+        if args.stress_vsh_help:
+            run_vsh_help_stress(qemu, args)
 
     print(f"[pass] regression complete; log: {args.log}", flush=True)
 
@@ -477,9 +539,11 @@ def main():
         if not args.no_build:
             print(render(build, args.toolchains))
         print(quote(qemu))
-        checks = "prompt, vcpus, schedstat, vmap, irqstat, vsh 0, ctrl-d, vsh 1, ctrl-d, vsh 2, Linux initramfs shell"
+        checks = "prompt, vcpus, schedstat, vmstat, mmap, irqstat, vsh 0, ctrl-d, vsh 1, ctrl-d, vsh 2, Linux initramfs shell"
         if args.stress_vsh_switch:
             checks += ", VM console switch/Enter stress"
+        if args.stress_vsh_help:
+            checks += f", VM console help stress x{args.stress_help_rounds}"
         print(f"checks: {checks}")
         return 0
 

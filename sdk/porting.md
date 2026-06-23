@@ -176,7 +176,7 @@ make ARCH=arm64 PLATFORM=qemu CROSS_COMPILE=aarch64-none-elf- -j$(nproc)
 QEMU validation should cover:
 
 - BEAU shell prompt.
-- `vcpus`, `schedstat`, `vmap`, `irqstat`, and `dumpstat`.
+- `vcpus`, `schedstat`, `mmap`, `irqstat`, and `dumpstat`.
 - `vsh 0` reaching the Zephyr shell.
 - `vsh 1` reaching the LK shell.
 - `vsh 2` reaching the Linux initramfs `uos` root shell and `id` reporting
