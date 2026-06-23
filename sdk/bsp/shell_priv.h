@@ -59,6 +59,10 @@ struct shell {
 #define SHELL_CMD_VERSION_PARAM		NULL
 #define SHELL_CMD_VERSION_HELP		"display the hv version information"
 
+#define SHELL_CMD_SYMTAB		"symtab"
+#define SHELL_CMD_SYMTAB_PARAM		NULL
+#define SHELL_CMD_SYMTAB_HELP		"list debug symbol offsets and names"
+
 #define SHELL_CMD_LOG_LVL		"log"
 #define SHELL_CMD_LOG_LVL_PARAM		"[<console_loglevel> [<mem_loglevel> [npk_loglevel]]]"
 #define SHELL_CMD_LOG_LVL_HELP		"loglevel {0-6}"

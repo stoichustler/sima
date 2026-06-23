@@ -198,6 +198,9 @@ boot logs settle to show the `console:\>` prompt.
   space, and ambiguous prefixes print matching command names before redrawing the
   prompt. Completion is intentionally limited to the first command token; command
   parameters remain command-specific and are not completed by the common shell.
+- BEAU shell `symtab` command lists the built-in debug symbol table as
+  `offset symbol` rows. `offset` is relative to `dbg_symbol_text_start`, which
+  keeps symbol dumps comparable when the final text load address changes.
 - PSCI-based host secondary CPU bring-up with `MAX_PCPU_NUM=8`.
 - VM0 and VM1 vCPUs share pCPU3 through the existing `sched_bvt` scheduler.
   Current QEMU BVT weights are VM0 Zephyr `128`, VM1 LK `16`, and VM2 Linux

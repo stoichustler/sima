@@ -19,6 +19,7 @@
 #include <ticks.h>
 #include <schedule.h>
 #include <irq.h>
+#include <debug/symbol.h>
 #include <bits.h>
 
 #define SHELL_PROMPT_STR	"console:\\> "
@@ -37,6 +38,7 @@ extern uint32_t arch_shell_cmds_sz;
 static void shell_print_registered_commands(void);
 static void shell_handle_tab_key(void);
 static int32_t shell_version(__unused int32_t argc, __unused char **argv);
+static int32_t shell_symtab(int32_t argc, __unused char **argv);
 static int32_t shell_loglevel(int32_t argc, char **argv);
 static int32_t shell_dump_host_mem(int32_t argc, char **argv);
 static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv);
@@ -52,6 +54,12 @@ static struct shell_cmd shell_cmds[] = {
 		.cmd_param	= SHELL_CMD_VERSION_PARAM,
 		.help_str	= SHELL_CMD_VERSION_HELP,
 		.fcn		= shell_version,
+	},
+	{
+		.str		= SHELL_CMD_SYMTAB,
+		.cmd_param	= SHELL_CMD_SYMTAB_PARAM,
+		.help_str	= SHELL_CMD_SYMTAB_HELP,
+		.fcn		= shell_symtab,
 	},
 	{
 		.str		= SHELL_CMD_LOG_LVL,
@@ -927,6 +935,44 @@ static int32_t shell_version(__unused int32_t argc, __unused char **argv)
 		(sizeof(HV_COMMIT_TAGS) > 1) ? ")" : "",
 		HV_BUILD_SCENARIO, HV_BUILD_BOARD, HV_BUILD_USER, HV_BUILD_TIME);
 	shell_puts(temp_str);
+
+	return 0;
+}
+
+static int32_t shell_symtab(int32_t argc, __unused char **argv)
+{
+	char temp_str[MAX_STR_SIZE];
+	uint32_t i;
+
+	if (argc != 1) {
+		return -EINVAL;
+	}
+
+	if (dbg_symbol_count == 0U) {
+		shell_puts("\r\nsymbol table is empty\r\n");
+		return 0;
+	}
+
+	shell_puts("\r\noffset              symbol\r\n");
+	shell_puts("──────────────────  ────────────────────────────────\r\n");
+	for (i = 0U; i < dbg_symbol_count; i++) {
+		const char *name = dbg_symbol_table[i].name;
+		uint64_t offset = dbg_symbol_table[i].addr;
+
+		/*
+		 * The generated table stores absolute text addresses. The shell
+		 * command presents offsets relative to dbg_symbol_text_start so
+		 * different load addresses can be compared directly.
+		 */
+		if ((dbg_symbol_text_start != 0UL) && (offset >= dbg_symbol_text_start)) {
+			offset -= dbg_symbol_text_start;
+		}
+
+		(void)snprintf(temp_str, MAX_STR_SIZE, "0x%016lx  ", offset);
+		shell_puts(temp_str);
+		shell_puts((name == NULL) ? "<null>" : name);
+		shell_puts("\r\n");
+	}
 
 	return 0;
 }
