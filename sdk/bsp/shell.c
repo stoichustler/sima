@@ -1069,8 +1069,8 @@ static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv)
 	uint16_t i;
 	uint16_t idx;
 
-	shell_puts("\r\nvmid  vcpu  pcpu  pcpu_mode  state     switches  lastwait.us  maxwait.us  since.us\r\n");
-	shell_puts("────  ────  ────  ─────────  ────────  ────────  ───────────  ──────────  ────────\r\n");
+	shell_puts("\r\nvcpu       pcpu  pcpu_mode  state     switches  lastwait.us  maxwait.us  since.us\r\n");
+	shell_puts("─────────  ────  ─────────  ────────  ────────  ───────────  ──────────  ────────\r\n");
 
 	for (idx = 0U; idx < CONFIG_MAX_VM_NUM; idx++) {
 		vm = get_vm_from_vmid(idx);
@@ -1092,11 +1092,10 @@ static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv)
 				snprintf(since_us, sizeof(since_us), "-");
 			}
 			snprintf(temp_str, MAX_STR_SIZE,
-				"%-5hu %-5hu %-5hu %-10s %-9s %-9lu %-12lu %-11lu %-8s\r\n",
-				vm->vm_id,
-				vcpu->vcpu_id,
+				"%-9s  %-4hu  %-9s  %-8s  %-8lu  %-11lu  %-10lu  %-8s\r\n",
+				vcpu->thread_obj.name,
 				pcpu_id,
-				shared_pcpu ? "shared" : "isolate",
+				shared_pcpu ? "shared" : "exclusive",
 				thread_state_str(vcpu->thread_obj.status),
 				stats.switches,
 				ticks_to_us(stats.last_wait_ticks),
@@ -1185,22 +1184,26 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 	uint16_t pcpu_id;
 	uint16_t pcpu_num = get_pcpu_nums();
 	bool has_bvt_stats = false;
-	const char *algorithm = (pcpu_num != 0U) ? sched_get_scheduler_name(0U) : "none";
-	const char *params = (pcpu_num != 0U) ? sched_get_scheduler_stat_desc(0U) : "";
+	bool has_rtds_stats = false;
 
 	snprintf(temp_str, MAX_STR_SIZE,
-		"\r\nschedstat algorithm:%s %s pcpus:%hu\r\n", algorithm, params, pcpu_num);
+		"\r\nschedstat pcpus:%hu\r\n", pcpu_num);
 	shell_puts(temp_str);
-	shell_puts("pcpu  timer  switches  resched  runqueue  thread\r\n");
-	shell_puts("────  ─────  ────────  ───────  ────────  ─────────────────\r\n");
+
+	shell_puts("\r\nPer-pCPU hybrid scheduler counters:\r\n\r\n");
+	shell_puts("pcpu  role       scheduler    timer   switches  resched  runqueue  current\r\n");
+	shell_puts("────  ─────────  ───────────  ──────  ────────  ───────  ────────  ─────────────────\r\n");
 
 	for (pcpu_id = 0U; pcpu_id < pcpu_num; pcpu_id++) {
 		struct thread_object *current = sched_get_current(pcpu_id);
 		const char *name = (current != NULL) ? current->name : "-";
+		bool shared_pcpu = pcpu_is_shared_by_vcpus(pcpu_id);
 
 		snprintf(temp_str, MAX_STR_SIZE,
-			"%-5hu %-6lu %-9lu %-8lu %-9u %s\r\n",
+			"%-5hu %-10s %-12s %-7lu %-9lu %-8lu %-9u %s\r\n",
 			pcpu_id,
+			shared_pcpu ? "shared" : "exclusive",
+			sched_get_scheduler_name(pcpu_id),
 			sched_get_ticks(pcpu_id),
 			sched_get_context_switches(pcpu_id),
 			sched_get_reschedule_requests(pcpu_id),
@@ -1212,9 +1215,15 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 	list_for_each(pos, head) {
 		struct thread_object *thread = container_of(pos, struct thread_object, node);
 		struct sched_bvt_stats bvt;
+		struct sched_rtds_stats rtds;
 
 		if (sched_get_bvt_stats(thread, &bvt)) {
 			has_bvt_stats = true;
+		}
+		if (sched_get_rtds_stats(thread, &rtds)) {
+			has_rtds_stats = true;
+		}
+		if (has_bvt_stats && has_rtds_stats) {
 			break;
 		}
 	}
@@ -1237,6 +1246,33 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 					(uint32_t)bvt.weight,
 					bvt.avt,
 					bvt.evt);
+				shell_puts(temp_str);
+			}
+		}
+	}
+
+	if (has_rtds_stats) {
+		uint64_t now = cpu_ticks();
+
+		shell_puts("\r\nRTDS stats:\r\n\r\n");
+		shell_puts("name             pcpu  state     period.us  budget.us  remain.us  deadline-in.us\r\n");
+		shell_puts("───────────────  ────  ────────  ─────────  ─────────  ─────────  ──────────────\r\n");
+
+		list_for_each(pos, head) {
+			struct thread_object *thread = container_of(pos, struct thread_object, node);
+			struct sched_rtds_stats rtds;
+
+			if (sched_get_rtds_stats(thread, &rtds)) {
+				snprintf(temp_str, MAX_STR_SIZE,
+					"%-15s  %-4hu  %-8s  %-9lu  %-9lu  %-9lu  %-11lu\r\n",
+					thread->name,
+					thread->pcpu_id,
+					thread_state_str(thread->status),
+					ticks_to_us(rtds.period_ticks),
+					ticks_to_us(rtds.budget_ticks),
+					ticks_to_us(rtds.remaining_ticks),
+					(rtds.deadline_ticks > now) ?
+						ticks_to_us(rtds.deadline_ticks - now) : 0UL);
 				shell_puts(temp_str);
 			}
 		}

@@ -59,6 +59,14 @@ struct sched_bvt_stats {
 	int64_t evt;
 };
 
+struct sched_rtds_stats {
+	uint64_t period_ticks;
+	uint64_t budget_ticks;
+	uint64_t remaining_ticks;
+	uint64_t deadline_ticks;
+	uint64_t last_start_ticks;
+};
+
 struct thread_object;
 typedef void (*thread_entry_t)(struct thread_object *obj);
 typedef void (*switch_t)(struct thread_object *obj);
@@ -105,7 +113,7 @@ struct sched_control {
 	uint64_t reschedule_requests;
 };
 
-#define SCHEDULER_MAX_NUMBER 4U
+#define SCHEDULER_MAX_NUMBER 5U
 struct acrn_scheduler {
 	char name[16];
 	char stat_desc[64];
@@ -153,6 +161,13 @@ struct sched_bvt_control {
 	int64_t svt;
 };
 
+extern struct acrn_scheduler sched_rtds;
+struct sched_rtds_control {
+	struct list_head ready_queue;
+	struct list_head depleted_queue;
+	struct hv_timer tick_timer;
+};
+
 extern struct acrn_scheduler sched_prio;
 struct sched_prio_control {
 	struct list_head prio_queue;
@@ -171,6 +186,7 @@ uint64_t sched_get_reschedule_requests(uint16_t pcpu_id);
 void sched_account_tick(struct sched_control *ctl);
 void sched_get_latency(const struct thread_object *obj, struct sched_latency_stats *stats);
 bool sched_get_bvt_stats(const struct thread_object *obj, struct sched_bvt_stats *stats);
+bool sched_get_rtds_stats(const struct thread_object *obj, struct sched_rtds_stats *stats);
 
 void init_sched(uint16_t pcpu_id);
 void deinit_sched(uint16_t pcpu_id);

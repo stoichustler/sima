@@ -18,6 +18,7 @@
 #include <vcpu.h>
 #include <host_pm.h>
 #include <schedule.h>
+#include <ticks.h>
 #include <console.h>
 #include <vuart.h>
 #include <debug/symbol.h>
@@ -1401,11 +1402,14 @@ static void shell_vmstat_vcpus(const struct acrn_vm *vm)
 	for (vcpu_id = 0U; vcpu_id < vm->hw.created_vcpus; vcpu_id++) {
 		struct acrn_vcpu *vcpu = vcpu_from_vid((struct acrn_vm *)vm, vcpu_id);
 		struct sched_bvt_stats bvt = { 0U };
+		struct sched_rtds_stats rtds = { 0U };
 		struct thread_object *current;
 		bool has_bvt;
+		bool has_rtds;
 
 		current = sched_get_current(vcpu->thread_obj.pcpu_id);
 		has_bvt = sched_get_bvt_stats(&vcpu->thread_obj, &bvt);
+		has_rtds = sched_get_rtds_stats(&vcpu->thread_obj, &rtds);
 		shell_item_line("%-4hu  %-4hu  %-7s  %-8s  %-3s  0x%016lx",
 			vcpu->vcpu_id, vcpu->thread_obj.pcpu_id,
 			shell_vcpu_state_to_str(vcpu->state),
@@ -1414,6 +1418,15 @@ static void shell_vmstat_vcpus(const struct acrn_vm *vm)
 			vcpu->pending_req);
 		shell_item_line("      bvt:weight:%u avt:%ld evt:%ld", has_bvt ? bvt.weight : 0U,
 			has_bvt ? bvt.avt : 0L, has_bvt ? bvt.evt : 0L);
+		if (has_rtds) {
+			uint64_t now = cpu_ticks();
+
+			shell_item_line("      rtds:period-us:%lu budget-us:%lu remain-us:%lu deadline-in-us:%lu",
+				ticks_to_us(rtds.period_ticks), ticks_to_us(rtds.budget_ticks),
+				ticks_to_us(rtds.remaining_ticks),
+				(rtds.deadline_ticks > now) ?
+					ticks_to_us(rtds.deadline_ticks - now) : 0UL);
+		}
 		shell_item_line("      timer:virq:%u cntv_ctl:0x%08x cntv_cval:0x%016lx rescue:stuck:%s wfi:%s lr:%s",
 			vcpu->arch.gctx.timer_virq, vcpu->arch.gctx.cntv_ctl_el0,
 			vcpu->arch.gctx.cntv_cval_el0,

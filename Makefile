@@ -55,6 +55,7 @@ CONFIG_GUEST_KERNEL_RAWIMAGE := y
 CONFIG_GUEST_KERNEL_BZIMAGE := n
 CONFIG_GUEST_KERNEL_ELF := n
 CONFIG_SCHED_BVT := y
+CONFIG_SCHED_RTDS := y
 HV_CONFIG_DIR := $(HV_OBJDIR)/configs
 HV_CONFIG_H := arch/arm64/platform/$(PLATFORM)/platform_$(PLATFORM).h
 ifeq ($(PLATFORM),qemu)
@@ -211,6 +212,9 @@ COMMON_C_SRCS += core/sched_noop.c
 endif
 ifeq ($(CONFIG_SCHED_BVT),y)
 COMMON_C_SRCS += core/sched_bvt.c
+endif
+ifeq ($(CONFIG_SCHED_RTDS),y)
+COMMON_C_SRCS += core/sched_rtds.c
 endif
 ifeq ($(CONFIG_SCHED_IORR),y)
 COMMON_C_SRCS += core/sched_iorr.c

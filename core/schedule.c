@@ -15,6 +15,8 @@
 #include <irq.h>
 #include <trace.h>
 #include <ticks.h>
+#include <vm_config.h>
+#include <logmsg.h>
 #include <asm/guest/vm_reset.h>
 
 static struct list_head thread_list;
@@ -64,6 +66,81 @@ static inline bool is_runnable_or_running(const struct thread_object *obj)
 static inline void set_thread_status(struct thread_object *obj, enum thread_object_state status)
 {
 	obj->status = status;
+}
+
+/*
+ * Hybrid scheduler ownership model:
+ *
+ * BEAU keeps one scheduler instance per physical CPU. A thread never carries a
+ * scheduler choice of its own; its scheduler is derived from thread->pcpu_id
+ * and the selected per-pCPU sched_control. This keeps context-switch, wake, and
+ * timer ownership local to one partitioned runqueue.
+ *
+ * For the ARM64 mixed-criticality scenario, static VM affinity is the policy
+ * input:
+ * - pCPUs assigned to more than one configured VM are shared cores and use
+ *   RTDS, so each runnable vCPU is represented as a periodic budget server.
+ * - pCPUs assigned to one configured VM are exclusive cores and use BVT, keeping
+ *   the lower-overhead fair-share scheduler for helper threads and private vCPU
+ *   execution.
+ *
+ * This function intentionally uses configured affinity rather than runtime VM
+ * state. The scheduler must be selected during pCPU initialization, before all
+ * VM threads necessarily exist, and must remain stable for every thread whose
+ * private scheduler data was initialized against that pCPU.
+ */
+static bool sched_pcpu_is_shared(uint16_t pcpu_id)
+{
+	const struct acrn_vm_config *vm_config;
+	uint16_t vm_id;
+	uint32_t users = 0U;
+
+	for (vm_id = 0U; vm_id < CONFIG_MAX_VM_NUM; vm_id++) {
+		vm_config = get_vm_config(vm_id);
+		if ((vm_config->cpu_affinity & (1UL << pcpu_id)) == 0UL) {
+			continue;
+		}
+
+		users++;
+		if (users > 1U) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static struct acrn_scheduler *select_pcpu_scheduler(uint16_t pcpu_id)
+{
+	struct acrn_scheduler *scheduler = NULL;
+
+#if defined(CONFIG_SCHED_BVT) && defined(CONFIG_SCHED_RTDS)
+	/*
+	 * The hybrid policy is deliberately resolved once per pCPU, not per VM or
+	 * per vCPU. BVT and RTDS store different private data in thread_object->data,
+	 * so changing a pCPU's scheduler after threads have been initialized would
+	 * reinterpret that data with the wrong layout.
+	 */
+	scheduler = sched_pcpu_is_shared(pcpu_id) ? &sched_rtds : &sched_bvt;
+#else
+#ifdef CONFIG_SCHED_NOOP
+	scheduler = &sched_noop;
+#endif
+#ifdef CONFIG_SCHED_IORR
+	scheduler = &sched_iorr;
+#endif
+#ifdef CONFIG_SCHED_BVT
+	scheduler = &sched_bvt;
+#endif
+#ifdef CONFIG_SCHED_RTDS
+	scheduler = &sched_rtds;
+#endif
+#ifdef CONFIG_SCHED_PRIO
+	scheduler = &sched_prio;
+#endif
+#endif
+
+	return scheduler;
 }
 
 static void sched_mark_runnable(struct thread_object *obj, uint64_t now)
@@ -147,18 +224,13 @@ void init_sched(uint16_t pcpu_id)
 	ctl->scheduler_ticks = 0UL;
 	ctl->context_switches = 0UL;
 	ctl->reschedule_requests = 0UL;
-#ifdef CONFIG_SCHED_NOOP
-	ctl->scheduler = &sched_noop;
-#endif
-#ifdef CONFIG_SCHED_IORR
-	ctl->scheduler = &sched_iorr;
-#endif
-#ifdef CONFIG_SCHED_BVT
-	ctl->scheduler = &sched_bvt;
-#endif
-#ifdef CONFIG_SCHED_PRIO
-	ctl->scheduler = &sched_prio;
-#endif
+	/*
+	 * Scheduler selection happens before idle/vCPU/helper threads are attached
+	 * to this pCPU. The chosen scheduler owns ctl->priv and the interpretation
+	 * of every future thread_object->data bound to this pCPU.
+	 */
+	ctl->scheduler = select_pcpu_scheduler(pcpu_id);
+	ASSERT(ctl->scheduler != NULL, "no scheduler configured!");
 	if (ctl->scheduler->init != NULL) {
 		ctl->scheduler->init(ctl);
 	}
@@ -199,6 +271,13 @@ void init_thread_data(struct thread_object *obj, struct sched_params *params)
 	INIT_LIST_HEAD(&obj->node);
 	(void)memset(&obj->latency, 0U, sizeof(obj->latency));
 	obtain_schedule_lock(obj->pcpu_id, &rflag);
+	/*
+	 * Thread private scheduler data is initialized by the scheduler selected
+	 * for the target pCPU. In the hybrid mode this means a vCPU on a shared core
+	 * receives RTDS state, while the same VM's vCPU on an exclusive core may
+	 * receive BVT state. Moving a thread across pCPUs would require rebuilding
+	 * this private data, so the current framework remains partitioned.
+	 */
 	if (scheduler->init_data != NULL) {
 		scheduler->init_data(obj, params);
 	}
@@ -282,6 +361,12 @@ void sched_get_latency(const struct thread_object *obj, struct sched_latency_sta
 
 __attribute__((weak)) bool sched_get_bvt_stats(__unused const struct thread_object *obj,
 	__unused struct sched_bvt_stats *stats)
+{
+	return false;
+}
+
+__attribute__((weak)) bool sched_get_rtds_stats(__unused const struct thread_object *obj,
+	__unused struct sched_rtds_stats *stats)
 {
 	return false;
 }
