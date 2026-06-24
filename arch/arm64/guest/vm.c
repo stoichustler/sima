@@ -39,19 +39,24 @@ DEFINE_PAGE_TABLE(stage2_pages_bitmap);
 static uint8_t stage2_zero_page[PAGE_SIZE] __aligned(PAGE_SIZE);
 static bool stage2_page_pool_initialized;
 
+#ifdef CONFIG_LOG_VERBOSE
 static void log_stage2_map(const struct acrn_vm *vm, const char *name,
 	uint64_t ipa, uint64_t pa, uint64_t size)
 {
-	pr_info("vm-%u stage-2 map %-7s ipa[0x%08lx-0x%08lx]:pa[0x%08lx-0x%08lx]",
+	pr_info("vm-%u stage-2 map (%6s) gpa[0x%08lx-0x%08lx]:hpa[0x%08lx-0x%08lx]",
 		vm->vm_id, name, ipa, ipa + size, pa, pa + size);
 }
 
 static void log_stage2_vio(const struct acrn_vm *vm, const char *name,
 	uint64_t ipa, uint64_t size)
 {
-	pr_info("vm-%u stage-2 vio %-7s ipa[0x%08lx-0x%08lx]",
+	pr_info("vm-%u stage-2 vio (%6s) gpa[0x%08lx-0x%08lx]",
 		vm->vm_id, name, ipa, ipa + size);
 }
+#else
+#define log_stage2_map(vm, name, ipa, pa, size)
+#define log_stage2_vio(vm, name, ipa, size)
+#endif /* CONFIG_LOG_VERBOSE */
 
 static bool stage2_large_page_support(enum _page_table_level level, __unused uint64_t prot)
 {

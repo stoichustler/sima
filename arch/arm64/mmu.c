@@ -35,17 +35,22 @@ static int nr_rsvd_regions;
  * This file owns only the EL2 stage-1 map. Guest memory isolation is built in
  * arch/arm64/guest/vm.c so the two regimes stay independently auditable.
  */
+#ifdef CONFIG_LOG_VERBOSE
 static void log_host_map(const char *name, uint64_t vaddr, uint64_t paddr, uint64_t size)
 {
-	pr_info("host stage-1 map %-7s va [0x%08lx-0x%08lx]:pa[0x%08lx-0x%08lx]",
+	pr_info("host stage-1 map (%6s) hva[0x%08lx-0x%08lx]:hpa[0x%08lx-0x%08lx]",
 		name, vaddr, vaddr + size, paddr, paddr + size);
 }
 
 static void log_host_unmap(const char *name, uint64_t vaddr, uint64_t size)
 {
-	pr_info("host stage-1 unmap %-8s va[0x%08lx-0x%08lx]",
+	pr_info("host stage-1 unmap (%6s) hva[0x%08lx-0x%08lx]",
 		name, vaddr, vaddr + size);
 }
+#else
+#define log_host_map(name, vaddr, paddr, size)
+#define log_host_unmap(name, vaddr, size)
+#endif /* CONFIG_LOG_VERBOSE */
 
 void init_phys_mem_range(void)
 {
@@ -199,7 +204,7 @@ static void init_hv_mapping(void)
 	init_ttbr0_el2 = (uint64_t)ppt_mmu_top_addr;
 	enable_paging();
 	if (arm64_mmu_is_enabled()) {
-		pr_info("mmu enabled: ttbr0_el2:0x%016lx", init_ttbr0_el2);
+		pr_info("MMU enabled: ttbr0_el2: 0x%016lx", init_ttbr0_el2);
 	}
 }
 

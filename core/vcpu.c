@@ -174,7 +174,7 @@ int32_t create_vcpu(struct acrn_vm *vm, uint16_t pcpu_id)
 
 		pr_info("create vm%d:vcpu%d, role: %s",
 				vcpu->vm->vm_id, vcpu->vcpu_id,
-				is_vcpu_bsp(vcpu) ? "primary" : "secondary");
+				is_vcpu_bsp(vcpu) ? "  primary" : "secondary");
 
 		cpu_compiler_barrier();
 
@@ -246,8 +246,6 @@ void launch_vcpu(struct acrn_vcpu *vcpu)
 void reset_vcpu(struct acrn_vcpu *vcpu)
 {
 	int i;
-
-	pr_dbg("vcpu%hu reset", vcpu->vcpu_id);
 
 	vcpu->launched = false;
 	vcpu->pending_req = 0UL;

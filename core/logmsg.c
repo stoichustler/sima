@@ -59,7 +59,7 @@ void do_logmsg(uint32_t severity, const char *fmt, ...)
 	/* Scale time-stamp appropriately */
 	timestamp = ticks_to_us(timestamp);
 	sec = timestamp / 1000000UL;
-	frac = (timestamp % 1000000UL) / 100UL;
+	frac = (timestamp % 1000000UL) / 1000UL;
 
 	/* Get CPU ID */
 	pcpu_id = get_pcpu_id();
@@ -67,7 +67,7 @@ void do_logmsg(uint32_t severity, const char *fmt, ...)
 
 	(void)memset(buffer, 0U, LOG_MESSAGE_MAX_SIZE);
 	/* Put time-stamp, CPU ID and severity into buffer */
-	snprintf(buffer, LOG_MESSAGE_MAX_SIZE, "[%05lu.%04lu][cpu%hu][sev%2u][seq%3u] ",
+	snprintf(buffer, LOG_MESSAGE_MAX_SIZE, "[κ][%05lu.%03lu][cpu%hu][sev%u][seq%4u] ",
 			sec, frac, pcpu_id, severity, atomic_inc_return(&log_seq));
 
 	/* Put message into remaining portion of local buffer */

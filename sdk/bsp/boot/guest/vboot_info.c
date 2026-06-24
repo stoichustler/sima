@@ -47,7 +47,7 @@ static void init_vm_ramdisk_info(struct acrn_vm *vm, const struct abi_module *mo
 		vm->sw.ramdisk_info.size = mod->size;
 	}
 
-	dev_dbg(DBG_LEVEL_BOOT, "vm-%hu ramdisk at 0x%08x (0x%08x)", vm->vm_id,
+	dev_dbg(DBG_LEVEL_BOOT, "vm-%hu Ramdisk at 0x%08x (0x%08x)", vm->vm_id,
 		(uint64_t)mod->start, mod->size);
 }
 
@@ -79,7 +79,7 @@ static int32_t init_vm_kernel_info(struct acrn_vm *vm, const struct abi_module *
 	int32_t ret = -EINVAL;
 	struct acrn_vm_config *vm_config = get_vm_config(vm->vm_id);
 
-	dev_dbg(DBG_LEVEL_BOOT, "vm-%hu kernel  at 0x%08x (0x%08x)", vm->vm_id,
+	dev_dbg(DBG_LEVEL_BOOT, "vm-%hu Kernel  at 0x%08x (0x%08x)", vm->vm_id,
 			(uint64_t)mod->start, mod->size);
 
 	vm->sw.kernel_type = vm_config->os_config.kernel_type;
@@ -268,7 +268,7 @@ static int32_t init_vm_sw_load(struct acrn_vm *vm, const struct acrn_boot_info *
 				pr_err("failed to load acpi module or fdt for vm%d", vm->vm_id);
 			}
 		} else if ((vm_config->guest_flags & GUEST_FLAG_NO_FW) != 0UL) {
-			dev_dbg(DBG_LEVEL_BOOT, "vm-%d boots without acpi/fdt", vm->vm_id);
+			dev_dbg(DBG_LEVEL_BOOT, "vm-%d boots without ACPI/FDT", vm->vm_id);
 		}
 
 	} else {
