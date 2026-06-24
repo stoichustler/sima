@@ -14,9 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 CWD = Path.cwd()
 PROMPT = "console:\\>"
 LINUX_PROMPT = "uos "
+LK_PROMPT = "uos ~"
 HELP_STRESS_TARGETS = (
     (0, "sos ~", "VM0 Zephyr", 30.0),
-    (1, "[κ] uos ~", "VM1 LK", 30.0),
+    (1, LK_PROMPT, "VM1 LK", 30.0),
     (2, LINUX_PROMPT, "VM2 Linux", 60.0),
 )
 ENTER = "\r"
@@ -411,7 +412,7 @@ def run_vsh_switch_stress(qemu, args):
     expect_vm2_id(qemu, "VM2 Linux identity after initial Enter burst")
     vsh_return(qemu, "return from stress VM2 initial", vmid=2)
 
-    vsh_enter(qemu, 1, "[κ] uos ~", "stress VM1 LK shell")
+    vsh_enter(qemu, 1, LK_PROMPT, "stress VM1 LK shell")
     send_enter_burst(qemu, args.stress_enters, args.stress_enter_delay, "VM1 LK", vmid=1)
     vsh_return(qemu, "return from stress VM1", vmid=1)
 
@@ -422,7 +423,7 @@ def run_vsh_switch_stress(qemu, args):
             args.stress_enter_delay, f"round {label} VM0", vmid=0)
         vsh_return(qemu, f"stress round {label}: return from VM0", vmid=0)
 
-        vsh_enter(qemu, 1, "[κ] uos ~", f"stress round {label}: VM1 LK shell")
+        vsh_enter(qemu, 1, LK_PROMPT, f"stress round {label}: VM1 LK shell")
         send_enter_burst(qemu, max(1, args.stress_enters // 4),
             args.stress_enter_delay, f"round {label} VM1", vmid=1)
         vsh_return(qemu, f"stress round {label}: return from VM1", vmid=1)
@@ -451,15 +452,33 @@ def run_qemu(args, cmd):
     with QemuSession(cmd, args.log, args.timeout) as qemu:
         qemu.disable_terminal_replies = args.no_terminal_replies
         qemu.expect(PROMPT, "BEAU shell prompt", keepalive=ENTER)
-        qemu.command("vcpus", ["vmid", "vcpu", "pcpu_mode", "isolate", "shared", "switches", "since.us"])
+        qemu.command("vcpus", [
+            "vcpu",
+            "pcpu_mode",
+            "exclusive",
+            "shared",
+            "switches",
+            "since.us",
+            "vm0:vcpu0",
+            "vm2:vcpu2",
+        ])
         qemu.command("schedstat", [
-            "schedstat algorithm:sched_bvt",
-            "mcu:1ms",
+            "schedstat pcpus:",
+            "Per-pCPU hybrid scheduler counters:",
             "pcpu",
+            "role",
+            "scheduler",
+            "exclusive",
+            "shared",
+            "sched_bvt",
+            "sched_rtds",
             "timer",
             "switches",
             "resched",
             "runqueue",
+            "current",
+            "BVT stats:",
+            "RTDS stats:",
         ])
         qemu.command(
             "vmstat",
@@ -477,7 +496,10 @@ def run_qemu(args, cmd):
                 "timer:virt-ppi:27",
                 "console:uart:",
                 "├─  vcpu state",
+                "sched",
+                "diag",
                 "bvt:weight:",
+                "rtds:period-us:",
                 "cpuif:used-lrs:",
             ],
             ["assertion failed", "stack check fails", "fatal error"],
@@ -490,16 +512,19 @@ def run_qemu(args, cmd):
                 "┌─  dumpstat vm0",
                 "┌─  vm0/vcpu0",
                 "sched:",
-                "├─  guest regs",
+                "├─  vcpu stats",
+                "guest regs:",
                 "elr:0x",
                 "spsr:0x",
                 "x00:0x",
-                "├─  recent events",
-                "exit:",
-                "irq:",
-                "timer:",
-                "├─  guest stack symbols:none",
-                "├─  host stack symbols:beau",
+                "system regs:",
+                "last-exit:",
+                "├─  vgic/vtimer",
+                "basic:",
+                "diagnosis:",
+                "trace:",
+                "vm stack:",
+                "pcpu stack:",
                 "│   pcpu:",
                 "from vcpu",
                 "+0x",
@@ -515,7 +540,7 @@ def run_qemu(args, cmd):
         qemu.expect(PROMPT, "return from VM0 shell")
 
         qemu.send("vsh 1" + ENTER)
-        qemu.expect("[κ] uos ~", "VM1 LK shell", keepalive=ENTER)
+        qemu.expect(LK_PROMPT, "VM1 LK shell", keepalive=ENTER)
         qemu.send(CTRL_D)
         qemu.expect(PROMPT, "return from VM1 shell")
 

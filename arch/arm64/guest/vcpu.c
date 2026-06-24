@@ -97,9 +97,16 @@ void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
 	const struct arm64_vgicv3_vcpu_ctx *vgic_ctx;
 	const struct arm64_vgic_irq *desc = NULL;
 	uint32_t idx;
+	uint32_t trace_ctl;
+	uint64_t key;
 	uint64_t now;
+	bool active;
 	bool current;
+	bool expired;
+	bool masked;
+	bool pending;
 	bool physical_timer;
+	bool level;
 
 	if ((vcpu == NULL) || (vcpu->vm == NULL)) {
 		return;
@@ -127,6 +134,28 @@ void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
 	if ((vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS) && (virq < ARM64_VGIC_IRQ_NUM)) {
 		desc = &vcpu->vm->arch_vm.vgic.irq[vcpu->vcpu_id][virq];
 	}
+	trace_ctl = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
+	expired = (((trace_ctl & CNTV_CTL_ENABLE) != 0U) &&
+		((int64_t)(cval - now) <= 0L));
+	masked = gctx->cntv_el2_masked;
+	pending = (desc != NULL) ? desc->pending : false;
+	active = (desc != NULL) ? desc->active : false;
+	level = (desc != NULL) ? desc->level : false;
+	key = ((uint64_t)(uint8_t)event << 56) |
+		((uint64_t)virq << 32) |
+		((uint64_t)trace_ctl << 16) |
+		((uint64_t)vgic_ctx->used_lrs << 9) |
+		(expired ? (1UL << 8) : 0UL) |
+		(masked ? (1UL << 7) : 0UL) |
+		(pending ? (1UL << 6) : 0UL) |
+		(active ? (1UL << 5) : 0UL) |
+		(level ? (1UL << 4) : 0UL) |
+		(write ? (1UL << 3) : 0UL) |
+		(injected ? (1UL << 2) : 0UL);
+	if (key == trace->last_key) {
+		return;
+	}
+	trace->last_key = key;
 
 	idx = trace->head;
 	if (idx >= ARM64_VCPU_VTIMER_TRACE_NUM) {
@@ -136,7 +165,7 @@ void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
 	entry->tsc = cpu_ticks();
 	entry->cntvct = now;
 	entry->cval = cval;
-	entry->ctl = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
+	entry->ctl = trace_ctl;
 	entry->virq = virq;
 	entry->pcpu_id = get_pcpu_id();
 	entry->event = (uint8_t)event;
@@ -145,12 +174,11 @@ void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
 	entry->misr = current ? read_ich_misr_el2() : 0UL;
 	entry->lr0 = current ? read_ich_lr_el2(0U) :
 		((vgic_ctx->used_lrs > 0U) ? vgic_ctx->lr[0U] : 0UL);
-	entry->expired = (((entry->ctl & CNTV_CTL_ENABLE) != 0U) &&
-		((int64_t)(cval - now) <= 0L));
-	entry->masked = gctx->cntv_el2_masked;
-	entry->pending = (desc != NULL) ? desc->pending : false;
-	entry->active = (desc != NULL) ? desc->active : false;
-	entry->level = (desc != NULL) ? desc->level : false;
+	entry->expired = expired;
+	entry->masked = masked;
+	entry->pending = pending;
+	entry->active = active;
+	entry->level = level;
 	entry->write = write;
 	entry->injected = injected;
 
@@ -161,6 +189,29 @@ void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
 	trace->head = idx;
 	if (trace->count < ARM64_VCPU_VTIMER_TRACE_NUM) {
 		trace->count++;
+	}
+}
+
+void arm64_vtimer_diag_mark_pre_eret(struct acrn_vcpu *vcpu,
+	bool flushed, bool lr_rescue, bool masked_expired)
+{
+	struct arm64_vcpu_vtimer_diag *diag;
+
+	if (vcpu == NULL) {
+		return;
+	}
+
+	diag = &vcpu->arch.debug.vtimer_diag;
+	if (flushed) {
+		diag->pre_eret_flush++;
+		if (lr_rescue) {
+			diag->pre_eret_flush_lr_rescue++;
+		}
+		if (masked_expired) {
+			diag->pre_eret_flush_masked_expired++;
+		}
+	} else {
+		diag->pre_eret_flush_skip++;
 	}
 }
 

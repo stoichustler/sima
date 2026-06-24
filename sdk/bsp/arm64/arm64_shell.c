@@ -35,7 +35,7 @@
 #define SHELL_CMD_MEM_MAP_HELP		"list arm64 host stage-1 and vm stage-2 memory mappings"
 #define SHELL_CMD_DUMPSTAT		"dumpstat"
 #define SHELL_CMD_DUMPSTAT_PARAM	"[vm id]"
-#define SHELL_CMD_DUMPSTAT_HELP		"dump arm64 vm registers, raw guest stack, and host stack"
+#define SHELL_CMD_DUMPSTAT_HELP		"dump arm64 vcpu stats and vgic/vtimer diagnostics"
 #define SHELL_CMD_CONSTAT		"constat"
 #define SHELL_CMD_CONSTAT_PARAM		"[vm id]"
 #define SHELL_CMD_CONSTAT_HELP		"dump vm console and vpl011 state"
@@ -50,13 +50,7 @@
 #define DUMPSTAT_REG_KEY_FMT		"%5s:0x%016lx"
 #define DUMPSTAT_REGS_PER_LINE_MAX	4U
 #define DUMPSTAT_VTIMER_VIRQ		ARM64_GIC_PPI_VIRTUAL_TIMER
-#define DUMPSTAT_LOCAL_IRQ_NUM		ARM64_VGIC_LOCAL_IRQ_NUM
-#define DUMPSTAT_CPUIF_ICC_PMR_EL1	0U
-#define DUMPSTAT_CPUIF_ICC_CTLR_EL1	1U
-#define DUMPSTAT_CPUIF_ICC_SRE_EL1	2U
-#define DUMPSTAT_CPUIF_ICC_IGRPEN1_EL1	3U
-#define DUMPSTAT_CPUIF_ICC_DIR_EL1	4U
-#define DUMPSTAT_CPUIF_ICC_RPR_EL1	5U
+#define VMSTAT_CPU_WAIT_WARN_US		20000UL
 
 static int32_t shell_list_mem(__unused int32_t argc, __unused char **argv);
 static int32_t shell_dumpstat(int32_t argc, char **argv);
@@ -280,44 +274,6 @@ static const char *shell_yes_no(bool value)
 	return value ? "Y" : "N";
 }
 
-static const char *shell_exit_source_to_str(uint32_t source)
-{
-	const char *str;
-
-	switch (source) {
-	case ARM64_VCPU_DEBUG_EXIT_SYNC:
-		str = "sync";
-		break;
-	case ARM64_VCPU_DEBUG_EXIT_IRQ:
-		str = "irq";
-		break;
-	default:
-		str = "none";
-		break;
-	}
-
-	return str;
-}
-
-static const char *shell_abort_type_to_str(uint32_t abort_type)
-{
-	const char *str;
-
-	switch (abort_type) {
-	case ARM64_VCPU_DEBUG_ABORT_INSTRUCTION:
-		str = "instruction";
-		break;
-	case ARM64_VCPU_DEBUG_ABORT_DATA:
-		str = "data";
-		break;
-	default:
-		str = "none";
-		break;
-	}
-
-	return str;
-}
-
 static const char *shell_vgic_source_to_str(uint32_t source)
 {
 	const char *str;
@@ -331,37 +287,6 @@ static const char *shell_vgic_source_to_str(uint32_t source)
 		break;
 	default:
 		str = "none";
-		break;
-	}
-
-	return str;
-}
-
-static const char *shell_cpuif_sysreg_to_str(uint32_t sysreg)
-{
-	const char *str;
-
-	switch (sysreg) {
-	case DUMPSTAT_CPUIF_ICC_SRE_EL1:
-		str = "ICC_SRE_EL1";
-		break;
-	case DUMPSTAT_CPUIF_ICC_PMR_EL1:
-		str = "ICC_PMR_EL1";
-		break;
-	case DUMPSTAT_CPUIF_ICC_CTLR_EL1:
-		str = "ICC_CTLR_EL1";
-		break;
-	case DUMPSTAT_CPUIF_ICC_IGRPEN1_EL1:
-		str = "ICC_IGRPEN1_EL1";
-		break;
-	case DUMPSTAT_CPUIF_ICC_DIR_EL1:
-		str = "ICC_DIR_EL1";
-		break;
-	case DUMPSTAT_CPUIF_ICC_RPR_EL1:
-		str = "ICC_RPR_EL1";
-		break;
-	default:
-		str = "unknown";
 		break;
 	}
 
@@ -403,6 +328,18 @@ static const char *shell_vtimer_trace_event_to_str(uint32_t event)
 	case ARM64_VTIMER_TRACE_BACKUP:
 		str = "backup";
 		break;
+	case ARM64_VTIMER_TRACE_WFI:
+		str = "wfi";
+		break;
+	case ARM64_VTIMER_TRACE_PENDING_LR:
+		str = "pending-lr";
+		break;
+	case ARM64_VTIMER_TRACE_LOST_LR:
+		str = "lost-lr";
+		break;
+	case ARM64_VTIMER_TRACE_MASK:
+		str = "mask";
+		break;
 	default:
 		str = "unknown";
 		break;
@@ -431,174 +368,16 @@ static void shell_dumpstat_vgic_event(const char *label,
 	}
 }
 
-static void shell_dumpstat_recent_events(const struct arm64_vcpu_debug_info *debug)
+static void shell_dumpstat_last_exit(const struct arm64_vcpu_last_exit *last)
 {
-	const struct arm64_vcpu_last_exit *last_exit = &debug->last_exit;
-	const struct arm64_vcpu_last_irq *last_irq = &debug->last_irq;
-	const struct arm64_vcpu_last_timer *last_timer = &debug->last_timer;
-	const struct arm64_vcpu_last_sgi *last_sgi = &debug->last_sgi;
-	const struct arm64_vcpu_last_sgi_target *last_sgi_target = &debug->last_sgi_target;
-	const struct arm64_vcpu_last_psci *last_psci = &debug->last_psci;
-	const struct arm64_vcpu_last_cpuif *last_cpuif = &debug->last_cpuif;
-	const struct arm64_vcpu_last_wfx *last_wfx = &debug->last_wfx;
-	const struct arm64_vcpu_last_guest_return *last_return = &debug->last_return;
-
-	if (last_exit->tsc == 0UL) {
-		shell_item_line(" exit:none");
+	if (last->tsc == 0UL) {
+		shell_item_line("last-exit:none");
 	} else {
-		if (last_exit->ec == ARM64_VCPU_DEBUG_EXIT_EC_INVALID) {
-			shell_item_line(" exit:src:%s ec:N/A status:%d tsc:0x%08lx",
-				shell_exit_source_to_str(last_exit->source),
-				last_exit->status, last_exit->tsc);
-		} else {
-			shell_item_line(" exit:src:%s ec:0x%x status:%d tsc:0x%08lx",
-				shell_exit_source_to_str(last_exit->source),
-				last_exit->ec, last_exit->status, last_exit->tsc);
-		}
-		shell_item_line("  esr:0x%016lx elr:0x%016lx far:0x%016lx hpfar:0x%016lx",
-			last_exit->esr, last_exit->elr, last_exit->far, last_exit->hpfar);
-		if (last_exit->abort_type != ARM64_VCPU_DEBUG_ABORT_NONE) {
-			shell_item_line("  abort:%s fsc:0x%02x",
-				shell_abort_type_to_str(last_exit->abort_type),
-				last_exit->abort_fsc);
-		}
+		shell_item_line("last-exit:src:%u ec:0x%x status:%d elr:0x%016lx esr:0x%016lx",
+			last->source, last->ec, last->status, last->elr, last->esr);
+		shell_item_line("          far:0x%016lx hpfar:0x%016lx tsc:0x%08lx",
+			last->far, last->hpfar, last->tsc);
 	}
-
-	if (last_irq->tsc == 0UL) {
-		shell_item_line("  irq:none");
-	} else {
-		shell_item_line("  irq:virq:%u level:%s src:%hu dst:%hu status:%d tsc:0x%08lx",
-			last_irq->virq, shell_yes_no(last_irq->level),
-			last_irq->source_vcpu_id, last_irq->target_vcpu_id,
-			last_irq->status, last_irq->tsc);
-	}
-
-	if (last_timer->tsc == 0UL) {
-		shell_item_line("timer:none");
-	} else {
-		shell_item_line("timer:virq:%u sysreg:0x%x write:%s injected:%s status:%d tsc:0x%08lx",
-			last_timer->virq, last_timer->sysreg,
-			shell_yes_no(last_timer->write), shell_yes_no(last_timer->injected),
-			last_timer->status, last_timer->tsc);
-		shell_item_line("       ctl:0x%08x cval:0x%016lx",
-			last_timer->ctl, last_timer->cval);
-	}
-
-	if (last_sgi->tsc == 0UL) {
-		shell_item_line("  sgi:none");
-	} else {
-		shell_item_line("  sgi:intid:%u src:%hu dst-mask:0x%04x delivered:0x%04x status:%d tsc:0x%08lx",
-			last_sgi->intid, last_sgi->source_vcpu_id,
-			last_sgi->target_mask, last_sgi->delivered_mask,
-			last_sgi->status, last_sgi->tsc);
-		shell_item_line("      value:0x%016lx", last_sgi->value);
-	}
-
-	if (last_sgi_target->tsc == 0UL) {
-		shell_item_line("sgi-dst:none");
-	} else {
-		shell_item_line("sgi-dst:intid:%u src:%hu dst:%hu status:%d request:%s running:%s current:%s tsc:0x%08lx",
-			last_sgi_target->intid, last_sgi_target->source_vcpu_id,
-			last_sgi_target->target_vcpu_id, last_sgi_target->status,
-			shell_yes_no(last_sgi_target->request_pending),
-			shell_yes_no(last_sgi_target->target_running),
-			shell_yes_no(last_sgi_target->target_current),
-			last_sgi_target->tsc);
-		shell_item_line("          sgi:enabled:0x%04x pending:0x%04x active:0x%04x desc:%s/%s/%s/%s used_lrs:%u",
-			(uint32_t)last_sgi_target->local_enabled,
-			(uint32_t)last_sgi_target->local_pending,
-			(uint32_t)last_sgi_target->local_active,
-			shell_yes_no(last_sgi_target->desc_enabled),
-			shell_yes_no(last_sgi_target->desc_pending),
-			shell_yes_no(last_sgi_target->desc_active),
-			shell_yes_no(last_sgi_target->desc_level),
-			last_sgi_target->used_lrs);
-		shell_item_line("          value:0x%016lx hcr:0x%016lx misr:0x%016lx lr0:0x%016lx lr1:0x%016lx",
-			last_sgi_target->source_value, last_sgi_target->hcr,
-			last_sgi_target->misr, last_sgi_target->lr0, last_sgi_target->lr1);
-	}
-
-	if (last_psci->tsc == 0UL) {
-		shell_item_line(" psci:none");
-	} else {
-		shell_item_line(" psci:fn:0x%x src:%hu dst:%hu ret:%ld tsc:0x%08lx",
-			last_psci->fn, last_psci->source_vcpu_id,
-			last_psci->target_vcpu_id, last_psci->ret, last_psci->tsc);
-		shell_item_line("      mpidr:0x%016lx entry:0x%016lx context:0x%016lx",
-			last_psci->target_mpidr, last_psci->entry, last_psci->context);
-	}
-
-	if (last_cpuif->tsc == 0UL) {
-		shell_item_line("cpuif-access:none");
-	} else {
-		/*
-		 * The trapped ICC access is the guest-visible lifecycle command that
-		 * can explain why a live LR stayed active, pending, or disabled.
-		 */
-		shell_item_line("cpuif-access:%s read:%s value:0x%016lx status:%d tsc:0x%08lx",
-			shell_cpuif_sysreg_to_str(last_cpuif->sysreg),
-			shell_yes_no(last_cpuif->read), last_cpuif->value,
-			last_cpuif->status, last_cpuif->tsc);
-	}
-
-	if (last_wfx->tsc == 0UL) {
-		shell_item_line("  wfx:none");
-	} else {
-		shell_item_line("  wfx:type:%s pending:%s irq-masked:%s request:%s yield:%s tsc:0x%08lx",
-			last_wfx->is_wfe ? "wfe" : "wfi",
-			shell_yes_no(last_wfx->pending_irq),
-			shell_yes_no(last_wfx->irq_masked),
-			shell_yes_no(last_wfx->request_pending),
-			shell_yes_no(last_wfx->yielded), last_wfx->tsc);
-		shell_item_line("      elr:0x%016lx esr:0x%016lx used_lrs:%u el2_masked:%s",
-			last_wfx->elr, last_wfx->esr, last_wfx->used_lrs,
-			shell_yes_no(last_wfx->cntv_el2_masked));
-		shell_item_line("      cntv_ctl:0x%08x cntv_cval:0x%016lx cntvct:0x%016lx expired:%s",
-			last_wfx->cntv_ctl, last_wfx->cntv_cval, last_wfx->cntvct,
-			shell_yes_no(last_wfx->cntv_expired));
-		shell_item_line("      hcr:0x%016lx misr:0x%016lx    ap0r0:0x%016lx    ap1r0:0x%016lx",
-			last_wfx->hcr, last_wfx->misr, last_wfx->ap0r0, last_wfx->ap1r0);
-		shell_item_line("      lr0:0x%016lx  lr1:0x%016lx live_lr0:0x%016lx live_lr1:0x%016lx",
-			last_wfx->lr0, last_wfx->lr1, last_wfx->live_lr0, last_wfx->live_lr1);
-	}
-
-	if (last_return->tsc == 0UL) {
-		shell_item_line("return:none");
-	} else {
-		shell_item_line("return:src:%s elr:0x%016lx spsr:0x%016lx tsc:0x%08lx",
-			shell_exit_source_to_str(last_return->source),
-			last_return->elr, last_return->spsr, last_return->tsc);
-		shell_item_line("       cntv_ctl:0x%08x cntv_cval:0x%016lx cntvct:0x%016lx expired:%s",
-			last_return->cntv_ctl, last_return->cntv_cval,
-			last_return->cntvct, shell_yes_no(last_return->cntv_expired));
-		shell_item_line("       cntp_ctl:0x%08x cntp_cval:0x%016lx cntpct:0x%016lx delta:%ld",
-			last_return->cntp_ctl, last_return->cntp_cval,
-			last_return->cntpct,
-			(int64_t)(last_return->cntp_cval - last_return->cntpct));
-		shell_item_line("          hcr:0x%016lx   vmcr:0x%016lx     misr:0x%016lx     eisr:0x%016lx elrsr:0x%016lx",
-			last_return->hcr, last_return->vmcr, last_return->misr,
-			last_return->eisr, last_return->elrsr);
-		shell_item_line("        ap0r0:0x%016lx  ap1r0:0x%016lx used_lrs:%u el2_masked:%s",
-			last_return->ap0r0, last_return->ap1r0,
-			last_return->used_lrs,
-			shell_yes_no(last_return->cntv_el2_masked));
-		shell_item_line("       sw_lr0:0x%016lx sw_lr1:0x%016lx live_lr0:0x%016lx live_lr1:0x%016lx",
-			last_return->sw_lr0, last_return->sw_lr1,
-			last_return->live_lr0, last_return->live_lr1);
-		shell_item_line("       timer:virq:%u en:%s pend:%s act:%s level:%s host:%s/%s/%s valid:%s",
-			last_return->timer_virq,
-			shell_yes_no(last_return->timer_enabled),
-			shell_yes_no(last_return->timer_pending),
-			shell_yes_no(last_return->timer_active),
-			shell_yes_no(last_return->timer_level),
-			shell_yes_no(last_return->host_enabled),
-			shell_yes_no(last_return->host_pending),
-			shell_yes_no(last_return->host_active),
-			shell_yes_no(last_return->host_valid));
-	}
-
-	shell_dumpstat_vgic_event("vgic-sync", &debug->last_vgic_sync);
-	shell_dumpstat_vgic_event("vgic-maint", &debug->last_vgic_maintenance);
 }
 
 static void shell_dumpstat_vtimer_trace(const struct arm64_vcpu_vtimer_trace *trace)
@@ -754,7 +533,6 @@ struct dumpstat_snapshot {
 	struct arm64_vcpu_guest_ctx gctx;
 	struct arm64_vgicv3_vcpu_ctx vgic_ctx;
 	struct arm64_vgic_irq timer_irq;
-	struct arm64_vgic_irq local_irq[DUMPSTAT_LOCAL_IRQ_NUM];
 	struct arm64_gicv3_local_irq_state host_timer_irq;
 	uint64_t live_cnthctl_el2;
 	uint64_t live_cntvct_el0;
@@ -773,11 +551,6 @@ struct dumpstat_snapshot {
 	uint64_t live_ich_ap0r0_el2;
 	uint64_t live_ich_ap1r0_el2;
 	uint64_t live_ich_lr[4U];
-	uint64_t live_icc_pmr_el1;
-	uint64_t live_icc_ctlr_el1;
-	uint64_t live_icc_sre_el1;
-	uint64_t live_icc_igrpen1_el1;
-	uint64_t live_daif;
 	uint64_t pending_req;
 	uint64_t irqs_pending;
 	uint64_t irqs_pending_mask;
@@ -787,7 +560,6 @@ struct dumpstat_snapshot {
 	bool vtimer_wfi_rescue;
 	bool vtimer_lr_rescue;
 	bool has_timer_irq;
-	bool has_local_irq;
 	bool has_live_timer;
 	bool captured;
 };
@@ -814,13 +586,6 @@ static void shell_dumpstat_capture(void *data)
 		snapshot->vtimer_lr_rescue = snapshot->vcpu->arch.vtimer_lr_rescue;
 		snapshot->vtimer_lr_rescue_budget =
 			snapshot->vcpu->arch.vtimer_lr_rescue_budget;
-		if ((snapshot->vcpu->vm != NULL) &&
-			(snapshot->vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
-			(void)memcpy_s(snapshot->local_irq, sizeof(snapshot->local_irq),
-				snapshot->vcpu->vm->arch_vm.vgic.irq[snapshot->vcpu->vcpu_id],
-				sizeof(snapshot->local_irq));
-			snapshot->has_local_irq = true;
-		}
 		snapshot->live_cnthctl_el2 = read_cnthctl_el2();
 		snapshot->live_cntvct_el0 = read_cntvct_el0();
 		snapshot->live_cntpct_el0 = read_cntpct_el0();
@@ -852,17 +617,6 @@ static void shell_dumpstat_capture(void *data)
 		snapshot->live_ich_lr[1U] = read_ich_lr_el2(1U);
 		snapshot->live_ich_lr[2U] = read_ich_lr_el2(2U);
 		snapshot->live_ich_lr[3U] = read_ich_lr_el2(3U);
-		/*
-		 * The virtual CPU interface is gated by VMCR and guest ICC state,
-		 * while Linux idle may hold DAIF.I set. Dumping both sides shows
-		 * whether an LR is blocked by priority/group state or merely waiting
-		 * for the guest to re-enable architectural IRQ handling.
-		 */
-		snapshot->live_icc_pmr_el1 = read_icc_pmr_el1();
-		snapshot->live_icc_ctlr_el1 = read_icc_ctlr_el1();
-		snapshot->live_icc_sre_el1 = read_icc_sre_el1();
-		snapshot->live_icc_igrpen1_el1 = read_icc_igrpen1_el1();
-		snapshot->live_daif = read_daif();
 		arm64_gicv3_get_local_irq_state(get_pcpu_id(), DUMPSTAT_VTIMER_VIRQ,
 			&snapshot->host_timer_irq);
 		snapshot->has_live_timer = true;
@@ -893,11 +647,7 @@ static const struct cpu_regs *shell_dumpstat_get_regs(struct acrn_vcpu *vcpu,
 		(void)memcpy_s(&snapshot->timer_irq, sizeof(snapshot->timer_irq),
 			&vcpu->vm->arch_vm.vgic.irq[vcpu->vcpu_id][DUMPSTAT_VTIMER_VIRQ],
 			sizeof(snapshot->timer_irq));
-		(void)memcpy_s(snapshot->local_irq, sizeof(snapshot->local_irq),
-			vcpu->vm->arch_vm.vgic.irq[vcpu->vcpu_id],
-			sizeof(snapshot->local_irq));
 		snapshot->has_timer_irq = true;
-		snapshot->has_local_irq = true;
 	}
 	snapshot->has_live_timer = false;
 	snapshot->captured = false;
@@ -1001,60 +751,48 @@ static void shell_dumpstat_timer_state(const struct dumpstat_snapshot *snapshot)
 			snapshot->live_ich_lr[0U], snapshot->live_ich_lr[1U]);
 		shell_item_line("         live_lr2:0x%016lx   live_lr3:0x%016lx",
 			snapshot->live_ich_lr[2U], snapshot->live_ich_lr[3U]);
-		shell_item_line("       live_icc:pmr:0x%016lx ctlr:0x%016lx sre:0x%016lx igrpen1:0x%016lx",
-			snapshot->live_icc_pmr_el1, snapshot->live_icc_ctlr_el1,
-			snapshot->live_icc_sre_el1, snapshot->live_icc_igrpen1_el1);
-		shell_item_line("       live_daif:0x%016lx", snapshot->live_daif);
 	}
 	for (idx = 0U; idx < snapshot->vgic_ctx.used_lrs; idx++) {
 		shell_item_line("   lr%u:0x%016lx", idx, snapshot->vgic_ctx.lr[idx]);
 	}
 }
 
-static void shell_dumpstat_local_irqs(const struct dumpstat_snapshot *snapshot)
+static void shell_dumpstat_vtimer_diag(const struct arm64_vcpu_vtimer_diag *diag)
 {
-	uint32_t idx;
-	uint16_t sgi_enabled = 0U;
-	uint16_t sgi_pending = 0U;
-	uint16_t sgi_active = 0U;
-	bool any = false;
+	uint64_t mask_ticks = diag->max_el2_mask_ticks;
 
-	if (!snapshot->has_local_irq) {
-		shell_item_line("local:none");
-		return;
-	}
+	if (diag->el2_mask_since_ticks != 0UL) {
+		uint64_t now = cpu_ticks();
+		uint64_t active_ticks = (now > diag->el2_mask_since_ticks) ?
+			(now - diag->el2_mask_since_ticks) : 0UL;
 
-	for (idx = 0U; idx < DUMPSTAT_LOCAL_IRQ_NUM; idx++) {
-		const struct arm64_vgic_irq *irq = &snapshot->local_irq[idx];
-
-		if (idx < ARM64_VGIC_SGI_NUM) {
-			uint16_t bit = (uint16_t)(1UL << idx);
-
-			if (irq->enabled) {
-				sgi_enabled |= bit;
-			}
-			if (irq->pending) {
-				sgi_pending |= bit;
-			}
-			if (irq->active) {
-				sgi_active |= bit;
-			}
-		}
-		if (irq->pending || irq->active || (idx == DUMPSTAT_VTIMER_VIRQ)) {
-			shell_item_line("local:virq:%2u enabled:%s pending:%s active:%s level:%s",
-				irq->virq, shell_yes_no(irq->enabled),
-				shell_yes_no(irq->pending), shell_yes_no(irq->active),
-				shell_yes_no(irq->level));
-			any = true;
+		if (active_ticks > mask_ticks) {
+			mask_ticks = active_ticks;
 		}
 	}
 
-	shell_item_line("local-sgi:enabled:0x%04x pending:0x%04x active:0x%04x",
-		(uint32_t)sgi_enabled, (uint32_t)sgi_pending, (uint32_t)sgi_active);
-
-	if (!any) {
-		shell_item_line("local:none");
-	}
+	/*
+	 * This section deliberately avoids repeating raw CNTV/LR fields from
+	 * "timer/vgic state" and "vtimer trace". It gives cumulative counters for
+	 * the four transitions that matter when Linux reports timer-softirq stalls:
+	 * WFI wakeup, pending-only LR preservation, EL2 host-timer masking, and the
+	 * last-chance flush before ERET.
+	 */
+	shell_item_line("wfi:trap:%lu irq-masked:%lu pending-irq:%lu rescue-arm:%lu",
+		diag->wfi_trap, diag->wfi_irq_masked, diag->wfi_pending_irq,
+		diag->wfi_rescue_arm);
+	shell_item_line("pending-only-lr:seen:%lu preserve:%lu drop:%lu lost-no-eoi:%lu",
+		diag->pending_only_lr_seen, diag->pending_only_lr_preserve,
+		diag->pending_only_lr_drop, diag->lost_pending_lr);
+	shell_item_line("el2-mask:set:%lu clear:%lu requeue:%lu max-age.us:%lu active:%s",
+		diag->el2_mask_set, diag->el2_mask_clear,
+		diag->masked_timer_requeue, ticks_to_us(mask_ticks),
+		shell_yes_no(diag->el2_mask_since_ticks != 0UL));
+	shell_item_line("pre-eret-flush:run:%lu masked-skip:%lu lr-rescue:%lu masked-expired:%lu budget-exhaust:%lu",
+		diag->pre_eret_flush, diag->pre_eret_flush_skip,
+		diag->pre_eret_flush_lr_rescue,
+		diag->pre_eret_flush_masked_expired,
+		diag->lr_rescue_budget_exhaust);
 }
 
 static int32_t shell_dumpstat_vcpu(struct acrn_vcpu *vcpu)
@@ -1077,24 +815,39 @@ static int32_t shell_dumpstat_vcpu(struct acrn_vcpu *vcpu)
 	shell_item_line("requests:pending:0x%016lx arch-irqs:0x%016lx mask:0x%016lx",
 		snapshot.pending_req, snapshot.irqs_pending,
 		snapshot.irqs_pending_mask);
-	shell_item_section("guest regs");
+	shell_item_section("vcpu stats");
+	/*
+	 * vcpu stats keeps the vCPU execution context together: EL1 guest
+	 * registers, saved EL1 system state, and the two stacks that explain where
+	 * the guest and BEAU vCPU thread were stopped. Timer/vGIC-specific evidence
+	 * is printed in the separate section below to avoid mixing scheduler/stack
+	 * state with interrupt-delivery state.
+	 */
+	shell_item_line("guest regs:");
 	shell_dumpstat_regs(regs);
-	shell_item_section("recent events");
-	shell_dumpstat_recent_events(debug);
-	shell_item_section("el1 state");
+	/*
+	 * Keep one compact exit record in the generic block. The older all-events
+	 * dump repeated timer/vGIC details already present below and made the
+	 * command expensive to scan during pressure runs.
+	 */
+	shell_dumpstat_last_exit(&debug->last_exit);
+	shell_item_line("system regs:");
 	shell_dumpstat_el1_state(&snapshot);
-	shell_item_section("timer/vgic state");
-	shell_dumpstat_timer_state(&snapshot);
-	shell_item_section("vtimer trace");
-	shell_dumpstat_vtimer_trace(&debug->vtimer_trace);
-	shell_item_section("local irq state");
-	shell_dumpstat_local_irqs(&snapshot);
 	if (vcpu->state != VCPU_OFFLINE) {
-		shell_item_section("guest stack symbols:none");
+		shell_item_line("vm stack:");
 		shell_dumpstat_vm_stack(vcpu, regs);
-		shell_item_section("host stack symbols:beau");
+		shell_item_line("pcpu stack:");
 		shell_dumpstat_host_stack(vcpu);
 	}
+	shell_item_section("vgic/vtimer");
+	shell_item_line("basic:");
+	shell_dumpstat_timer_state(&snapshot);
+	shell_dumpstat_vgic_event("vgic-sync", &debug->last_vgic_sync);
+	shell_dumpstat_vgic_event("vgic-maint", &debug->last_vgic_maintenance);
+	shell_item_line("diagnosis:");
+	shell_dumpstat_vtimer_diag(&vcpu->arch.debug.vtimer_diag);
+	shell_item_line("trace:");
+	shell_dumpstat_vtimer_trace(&debug->vtimer_trace);
 	shell_item_end();
 
 	return 0;
@@ -1375,6 +1128,9 @@ static void shell_vmstat_vm_config(uint16_t vm_id, const struct acrn_vm_config *
 		arch->guest_uart_base, arch->guest_uart_size, arch->guest_uart_irq,
 		shell_yes_no(console_vmid == vm_id), ring.queued, ring.capacity,
 		shell_yes_no(ring.pending));
+	if (ring.pending) {
+		shell_item_line("console-diag:vm-console-backlog");
+	}
 	if (vu != NULL) {
 		shell_item_line("        vuart:active:%s irq:%u rx:%u tx:%u ier:0x%02x lsr:0x%02x",
 			shell_yes_no(vu->active), vu->irq, vuart_rx_numchars(vu),
@@ -1387,6 +1143,82 @@ static void shell_vmstat_vm_config(uint16_t vm_id, const struct acrn_vm_config *
 	shell_item_line("%s", temp_str);
 }
 
+static void shell_vmstat_append_flag(char *flags, size_t flags_len, const char *flag)
+{
+	size_t len = strnlen_s(flags, flags_len);
+
+	if (len != 0U) {
+		(void)strncat_s(flags, flags_len, ",", 1U);
+	}
+	(void)strncat_s(flags, flags_len, flag, strnlen_s(flag, flags_len));
+}
+
+static void shell_vmstat_vcpu_diag(const struct acrn_vcpu *vcpu,
+	const struct thread_object *current, const struct sched_latency_stats *latency,
+	const struct sched_rtds_stats *rtds, bool has_rtds,
+	char *flags, size_t flags_len)
+{
+	uint64_t now = cpu_ticks();
+	bool cpu_wait = false;
+
+	flags[0] = '\0';
+
+	/*
+	 * These flags are quick "why might this VM look stuck?" hints from the
+	 * current vmstat snapshot. They do not prove a permanent hang by themselves;
+	 * they point to the next subsystem to inspect.
+	 *
+	 * cpu-wait:
+	 *   The vCPU is runnable but is not the current thread on its pCPU for at
+	 *   least two RTDS periods. A runnable thread wants CPU time; a long wait
+	 *   usually means another vCPU/thread is occupying that pCPU or the shared
+	 *   core is overloaded.
+	 *
+	 * rtds-depleted:
+	 *   The vCPU runs under RTDS, is not currently executing, and its
+	 *   current-period budget is already zero. RTDS gives each vCPU a fixed
+	 *   budget every period; once that budget is spent, a non-current vCPU must
+	 *   wait for replenishment unless spare CPU time is available through
+	 *   work-conserving slack. A current vCPU with zero budget is probably using
+	 *   that slack, so it is not flagged here.
+	 *
+	 * rtds-overrun:
+	 *   The vCPU is already in cpu-wait and the RTDS replenishment/deadline
+	 *   boundary is also due. This combines "wanted CPU for a while" with "the
+	 *   current RTDS period should have rolled", which is a stronger signal that
+	 *   the shared core is behind schedule.
+	 *
+	 * vtimer-rescue:
+	 *   The ARM64 virtual timer stuck or WFI rescue path is active. Linux relies
+	 *   on virtual timer interrupts for scheduler ticks, timeouts and RCU
+	 *   progress; if the rescue path is active, the guest can look idle or frozen
+	 *   even when the vCPU itself is being scheduled. A held LR alone is not
+	 *   flagged here because it can be part of normal pending-interrupt handling.
+	 */
+	if ((vcpu->thread_obj.status == THREAD_STS_RUNNABLE) &&
+		(current != &vcpu->thread_obj) &&
+		(latency->runnable_since != 0UL) &&
+		(ticks_to_us(now - latency->runnable_since) >= VMSTAT_CPU_WAIT_WARN_US)) {
+		cpu_wait = true;
+		shell_vmstat_append_flag(flags, flags_len, "cpu-wait");
+	}
+	if (has_rtds && (current != &vcpu->thread_obj) &&
+		(vcpu->thread_obj.status == THREAD_STS_RUNNABLE) &&
+		(rtds->remaining_ticks == 0UL)) {
+		shell_vmstat_append_flag(flags, flags_len, "rtds-depleted");
+	}
+	if (has_rtds && cpu_wait && (rtds->deadline_ticks <= now)) {
+		shell_vmstat_append_flag(flags, flags_len, "rtds-overrun");
+	}
+	if (vcpu->arch.vtimer_stuck_rescue_armed || vcpu->arch.vtimer_wfi_rescue) {
+		shell_vmstat_append_flag(flags, flags_len, "vtimer-rescue");
+	}
+
+	if (flags[0] == '\0') {
+		(void)snprintf(flags, flags_len, "ok");
+	}
+}
+
 static void shell_vmstat_vcpus(const struct acrn_vm *vm)
 {
 	uint16_t vcpu_id;
@@ -1397,27 +1229,35 @@ static void shell_vmstat_vcpus(const struct acrn_vm *vm)
 	}
 
 	shell_item_section("vcpu state");
-	shell_item_line("vcpu  pcpu  vcpu     thread    cur  req-mask");
-	shell_item_line("────  ────  ───────  ────────  ───  ──────────────────");
+	shell_item_line("vcpu       pcpu  sched  vcpu     thread    cur  req-mask            diag");
+	shell_item_line("─────────  ────  ─────  ───────  ────────  ───  ──────────────────  ────────────");
 	for (vcpu_id = 0U; vcpu_id < vm->hw.created_vcpus; vcpu_id++) {
 		struct acrn_vcpu *vcpu = vcpu_from_vid((struct acrn_vm *)vm, vcpu_id);
+		struct sched_latency_stats latency = { 0U };
 		struct sched_bvt_stats bvt = { 0U };
 		struct sched_rtds_stats rtds = { 0U };
 		struct thread_object *current;
+		char diag[96U];
 		bool has_bvt;
 		bool has_rtds;
 
 		current = sched_get_current(vcpu->thread_obj.pcpu_id);
+		sched_get_latency(&vcpu->thread_obj, &latency);
 		has_bvt = sched_get_bvt_stats(&vcpu->thread_obj, &bvt);
 		has_rtds = sched_get_rtds_stats(&vcpu->thread_obj, &rtds);
-		shell_item_line("%-4hu  %-4hu  %-7s  %-8s  %-3s  0x%016lx",
-			vcpu->vcpu_id, vcpu->thread_obj.pcpu_id,
+		shell_vmstat_vcpu_diag(vcpu, current, &latency, &rtds, has_rtds,
+			diag, sizeof(diag));
+		shell_item_line("%-9s  %-4hu  %-5s  %-7s  %-8s  %-3s  0x%016lx  %s",
+			vcpu->thread_obj.name, vcpu->thread_obj.pcpu_id,
+			has_rtds ? "rtds" : (has_bvt ? "bvt" : "-"),
 			shell_vcpu_state_to_str(vcpu->state),
 			thread_state_to_str(vcpu->thread_obj.status),
 			shell_yes_no(current == &vcpu->thread_obj),
-			vcpu->pending_req);
-		shell_item_line("      bvt:weight:%u avt:%ld evt:%ld", has_bvt ? bvt.weight : 0U,
-			has_bvt ? bvt.avt : 0L, has_bvt ? bvt.evt : 0L);
+			vcpu->pending_req, diag);
+		if (has_bvt) {
+			shell_item_line("      bvt:weight:%u avt:%ld evt:%ld", bvt.weight,
+				bvt.avt, bvt.evt);
+		}
 		if (has_rtds) {
 			uint64_t now = cpu_ticks();
 

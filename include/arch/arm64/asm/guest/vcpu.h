@@ -41,6 +41,10 @@
 #define ARM64_VTIMER_TRACE_EOI			8U
 #define ARM64_VTIMER_TRACE_REQUEUE		9U
 #define ARM64_VTIMER_TRACE_BACKUP		10U
+#define ARM64_VTIMER_TRACE_WFI			11U
+#define ARM64_VTIMER_TRACE_PENDING_LR		12U
+#define ARM64_VTIMER_TRACE_LOST_LR		13U
+#define ARM64_VTIMER_TRACE_MASK			14U
 
 /*
  * EL2 control state that is programmed around vCPU scheduling. The guest GPRs
@@ -320,7 +324,61 @@ struct arm64_vcpu_vtimer_trace_entry {
 struct arm64_vcpu_vtimer_trace {
 	uint32_t head;
 	uint32_t count;
+	/*
+	 * The trace ring is for state changes; high-rate repetitions are counted
+	 * by vtimer_diag. Suppressing consecutive duplicates keeps dumpstat useful
+	 * when an interrupt stays in the same pending/masked state for many exits.
+	 */
+	uint64_t last_key;
 	struct arm64_vcpu_vtimer_trace_entry entry[ARM64_VCPU_VTIMER_TRACE_NUM];
+};
+
+/*
+ * vtimer/vGIC diagnosis counters are intentionally summaries, not another raw
+ * register dump. dumpstat already prints the current CNTV, vGIC descriptor and
+ * LR state; these counters answer which timer-forward-progress transition kept
+ * repeating before Linux reported timer-softirq/RCU stalls.
+ */
+struct arm64_vcpu_vtimer_diag {
+	/*
+	 * WFI tells whether the guest repeatedly slept with an IRQ already visible.
+	 * irq_masked means EL1 returned from WFI with PSTATE.I set; pending_irq means
+	 * EL2 believed a virtual interrupt should keep the vCPU running.
+	 */
+	uint64_t wfi_trap;
+	uint64_t wfi_irq_masked;
+	uint64_t wfi_pending_irq;
+	uint64_t wfi_rescue_arm;
+	/*
+	 * pending-only LR flow tracks the QEMU-sensitive path where a timer LR can
+	 * wake WFI but disappear before Linux acknowledges PPI27. preserve means
+	 * CNTV was still due and EL2 kept the virtual line asserted; drop means CNTV
+	 * was no longer due and EL2 retired that pending-only state.
+	 */
+	uint64_t pending_only_lr_seen;
+	uint64_t pending_only_lr_preserve;
+	uint64_t pending_only_lr_drop;
+	uint64_t lost_pending_lr;
+	/*
+	 * EL2 masks the host virtual-timer PPI while the interrupt is owned by vGIC
+	 * state. Long mask age or requeue events indicate the host-masked timer had
+	 * to be rebuilt from live CNTV instead of normal LR/EOI flow.
+	 */
+	uint64_t el2_mask_set;
+	uint64_t el2_mask_clear;
+	uint64_t masked_timer_requeue;
+	/*
+	 * pre-ERET flush counters summarize the last-chance vtimer/vGIC refresh
+	 * before returning to EL1. They stay out of the trace ring because this path
+	 * can be hot and would otherwise overwrite rarer pending-only LR evidence.
+	 */
+	uint64_t pre_eret_flush;
+	uint64_t pre_eret_flush_skip;
+	uint64_t pre_eret_flush_lr_rescue;
+	uint64_t pre_eret_flush_masked_expired;
+	uint64_t lr_rescue_budget_exhaust;
+	uint64_t max_el2_mask_ticks;
+	uint64_t el2_mask_since_ticks;
 };
 
 struct arm64_vcpu_debug_info {
@@ -336,6 +394,7 @@ struct arm64_vcpu_debug_info {
 	struct arm64_vcpu_last_wfx last_wfx;
 	struct arm64_vcpu_last_guest_return last_return;
 	struct arm64_vcpu_vtimer_trace vtimer_trace;
+	struct arm64_vcpu_vtimer_diag vtimer_diag;
 };
 
 struct acrn_vcpu_arch {
@@ -368,6 +427,8 @@ int32_t arm64_dispatch_hypercall(struct acrn_vcpu *vcpu);
 void arm64_prepare_linux_vcpu_context(struct acrn_vcpu *vcpu, uint64_t entry, uint64_t x0);
 void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
 	uint32_t virq, uint32_t ctl, uint64_t cval, bool write, bool injected);
+void arm64_vtimer_diag_mark_pre_eret(struct acrn_vcpu *vcpu,
+	bool flushed, bool lr_rescue, bool masked_expired);
 
 #endif /* ASSEMBLER */
 

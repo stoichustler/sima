@@ -107,20 +107,45 @@ static bool vtimer_guest_ctx_expired(const struct arm64_vcpu_guest_ctx *gctx)
 static void vtimer_set_host_mask(struct acrn_vcpu *vcpu, bool masked)
 {
 	struct arm64_vcpu_guest_ctx *gctx;
+	struct arm64_vcpu_vtimer_diag *diag;
+	uint64_t now;
 
 	if ((vcpu == NULL) || (get_running_vcpu(get_pcpu_id()) != vcpu)) {
 		return;
 	}
 
 	gctx = &vcpu->arch.gctx;
-	if (masked) {
+	diag = &vcpu->arch.debug.vtimer_diag;
+	now = cpu_ticks();
+	if (masked && !gctx->cntv_el2_masked) {
+		/*
+		 * The host PPI is priority-masked only while vGIC state owns an expired
+		 * guest timer. Counting transitions and max age shows whether EL2 kept
+		 * CNTV hidden for too long without a matching LR/EOI completion.
+		 */
 		gctx->cntv_el2_masked = true;
+		diag->el2_mask_set++;
+		diag->el2_mask_since_ticks = now;
 		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
 			ARM64_GIC_PRIORITY_MASKED);
+		arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_MASK,
+			gctx->timer_virq, UINT32_MAX, UINT64_MAX, false, true);
+	} else if (masked) {
+		gctx->cntv_el2_masked = true;
 	} else if (gctx->cntv_el2_masked) {
+		uint64_t mask_ticks = (diag->el2_mask_since_ticks != 0UL) ?
+			(now - diag->el2_mask_since_ticks) : 0UL;
+
 		gctx->cntv_el2_masked = false;
+		diag->el2_mask_clear++;
+		if (mask_ticks > diag->max_el2_mask_ticks) {
+			diag->max_el2_mask_ticks = mask_ticks;
+		}
+		diag->el2_mask_since_ticks = 0UL;
 		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
 			ARM64_GIC_PRIORITY_DEFAULT);
+		arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_MASK,
+			gctx->timer_virq, UINT32_MAX, UINT64_MAX, false, false);
 	}
 }
 
@@ -293,17 +318,15 @@ void arm64_vtimer_trace_switch(struct acrn_vcpu *vcpu, uint32_t event)
 	}
 }
 
-static void vtimer_write_live_ctl(struct arm64_vcpu_guest_ctx *gctx)
+static void vtimer_write_live_ctl(struct acrn_vcpu *vcpu)
 {
+	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
 	uint32_t ctl = vtimer_guest_ctl(gctx);
-	bool host_masked = gctx->cntv_el2_masked;
 
-	gctx->cntv_el2_masked = false;
-	write_cntv_ctl_el0(ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
-	if (host_masked) {
-		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
-			ARM64_GIC_PRIORITY_DEFAULT);
+	if (gctx->cntv_el2_masked) {
+		vtimer_set_host_mask(vcpu, false);
 	}
+	write_cntv_ctl_el0(ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
 }
 
 int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
@@ -353,7 +376,7 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 			}
 		} else {
 			gctx->cntp_ctl_el0 = write_ctl;
-			vtimer_write_live_ctl(gctx);
+			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	case SYSREG_CNTV_CTL_EL0:
@@ -365,7 +388,7 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 			}
 		} else {
 			gctx->cntv_ctl_el0 = write_ctl;
-			vtimer_write_live_ctl(gctx);
+			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	case SYSREG_CNTP_CVAL_EL0:
@@ -377,7 +400,7 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 		} else {
 			gctx->cntp_cval_el0 = write_value;
 			write_cntv_cval_el0(gctx->cntp_cval_el0);
-			vtimer_write_live_ctl(gctx);
+			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	case SYSREG_CNTV_CVAL_EL0:
@@ -389,7 +412,7 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 		} else {
 			gctx->cntv_cval_el0 = write_value;
 			write_cntv_cval_el0(gctx->cntv_cval_el0);
-			vtimer_write_live_ctl(gctx);
+			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	case SYSREG_CNTP_TVAL_EL0:
@@ -402,7 +425,7 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 			val = now + (uint64_t)(int32_t)(uint32_t)write_value;
 			gctx->cntp_cval_el0 = val;
 			write_cntv_cval_el0(val);
-			vtimer_write_live_ctl(gctx);
+			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	case SYSREG_CNTV_TVAL_EL0:
@@ -415,7 +438,7 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 			val = now + (uint64_t)(int32_t)(uint32_t)write_value;
 			gctx->cntv_cval_el0 = val;
 			write_cntv_cval_el0(val);
-			vtimer_write_live_ctl(gctx);
+			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	default:
@@ -511,11 +534,14 @@ static void vtimer_arm_stuck_rescue(struct acrn_vcpu *vcpu)
 
 static void vtimer_arm_wfi_rescue(struct acrn_vcpu *vcpu)
 {
+	vcpu->arch.debug.vtimer_diag.wfi_rescue_arm++;
 	vcpu->arch.vtimer_wfi_rescue = true;
 	vcpu->arch.gctx.hcr_el2 |= HCR_TWI;
 	if (get_running_vcpu(get_pcpu_id()) == vcpu) {
 		write_hcr_el2(vcpu->arch.gctx.hcr_el2);
 	}
+	arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_WFI,
+		vcpu->arch.gctx.timer_virq, UINT32_MAX, UINT64_MAX, false, true);
 }
 
 static void vtimer_keep_rescue(struct acrn_vcpu *vcpu)

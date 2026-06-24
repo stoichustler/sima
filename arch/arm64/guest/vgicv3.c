@@ -1313,6 +1313,7 @@ bool arm64_vgicv3_requeue_lost_masked_timer(struct acrn_vcpu *vcpu)
 		 */
 		vgic_set_pending(vgic, vcpu->vcpu_id, desc, true);
 		vgicv3_flush_vcpu(vcpu, true);
+		vcpu->arch.debug.vtimer_diag.masked_timer_requeue++;
 		arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_REQUEUE, virq,
 			UINT32_MAX, UINT64_MAX, false, false);
 		requeued = true;
@@ -1476,9 +1477,11 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				 */
 				timer_line_asserted = arm64_vtimer_sample_current(vcpu);
 				timer_line_sampled = true;
+				vcpu->arch.debug.vtimer_diag.lost_pending_lr++;
 				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id,
 					desc, timer_line_asserted);
 				if (timer_line_asserted) {
+					vcpu->arch.debug.vtimer_diag.pending_only_lr_preserve++;
 					arm64_vgicv3_keep_vtimer_rescue(vcpu);
 					if ((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL) {
 						/*
@@ -1491,8 +1494,12 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 						arm64_vtimer_arm_wfi_rescue(vcpu);
 					}
 				} else {
+					vcpu->arch.debug.vtimer_diag.pending_only_lr_drop++;
 					arm64_vgicv3_clear_vtimer_rescue(vcpu);
 				}
+				arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_LOST_LR,
+					virq, UINT32_MAX, UINT64_MAX, false,
+					timer_line_asserted);
 			} else if (queued_level) {
 				/* Keep the level source queued for the next flush pass. */
 			} else if (!desc->level && old_pending && !eoi_reported) {
@@ -1554,16 +1561,27 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				 * software level line asserted while CNTV is still due; otherwise
 				 * EL2 can be left with a host-masked expired CNTV source and no
 				 * descriptor state from which to rebuild delivery.
+				 *
+				 * The counters distinguish a healthy preservation loop from a
+				 * real drop: seen counts the hardware pattern, preserve means CNTV
+				 * still required delivery, and drop means the live timer was no
+				 * longer due so the pending-only LR could be retired.
 				 */
+				vcpu->arch.debug.vtimer_diag.pending_only_lr_seen++;
 				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id,
 					desc, line_asserted);
 				desc->active = false;
 				arm64_vtimer_set_host_mask(vcpu, line_asserted);
 				if (!line_asserted) {
+					vcpu->arch.debug.vtimer_diag.pending_only_lr_drop++;
 					remove_lr(vcpu, idx);
 				} else {
+					vcpu->arch.debug.vtimer_diag.pending_only_lr_preserve++;
 					idx++;
 				}
+				arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_PENDING_LR,
+					virq, UINT32_MAX, UINT64_MAX, false,
+					line_asserted);
 				continue;
 			}
 
@@ -1772,6 +1790,7 @@ static bool vgicv3_pending_vtimer_rescue_blocks_reschedule(struct acrn_vcpu *vcp
 		return true;
 	}
 
+	vcpu->arch.debug.vtimer_diag.lr_rescue_budget_exhaust++;
 	return false;
 }
 

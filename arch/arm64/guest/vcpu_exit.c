@@ -211,6 +211,8 @@ static bool vcpu_has_pending_guest_irq(struct acrn_vcpu *vcpu)
 static void prepare_current_guest_return(struct acrn_vcpu *vcpu)
 {
 	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
+	bool lr_rescue = vcpu->arch.vtimer_lr_rescue;
+	bool masked_expired = gctx->cntv_el2_masked && arm64_vtimer_guest_expired(vcpu);
 	/*
 	 * This is a last-chance synchronization point, not a scheduler policy.
 	 * Linux can return from WFI with DAIF.I still masked after a pending-only
@@ -221,15 +223,19 @@ static void prepare_current_guest_return(struct acrn_vcpu *vcpu)
 	 * blocked. Restrict the extra flush to the timer-rescue/host-masked cases so
 	 * ordinary guest exits keep the existing lightweight return path.
 	 */
-	bool timer_needs_flush = vcpu->arch.vtimer_lr_rescue ||
-		(gctx->cntv_el2_masked && arm64_vtimer_guest_expired(vcpu));
+	bool timer_needs_flush = lr_rescue || masked_expired;
 
 	if (!timer_needs_flush) {
+		if (gctx->cntv_el2_masked) {
+			arm64_vtimer_diag_mark_pre_eret(vcpu, false,
+				lr_rescue, masked_expired);
+		}
 		return;
 	}
 
 	refresh_current_vtimer(vcpu);
 	arm64_vgicv3_flush_current_vcpu_with_lock(vcpu);
+	arm64_vtimer_diag_mark_pre_eret(vcpu, true, lr_rescue, masked_expired);
 }
 
 static struct acrn_vcpu *schedule_without_guest_return_work(uint16_t pcpu_id,
@@ -784,6 +790,20 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 		((int64_t)(last->cntv_cval - last->cntvct) <= 0L);
 	last->cntv_el2_masked = vcpu->arch.gctx.cntv_el2_masked;
 	last->tsc = cpu_ticks();
+	/*
+	 * WFI itself is common and already has a last_wfx snapshot. Count the
+	 * interesting predicates here, but leave the trace ring for rarer edges such
+	 * as rescue arming or pending-only LR preservation.
+	 */
+	if (!is_wfe) {
+		vcpu->arch.debug.vtimer_diag.wfi_trap++;
+		if (irq_masked) {
+			vcpu->arch.debug.vtimer_diag.wfi_irq_masked++;
+		}
+		if (pending_irq) {
+			vcpu->arch.debug.vtimer_diag.wfi_pending_irq++;
+		}
+	}
 
 	/*
 	 * This handler is non-default diagnostic plumbing because QEMU 3OS leaves
