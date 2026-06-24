@@ -368,6 +368,25 @@ init_thread_data(&vcpu->thread_obj, &params);
   entries are raw addresses because BEAU does not embed guest symbol tables. The
   debug image embeds the BEAU symbol table, so host stack return addresses are
   printed as `function+offset`. Offline vCPUs skip stack output.
+  `guest-trace` is a small per-vCPU ring for the guest/EL2 boundary:
+
+  ```text
+  ┌────────────┐
+  │ vCPU thread│
+  └─────┬──────┘
+        │ enter
+        ▼
+  ┌────────────┐      exit       ┌────────────┐
+  │  EL1 guest │ ──────────────▶ │ EL2 handler│
+  └────────────┘ ◀────────────── └────────────┘
+        ▲           resume
+        │
+        ╰─ next guest run
+  ```
+
+  `enter` is the first handoff from the vCPU thread into EL1, `exit` is the
+  guest trap or physical interrupt return to EL2, and `resume` is the point
+  where EL2 has finished handling the exit and is about to `ERET` back to EL1.
 - `constat [vm id]` prints focused VM console state for live diagnostics:
   selected/input VM IDs, host input backlog, async TX ring usage and drops,
   vUART RX/TX state, vPL011 pending/assert/deassert counters, and the guest UART

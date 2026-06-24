@@ -15,6 +15,7 @@
 #include <asm/irq.h>
 #include <asm/cpu.h>
 #include <asm/sysreg.h>
+#include <asm/trap.h>
 #include <asm/guest/vcpu_priv.h>
 #include <asm/guest/virq.h>
 #include <asm/guest/vgicv3.h>
@@ -86,6 +87,52 @@ void arm64_prepare_linux_vcpu_context(struct acrn_vcpu *vcpu, uint64_t entry, ui
 	arm64_init_guest_regs(&vcpu->arch.regs, entry, x0);
 	arm64_init_guest_control_context(vcpu);
 	arm64_vgicv3_reset_vcpu_boot_state(vcpu);
+}
+
+uint64_t arm64_vcpu_trace_guest_boundary(struct acrn_vcpu *vcpu, uint8_t event,
+	uint32_t source, int32_t status)
+{
+	struct arm64_vcpu_guest_trace *trace;
+	struct arm64_vcpu_guest_trace_entry *entry;
+	const struct cpu_regs *regs;
+	uint32_t idx;
+	uint64_t now;
+
+	if (vcpu == NULL) {
+		return cpu_ticks();
+	}
+
+	now = cpu_ticks();
+	trace = &vcpu->arch.debug.guest_trace;
+	idx = trace->head;
+	if (idx >= ARM64_VCPU_GUEST_TRACE_NUM) {
+		idx = 0U;
+	}
+	entry = &trace->entry[idx];
+	regs = &vcpu->arch.regs;
+
+	entry->tsc = now;
+	entry->elr = regs->elr;
+	entry->esr = regs->esr;
+	entry->far = regs->far;
+	entry->hpfar = regs->hpfar;
+	entry->ec = (event == ARM64_VCPU_GUEST_TRACE_EXIT) ?
+		(uint32_t)ESR_EL2_EC(regs->esr) : ARM64_VCPU_DEBUG_EXIT_EC_INVALID;
+	entry->source = source;
+	entry->status = status;
+	entry->pcpu_id = get_pcpu_id();
+	entry->event = event;
+
+	idx++;
+	if (idx >= ARM64_VCPU_GUEST_TRACE_NUM) {
+		idx = 0U;
+	}
+	trace->head = idx;
+	if (trace->count < ARM64_VCPU_GUEST_TRACE_NUM) {
+		trace->count++;
+	}
+
+	return now;
 }
 
 void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
@@ -409,6 +456,8 @@ void arch_vcpu_thread(struct thread_object *obj)
 		if (ret < 0) {
 			break;
 		}
+		arm64_vcpu_trace_guest_boundary(vcpu, ARM64_VCPU_GUEST_TRACE_ENTER,
+			ARM64_VCPU_DEBUG_EXIT_NONE, 0);
 		arm64_run_vcpu(&vcpu->arch);
 	}
 

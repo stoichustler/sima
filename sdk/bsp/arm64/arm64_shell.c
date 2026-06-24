@@ -351,6 +351,33 @@ static const char *shell_vtimer_trace_event_to_str(uint32_t event)
 	return str;
 }
 
+static const char *shell_guest_trace_event_to_str(uint8_t event)
+{
+	const char *str;
+
+	/*
+	 * enter  : vCPU thread -> EL1.
+	 * exit   : EL1 -> EL2.
+	 * resume : EL2 -> EL1.
+	 */
+	switch (event) {
+	case ARM64_VCPU_GUEST_TRACE_ENTER:
+		str = "enter";
+		break;
+	case ARM64_VCPU_GUEST_TRACE_EXIT:
+		str = "exit";
+		break;
+	case ARM64_VCPU_GUEST_TRACE_RESUME:
+		str = "resume";
+		break;
+	default:
+		str = "unknown";
+		break;
+	}
+
+	return str;
+}
+
 static void shell_dumpstat_vgic_event(const char *label,
 	const struct arm64_vcpu_last_vgic *last)
 {
@@ -371,6 +398,24 @@ static void shell_dumpstat_vgic_event(const char *label,
 	}
 }
 
+static void shell_dumpstat_guest_resume(const struct arm64_vcpu_guest_resume *last)
+{
+	if (last->tsc == 0UL) {
+		shell_item_line("last-resume:none");
+	} else {
+		shell_item_line("last-resume:src:%u pc:0x%016lx spsr:0x%016lx tsc:0x%08lx",
+			last->source, last->elr, last->spsr, last->tsc);
+		shell_item_line("            cntv_ctl:0x%08x cntv_exp:%s el2_mask:%s virq:%u p/a/l:%s/%s/%s",
+			last->cntv_ctl, shell_yes_no(last->cntv_expired),
+			shell_yes_no(last->cntv_el2_masked), last->timer_virq,
+			shell_yes_no(last->timer_pending),
+			shell_yes_no(last->timer_active),
+			shell_yes_no(last->timer_level));
+		shell_item_line("            lr0:0x%016lx lr1:0x%016lx live_lr0:0x%016lx live_lr1:0x%016lx",
+			last->sw_lr0, last->sw_lr1, last->live_lr0, last->live_lr1);
+	}
+}
+
 static void shell_dumpstat_last_exit(const struct arm64_vcpu_last_exit *last)
 {
 	if (last->tsc == 0UL) {
@@ -380,6 +425,46 @@ static void shell_dumpstat_last_exit(const struct arm64_vcpu_last_exit *last)
 			last->source, last->ec, last->status, last->elr, last->esr);
 		shell_item_line("          far:0x%016lx hpfar:0x%016lx tsc:0x%08lx",
 			last->far, last->hpfar, last->tsc);
+	}
+}
+
+static void shell_dumpstat_guest_trace(const struct arm64_vcpu_guest_trace *trace)
+{
+	uint32_t count = trace->count;
+	uint32_t start;
+	uint32_t idx;
+	uint64_t prev_tsc = 0UL;
+
+	if (count > ARM64_VCPU_GUEST_TRACE_NUM) {
+		count = ARM64_VCPU_GUEST_TRACE_NUM;
+	}
+	if (count == 0U) {
+		shell_item_line("guest-trace:none");
+		return;
+	}
+
+	start = (trace->head + ARM64_VCPU_GUEST_TRACE_NUM - count) %
+		ARM64_VCPU_GUEST_TRACE_NUM;
+	for (idx = 0U; idx < count; idx++) {
+		uint32_t ring_idx = (start + idx) % ARM64_VCPU_GUEST_TRACE_NUM;
+		const struct arm64_vcpu_guest_trace_entry *entry = &trace->entry[ring_idx];
+		uint64_t delta_us = ((prev_tsc == 0UL) || (entry->tsc < prev_tsc)) ?
+			0UL : ticks_to_us(entry->tsc - prev_tsc);
+
+		if (entry->ec == ARM64_VCPU_DEBUG_EXIT_EC_INVALID) {
+			shell_item_line("gt[%02u] %-6s pcpu:%hu src:0x%02x ec:N/A  status:%3d delta.us:%8lu tsc:0x%016lx",
+				idx, shell_guest_trace_event_to_str(entry->event),
+				entry->pcpu_id, entry->source, entry->status,
+				delta_us, entry->tsc);
+		} else {
+			shell_item_line("gt[%02u] %-6s pcpu:%hu src:0x%02x ec:0x%02x status:%3d delta.us:%8lu tsc:0x%016lx",
+				idx, shell_guest_trace_event_to_str(entry->event),
+				entry->pcpu_id, entry->source, entry->ec, entry->status,
+				delta_us, entry->tsc);
+		}
+		shell_item_line("       elr:0x%016lx esr:0x%016lx far:0x%016lx hpfar:0x%016lx",
+			entry->elr, entry->esr, entry->far, entry->hpfar);
+		prev_tsc = entry->tsc;
 	}
 }
 
@@ -839,6 +924,8 @@ static int32_t shell_dumpstat_vcpu(struct acrn_vcpu *vcpu)
 	 * command expensive to scan during pressure runs.
 	 */
 	shell_dumpstat_last_exit(&debug->last_exit);
+	shell_dumpstat_guest_resume(&debug->last_resume);
+	shell_dumpstat_guest_trace(&debug->guest_trace);
 	shell_item_line("system regs:");
 	shell_dumpstat_el1_state(&snapshot);
 	if (vcpu->state != VCPU_OFFLINE) {

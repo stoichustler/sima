@@ -46,6 +46,10 @@
 #define ARM64_VTIMER_TRACE_LOST_LR		13U
 #define ARM64_VTIMER_TRACE_MASK			14U
 #define ARM64_VTIMER_TRACE_STALL		15U
+#define ARM64_VCPU_GUEST_TRACE_NUM		8U
+#define ARM64_VCPU_GUEST_TRACE_ENTER		1U
+#define ARM64_VCPU_GUEST_TRACE_EXIT		2U
+#define ARM64_VCPU_GUEST_TRACE_RESUME		3U
 
 /*
  * EL2 control state that is programmed around vCPU scheduling. The guest GPRs
@@ -255,12 +259,12 @@ struct arm64_vcpu_last_wfx {
 };
 
 /*
- * The guest-return snapshot is recorded after exit handling has synchronized
+ * The guest-resume snapshot is recorded after exit handling has synchronized
  * vtimer/vGIC state and immediately before EL2 restores the frame for ERET.
- * It shows what the guest was actually about to observe, which can differ from
- * the state captured at the earlier physical IRQ entry point.
+ * It shows what the guest is about to observe, which can differ from the state
+ * captured at the earlier physical IRQ entry point.
  */
-struct arm64_vcpu_last_guest_return {
+struct arm64_vcpu_guest_resume {
 	uint64_t tsc;
 	uint64_t elr;
 	uint64_t spsr;
@@ -294,6 +298,25 @@ struct arm64_vcpu_last_guest_return {
 	bool host_enabled;
 	bool host_pending;
 	bool host_active;
+};
+
+struct arm64_vcpu_guest_trace_entry {
+	uint64_t tsc;
+	uint64_t elr;
+	uint64_t esr;
+	uint64_t far;
+	uint64_t hpfar;
+	uint32_t ec;
+	uint32_t source;
+	int32_t status;
+	uint16_t pcpu_id;
+	uint8_t event;
+};
+
+struct arm64_vcpu_guest_trace {
+	uint32_t head;
+	uint32_t count;
+	struct arm64_vcpu_guest_trace_entry entry[ARM64_VCPU_GUEST_TRACE_NUM];
 };
 
 /*
@@ -406,7 +429,8 @@ struct arm64_vcpu_debug_info {
 	struct arm64_vcpu_last_vgic last_vgic_sync;
 	struct arm64_vcpu_last_vgic last_vgic_maintenance;
 	struct arm64_vcpu_last_wfx last_wfx;
-	struct arm64_vcpu_last_guest_return last_return;
+	struct arm64_vcpu_guest_resume last_resume;
+	struct arm64_vcpu_guest_trace guest_trace;
 	struct arm64_vcpu_vtimer_trace vtimer_trace;
 	struct arm64_vcpu_vtimer_diag vtimer_diag;
 };
@@ -440,6 +464,8 @@ int32_t arm64_process_vcpu_requests(struct acrn_vcpu *vcpu);
 bool arm64_is_acrn_hypercall(uint64_t hcall_id);
 int32_t arm64_dispatch_hypercall(struct acrn_vcpu *vcpu);
 void arm64_prepare_linux_vcpu_context(struct acrn_vcpu *vcpu, uint64_t entry, uint64_t x0);
+uint64_t arm64_vcpu_trace_guest_boundary(struct acrn_vcpu *vcpu, uint8_t event,
+	uint32_t source, int32_t status);
 void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
 	uint32_t virq, uint32_t ctl, uint64_t cval, bool write, bool injected);
 void arm64_vtimer_diag_mark_pre_eret(struct acrn_vcpu *vcpu,

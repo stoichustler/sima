@@ -208,7 +208,7 @@ static bool vcpu_has_pending_guest_irq(struct acrn_vcpu *vcpu)
 	return arm64_vgicv3_pending_irq_blocks_reschedule(vcpu);
 }
 
-static void prepare_current_guest_return(struct acrn_vcpu *vcpu)
+static void prepare_current_guest_resume(struct acrn_vcpu *vcpu)
 {
 	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
 	bool lr_rescue = vcpu->arch.vtimer_lr_rescue;
@@ -238,7 +238,7 @@ static void prepare_current_guest_return(struct acrn_vcpu *vcpu)
 	arm64_vtimer_diag_mark_pre_eret(vcpu, true, lr_rescue, masked_expired);
 }
 
-static struct acrn_vcpu *schedule_without_guest_return_work(uint16_t pcpu_id,
+static struct acrn_vcpu *schedule_without_guest_resume(uint16_t pcpu_id,
 	struct acrn_vcpu *vcpu)
 {
 	refresh_current_vtimer(vcpu);
@@ -291,12 +291,13 @@ static void record_vcpu_exit(struct acrn_vcpu *vcpu, uint32_t source, int32_t st
 	}
 	last->source = source;
 	last->status = status;
-	last->tsc = cpu_ticks();
+	last->tsc = arm64_vcpu_trace_guest_boundary(vcpu, ARM64_VCPU_GUEST_TRACE_EXIT,
+		source, status);
 }
 
-static void record_vcpu_return(struct acrn_vcpu *vcpu, uint32_t source)
+static void record_vcpu_resume(struct acrn_vcpu *vcpu, uint32_t source)
 {
-	struct arm64_vcpu_last_guest_return *last = &vcpu->arch.debug.last_return;
+	struct arm64_vcpu_guest_resume *last = &vcpu->arch.debug.last_resume;
 	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
 	struct arm64_gicv3_local_irq_state host_irq;
 	uint32_t virq = (gctx->timer_virq == 0U) ?
@@ -313,7 +314,8 @@ static void record_vcpu_return(struct acrn_vcpu *vcpu, uint32_t source)
 	(void)memset(&host_irq, 0U, sizeof(host_irq));
 	arm64_gicv3_get_local_irq_state(get_pcpu_id(), ARM64_GIC_PPI_VIRTUAL_TIMER, &host_irq);
 
-	last->tsc = cpu_ticks();
+	last->tsc = arm64_vcpu_trace_guest_boundary(vcpu, ARM64_VCPU_GUEST_TRACE_RESUME,
+		source, 0);
 	last->elr = vcpu->arch.regs.elr;
 	last->spsr = vcpu->arch.regs.spsr;
 	last->cntpct = host_now;
@@ -901,7 +903,7 @@ void dispatch_vcpu_trap(struct cpu_regs *regs)
 	 * sitting just after WFI with PSTATE.I still set; it needs a short return to
 	 * EL1 to leave the idle path and unmask the pending virtual IRQ.
 	 */
-	vcpu = schedule_without_guest_return_work(pcpu_id, vcpu);
+	vcpu = schedule_without_guest_resume(pcpu_id, vcpu);
 	ret = arm64_process_vcpu_requests(vcpu);
 	if (ret < 0) {
 		pr_fatal("failed to process arm64 vcpu requests");
@@ -911,8 +913,8 @@ void dispatch_vcpu_trap(struct cpu_regs *regs)
 		schedule();
 	}
 
-	prepare_current_guest_return(vcpu);
-	record_vcpu_return(vcpu, ARM64_VCPU_DEBUG_EXIT_SYNC);
+	prepare_current_guest_resume(vcpu);
+	record_vcpu_resume(vcpu, ARM64_VCPU_DEBUG_EXIT_SYNC);
 	restore_exit_regs(regs, vcpu);
 }
 
@@ -946,7 +948,7 @@ void dispatch_vcpu_irq(struct cpu_regs *regs)
 	 * If a virtual IRQ is already materialized, let the guest retire enough
 	 * instructions to unmask and handle it before honoring host reschedule.
 	 */
-	vcpu = schedule_without_guest_return_work(pcpu_id, vcpu);
+	vcpu = schedule_without_guest_resume(pcpu_id, vcpu);
 	ret = arm64_process_vcpu_requests(vcpu);
 	if (ret < 0) {
 		pr_fatal("failed to process arm64 vcpu requests");
@@ -956,7 +958,7 @@ void dispatch_vcpu_irq(struct cpu_regs *regs)
 		schedule();
 	}
 
-	prepare_current_guest_return(vcpu);
-	record_vcpu_return(vcpu, ARM64_VCPU_DEBUG_EXIT_IRQ);
+	prepare_current_guest_resume(vcpu);
+	record_vcpu_resume(vcpu, ARM64_VCPU_DEBUG_EXIT_IRQ);
 	restore_exit_regs(regs, vcpu);
 }
