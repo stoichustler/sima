@@ -340,6 +340,9 @@ static const char *shell_vtimer_trace_event_to_str(uint32_t event)
 	case ARM64_VTIMER_TRACE_MASK:
 		str = "mask";
 		break;
+	case ARM64_VTIMER_TRACE_STALL:
+		str = "stall";
+		break;
 	default:
 		str = "unknown";
 		break;
@@ -788,6 +791,11 @@ static void shell_dumpstat_vtimer_diag(const struct arm64_vcpu_vtimer_diag *diag
 		diag->el2_mask_set, diag->el2_mask_clear,
 		diag->masked_timer_requeue, ticks_to_us(mask_ticks),
 		shell_yes_no(diag->el2_mask_since_ticks != 0UL));
+	shell_item_line("stale-lr:seen:%lu unmask:%lu drop:%lu handoff:%lu skip:%lu reinject:%lu max-age.us:%lu",
+		diag->stale_pending_lr, diag->stale_pending_lr_mask_release,
+		diag->stale_pending_lr_drop, diag->stale_pending_lr_handoff,
+		diag->stale_pending_lr_skip_flush, diag->stale_pending_lr_reinject,
+		ticks_to_us(diag->stale_pending_lr_max_age_ticks));
 	shell_item_line("pre-eret-flush:run:%lu masked-skip:%lu lr-rescue:%lu masked-expired:%lu budget-exhaust:%lu",
 		diag->pre_eret_flush, diag->pre_eret_flush_skip,
 		diag->pre_eret_flush_lr_rescue,

@@ -457,6 +457,13 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 	last->injected = false;
 	last->tsc = cpu_ticks();
 	if (!read) {
+		/*
+		 * A guest timer write is an explicit ownership boundary: Linux either
+		 * reprogrammed the deadline or masked/disabled the source after taking
+		 * the interrupt. Any previous stale-LR host handoff must stop suppressing
+		 * vGIC flushes from this point on.
+		 */
+		vcpu->arch.vtimer_host_handoff = false;
 		arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_SYSREG,
 			last->virq, last->ctl, last->cval, true, false);
 	}
@@ -699,6 +706,10 @@ void arm64_vgicv3_virtual_timer_irq_handler(__unused uint32_t irq, __unused void
 		if (virq == 0U) {
 			vcpu->arch.gctx.timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 			virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+		}
+		if (vcpu->arch.vtimer_host_handoff) {
+			vcpu->arch.vtimer_host_handoff = false;
+			vcpu->arch.debug.vtimer_diag.stale_pending_lr_reinject++;
 		}
 		if (virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
 			vcpu->arch.gctx.cntp_cval_el0 = read_cntv_cval_el0();

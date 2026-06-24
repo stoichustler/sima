@@ -112,6 +112,19 @@
  */
 #define BIT32(n)			(1U << (n))
 
+/*
+ * A pending-only virtual timer LR is a valid transient state: it can wake Linux
+ * from WFI before EL1 unmasks interrupts and acknowledges PPI27. It must not
+ * become a permanent owner of the timer source, though. If host PPI27 remains
+ * priority-masked for much longer than a normal Linux timer interrupt handling
+ * window, clear the stale vGIC/LR owner and hand ownership back to host CNTV
+ * PPI delivery. The next real PPI or guest timer write rebuilds guest-visible
+ * injection through the ordinary path. The value is intentionally conservative:
+ * the failure mode lasts for seconds, while healthy WFI-to-IRQ handoff should
+ * complete well below 50ms.
+ */
+#define VTIMER_PENDING_LR_STALL_US	50000U
+
 #define VGICD_CTLR			0x0000U
 #define VGICD_TYPER			0x0004U
 #define VGICD_IIDR			0x0008U
@@ -587,6 +600,84 @@ static void remove_lr(struct acrn_vcpu *vcpu, uint32_t idx)
 		ctx->lr[last] = 0UL;
 		ctx->used_lrs--;
 	}
+}
+
+static bool vgicv3_vtimer_pending_lr_stalled(struct acrn_vcpu *vcpu,
+	const struct arm64_vgic_irq *desc, uint32_t state, bool line_asserted,
+	uint64_t *age_ticks)
+{
+	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
+	const struct arm64_vcpu_vtimer_diag *diag = &vcpu->arch.debug.vtimer_diag;
+	uint64_t age = 0UL;
+	bool stalled;
+
+	if (diag->el2_mask_since_ticks != 0UL) {
+		uint64_t now = cpu_ticks();
+
+		age = (now > diag->el2_mask_since_ticks) ?
+			(now - diag->el2_mask_since_ticks) : 0UL;
+	}
+
+	if (age_ticks != NULL) {
+		*age_ticks = age;
+	}
+
+	stalled = gctx->cntv_el2_masked && desc->level && desc->pending &&
+		!desc->active && line_asserted &&
+		((state & ICH_LR_STATE_PENDING) != 0U) &&
+		((state & ICH_LR_STATE_ACTIVE) == 0U) &&
+		(age >= us_to_ticks(VTIMER_PENDING_LR_STALL_US));
+
+	return stalled;
+}
+
+static void vgicv3_release_stale_vtimer_lr(struct acrn_vcpu *vcpu,
+	struct arm64_vgicv3 *vgic, struct arm64_vgic_irq *desc, uint32_t lr_idx,
+	uint64_t age_ticks)
+{
+	struct arm64_vcpu_vtimer_diag *diag = &vcpu->arch.debug.vtimer_diag;
+
+	/*
+	 * This is an ownership handoff, not an interrupt loss. The stale state means
+	 * vGIC/LR delivery has failed to produce guest acknowledgement for too long.
+	 * Clear only the stale vGIC owner, unmask the host virtual timer PPI, and
+	 * let the next real CNTV PPI rebuild the guest interrupt through the normal
+	 * injection path. Keeping desc->pending set here would let the same flush
+	 * path immediately recreate the stale pending-only LR.
+	 */
+	diag->stale_pending_lr++;
+	diag->stale_pending_lr_mask_release++;
+	diag->stale_pending_lr_drop++;
+	diag->stale_pending_lr_handoff++;
+	if (age_ticks > diag->stale_pending_lr_max_age_ticks) {
+		diag->stale_pending_lr_max_age_ticks = age_ticks;
+	}
+	vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
+	desc->active = false;
+	vcpu->arch.vtimer_host_handoff = true;
+	arm64_vgicv3_clear_vtimer_rescue(vcpu);
+	arm64_vtimer_set_host_mask(vcpu, false);
+	remove_lr(vcpu, lr_idx);
+	arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_STALL,
+		vcpu->arch.gctx.timer_virq, UINT32_MAX, UINT64_MAX, false, false);
+}
+
+static bool vgicv3_skip_vtimer_host_handoff_flush(struct acrn_vcpu *vcpu,
+	const struct arm64_vgic_irq *desc)
+{
+	bool skip = vcpu->arch.vtimer_host_handoff &&
+		vgic_is_vtimer_irq(vcpu, desc->virq) && desc->level;
+
+	if (skip) {
+		/*
+		 * While host handoff is active, the host CNTV PPI owns rediscovery of
+		 * the expired timer. Re-flushing from a leftover software pending bit
+		 * would recreate the same pending-only LR without a fresh hardware event.
+		 */
+		vcpu->arch.debug.vtimer_diag.stale_pending_lr_skip_flush++;
+	}
+
+	return skip;
 }
 
 static void vgic_update_irq_lr(struct acrn_vcpu *vcpu, const struct arm64_vgic_irq *desc)
@@ -1554,6 +1645,8 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 			if (loaded && desc->level && vgic_is_vtimer_irq(vcpu, virq) &&
 				lr_pending && !lr_active) {
 				bool line_asserted = arm64_vtimer_sample_current(vcpu);
+				uint64_t stall_age_ticks = 0UL;
+				bool stale_released = false;
 
 				/*
 				 * QEMU can consume a pending-only timer LR as a WFI wake event
@@ -1571,17 +1664,25 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id,
 					desc, line_asserted);
 				desc->active = false;
-				arm64_vtimer_set_host_mask(vcpu, line_asserted);
 				if (!line_asserted) {
+					arm64_vtimer_set_host_mask(vcpu, false);
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_drop++;
 					remove_lr(vcpu, idx);
+				} else if (vgicv3_vtimer_pending_lr_stalled(vcpu, desc, state,
+					line_asserted, &stall_age_ticks)) {
+					vgicv3_release_stale_vtimer_lr(vcpu, &vcpu->vm->arch_vm.vgic,
+						desc, idx, stall_age_ticks);
+					stale_released = true;
 				} else {
+					arm64_vtimer_set_host_mask(vcpu, true);
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_preserve++;
 					idx++;
 				}
-				arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_PENDING_LR,
-					virq, UINT32_MAX, UINT64_MAX, false,
-					line_asserted);
+				if (!stale_released) {
+					arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_PENDING_LR,
+						virq, UINT32_MAX, UINT64_MAX, false,
+						line_asserted);
+				}
 				continue;
 			}
 
@@ -1839,6 +1940,10 @@ bool arm64_vgicv3_pending_irq_blocks_reschedule(struct acrn_vcpu *vcpu)
 			struct arm64_vgic_irq *desc = &vgic->irq[vcpu->vcpu_id][virq];
 
 			bits &= ~BIT32(bit);
+			if (vgicv3_skip_vtimer_host_handoff_flush(vcpu, desc)) {
+				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
+				continue;
+			}
 			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc) &&
 				(!desc->level || (find_lr_for_virq(vcpu, virq) < 0)) &&
 				vgicv3_pending_vtimer_rescue_blocks_reschedule(vcpu, virq)) {
@@ -1900,6 +2005,10 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 
 			bits &= ~BIT32(bit);
 			if (!desc->pending) {
+				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
+				continue;
+			}
+			if (vgicv3_skip_vtimer_host_handoff_flush(vcpu, desc)) {
 				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
 				continue;
 			}
