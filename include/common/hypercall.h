@@ -402,6 +402,8 @@ int32_t hcall_get_cpu_pm_state(struct acrn_vcpu *vcpu, struct acrn_vm *target_vm
  */
 int32_t hcall_vm_intr_monitor(struct acrn_vcpu *vcpu, struct acrn_vm *target_vm, uint64_t param1, uint64_t param2);
 
+int32_t hcall_vm_wdt_kick(struct acrn_vcpu *vcpu, struct acrn_vm *target_vm, uint64_t param1, uint64_t param2);
+
 /**
  * @defgroup trusty_hypercall Trusty Hypercalls
  *

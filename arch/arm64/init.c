@@ -10,6 +10,7 @@
 #include <logmsg.h>
 #include <mmu.h>
 #include <timer.h>
+#include <vm_wdt.h>
 #include <console.h>
 #include <shell.h>
 #include <serial.h>
@@ -131,6 +132,7 @@ static void init_pcpu_comm_post(void)
 			panic("failed to initialize all secondary cores!");
 		}
 		shell_start();
+		vm_wdt_start();
 	}
 
 	init_guest_mode(pcpu_id);

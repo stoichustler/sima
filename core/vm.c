@@ -13,6 +13,7 @@
 #include <logmsg.h>
 #include <sbuf.h>
 #include <sprintf.h>
+#include <vm_wdt.h>
 #include <asm/notify.h>
 #include <host_pm.h>
 
@@ -390,6 +391,8 @@ void launch_vms(uint16_t pcpu_id)
 void start_vm(struct acrn_vm *vm)
 {
 	struct acrn_vcpu *vcpu = vcpu_from_vid(vm, BSP_CPU_ID);
+
+	vm_wdt_reset(vm);
 	arch_vm_prepare_bsp(vcpu);
 	launch_vcpu(vcpu);
 	vm->state = VM_RUNNING;
@@ -422,6 +425,7 @@ int32_t destroy_vm(struct acrn_vm *vm)
 
 	/* Only allow shutdown paused vm */
 	vm->state = VM_POWERED_OFF;
+	vm_wdt_reset(vm);
 
 	if (is_service_vm(vm)) {
 		sbuf_reset();

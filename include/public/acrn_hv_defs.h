@@ -80,6 +80,7 @@
 #define HC_SETUP_HV_NPK_LOG         BASE_HC_ID(HC_ID, HC_ID_DBG_BASE + 0x01UL)
 #define HC_PROFILING_OPS            BASE_HC_ID(HC_ID, HC_ID_DBG_BASE + 0x02UL)
 #define HC_GET_HW_INFO              BASE_HC_ID(HC_ID, HC_ID_DBG_BASE + 0x03UL)
+#define HC_VM_WDT_KICK              BASE_HC_ID(HC_ID, HC_ID_DBG_BASE + 0x04UL)
 
 /* Trusty */
 #define HC_ID_TRUSTY_BASE           0x70UL

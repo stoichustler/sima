@@ -187,6 +187,7 @@ endif
 
 COMMON_C_SRCS += core/vcpu.c
 COMMON_C_SRCS += core/vm.c
+COMMON_C_SRCS += core/vm_wdt.c
 
 # FIXME: During initial development stage of riscv enabling,
 # we would like to first confine the core files to x86-only.
@@ -490,7 +491,7 @@ sdk/image/linux/beau-linux.dtb: sdk/image/linux/beau-linux.dts
 	$(Q)echo "dtc       $@"
 	$(Q)$(DTC) -I dts -O dtb -o $@ $<
 
-$(HV_OBJDIR)/arch/arm64/platform/qemu/platform_image.o: sdk/image/linux/beau-linux.dtb
+$(HV_OBJDIR)/arch/arm64/platform/qemu/platform_image.o: sdk/image/lk.bin sdk/image/zephyr.bin sdk/image/linux/beau-linux.dtb
 endif
 endif
 

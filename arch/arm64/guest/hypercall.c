@@ -11,6 +11,7 @@
 #include <guest_memory.h>
 #include <hypercall.h>
 #include <acrn_hv_defs.h>
+#include <vm_wdt.h>
 #include <version.h>
 #include <logmsg.h>
 #include <trace.h>
@@ -24,7 +25,9 @@
  * VMX, VTD, LAPIC, and profiling calls return -ENOTTY on ARM64 until their
  * dependencies exist here.
  */
-#define ACRN_HCALL_ID(id)	(((id) >> 24U) == HC_ID)
+#define ACRN_HCALL_ID_MASK	0xffffffffUL
+#define ACRN_HCALL_FUNC(id)	((id) & ACRN_HCALL_ID_MASK)
+#define ACRN_HCALL_ID(id)	((ACRN_HCALL_FUNC(id) >> 24U) == HC_ID)
 
 struct arm64_hc_dispatch {
 	int32_t (*handler)(struct acrn_vcpu *vcpu, struct acrn_vm *target_vm,
@@ -118,6 +121,10 @@ static const struct arm64_hc_dispatch arm64_hc_dispatch_table[] = {
 	[HC_IDX(HC_GET_HW_INFO)] = {
 		.handler = hcall_arm64_get_hw_info,
 	},
+	[HC_IDX(HC_VM_WDT_KICK)] = {
+		.handler = hcall_vm_wdt_kick,
+		.permission_flags = GUEST_FLAG_STATIC_VM,
+	},
 };
 
 static struct acrn_vm *arm64_hcall_target_vm(struct acrn_vm *vm, uint64_t hcall_id,
@@ -143,7 +150,7 @@ bool arm64_is_acrn_hypercall(uint64_t hcall_id)
 int32_t arm64_dispatch_hypercall(struct acrn_vcpu *vcpu)
 {
 	struct acrn_vm *vm = vcpu->vm;
-	uint64_t hcall_id = vcpu->arch.regs.x0;
+	uint64_t hcall_id = ACRN_HCALL_FUNC(vcpu->arch.regs.x0);
 	uint64_t param1 = vcpu->arch.regs.x1;
 	uint64_t param2 = vcpu->arch.regs.x2;
 	int32_t ret = -ENOTTY;

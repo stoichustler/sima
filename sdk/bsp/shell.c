@@ -828,6 +828,24 @@ void shell_kick(void)
 	}
 }
 
+bool shell_is_open(void)
+{
+	return shell_prompt_enabled && console_is_hv();
+}
+
+bool shell_async_puts(const char *string_ptr)
+{
+	if (!shell_is_open()) {
+		return false;
+	}
+
+	shell_puts("\r\n");
+	shell_puts(string_ptr);
+	shell_restore_input_line();
+
+	return true;
+}
+
 static void shell_thread_main(__unused struct thread_object *obj)
 {
 	while (true) {
