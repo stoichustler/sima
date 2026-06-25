@@ -553,6 +553,30 @@ void arm64_gicv3_set_irq_priority(uint32_t intid, uint8_t priority)
 	}
 }
 
+void arm64_gicv3_set_local_irq_active(uint16_t pcpu_id, uint32_t intid)
+{
+	struct beau_gic_v3_softc *sc = &gic_v3_sc;
+
+	if ((pcpu_id < MAX_PCPU_NUM) && (intid < GIC_FIRST_SPI) &&
+		(sc->gic_redist_bases[pcpu_id] != 0UL)) {
+		gic_r_write_4(sc, pcpu_id, GICR_SGI_BASE + GICD_ISACTIVER(intid),
+			gic_v3_intid_mask(intid));
+		cpu_memory_barrier();
+	}
+}
+
+void arm64_gicv3_clear_local_irq_active(uint16_t pcpu_id, uint32_t intid)
+{
+	struct beau_gic_v3_softc *sc = &gic_v3_sc;
+
+	if ((pcpu_id < MAX_PCPU_NUM) && (intid < GIC_FIRST_SPI) &&
+		(sc->gic_redist_bases[pcpu_id] != 0UL)) {
+		gic_r_write_4(sc, pcpu_id, GICR_SGI_BASE + GICD_ICACTIVER(intid),
+			gic_v3_intid_mask(intid));
+		cpu_memory_barrier();
+	}
+}
+
 bool arm64_gicv3_has_its(void)
 {
 	return beau_gicv3_its_present();

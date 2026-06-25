@@ -211,32 +211,18 @@ static bool vcpu_has_pending_guest_irq(struct acrn_vcpu *vcpu)
 
 static void prepare_current_guest_resume(struct acrn_vcpu *vcpu)
 {
-	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
 	bool lr_rescue = vcpu->arch.vtimer_lr_rescue;
-	bool masked_expired = gctx->cntv_el2_masked && arm64_vtimer_guest_expired(vcpu);
+	bool expired;
+
 	/*
-	 * This is a last-chance synchronization point, not a scheduler policy.
-	 * Linux can return from WFI with DAIF.I still masked after a pending-only
-	 * virtual timer LR woke the CPU. A host IRQ or scheduling decision may have
-	 * synced LRs meanwhile and left only the software vGIC timer state pending.
-	 * If EL2 returns without re-materializing that pending timer in a hardware
-	 * LR, the next guest idle path can sleep with timer softirq progress still
-	 * blocked. Restrict the extra flush to the timer-rescue/host-masked cases so
-	 * ordinary guest exits keep the existing lightweight return path.
+	 * Sample the live CNTV line before every ERET, update PPI27's level state,
+	 * and flush it into an LR if it is deliverable. This keeps CNTV/PPI27
+	 * deterministic and avoids relying on stale-LR rescue as the normal timer
+	 * delivery path.
 	 */
-	bool timer_needs_flush = lr_rescue || masked_expired;
-
-	if (!timer_needs_flush) {
-		if (gctx->cntv_el2_masked) {
-			arm64_vtimer_diag_mark_pre_eret(vcpu, false,
-				lr_rescue, masked_expired);
-		}
-		return;
-	}
-
-	refresh_current_vtimer(vcpu);
-	arm64_vgicv3_flush_current_vcpu_with_lock(vcpu);
-	arm64_vtimer_diag_mark_pre_eret(vcpu, true, lr_rescue, masked_expired);
+	arm64_vgicv3_update_current_vtimer(vcpu);
+	expired = arm64_vtimer_guest_expired(vcpu);
+	arm64_vtimer_diag_mark_pre_eret(vcpu, true, lr_rescue, expired);
 }
 
 static struct acrn_vcpu *schedule_without_guest_resume(uint16_t pcpu_id,
@@ -301,8 +287,7 @@ static void record_vcpu_resume(struct acrn_vcpu *vcpu, uint32_t source)
 	struct arm64_vcpu_guest_resume *last = &vcpu->arch.debug.last_resume;
 	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
 	struct arm64_gicv3_local_irq_state host_irq;
-	uint32_t virq = (gctx->timer_virq == 0U) ?
-		ARM64_GIC_PPI_VIRTUAL_TIMER : gctx->timer_virq;
+	uint32_t virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 	uint64_t host_now = read_cntpct_el0();
 	uint64_t host_cval = read_cntp_cval_el0();
 	uint64_t now = read_cntvct_el0();
@@ -809,14 +794,12 @@ static int32_t handle_wfx(struct acrn_vcpu *vcpu)
 	}
 
 	/*
-	 * This handler is non-default diagnostic plumbing because QEMU 3OS leaves
-	 * HCR_EL2.TWI/TWE clear. If a diagnostic mode enables the traps, keep the
-	 * behavior lightweight: WFE yields, and WFI yields only when no virtual event
-	 * is visible. A masked pending IRQ still has to return to EL1 so Linux can run
-	 * out of the idle path and unmask interrupts. The timer rescue path keeps TWI
-	 * armed while EL2 preserves a pending-only timer LR, so repeated WFI cannot
-	 * sleep behind the same masked virtual timer. Timer EOI or a line-low resample
-	 * clears both the rescue marker and TWI.
+	 * This handler is normally reached only when a diagnostic or rescue path
+	 * enables WFI/WFE trapping. Keep the behavior lightweight: WFE yields, and
+	 * WFI yields only when no virtual event is visible. A masked pending IRQ
+	 * still has to return to EL1 so Linux can run out of the idle path and
+	 * unmask interrupts. Timer rescue uses TWI as a one-shot wake assist, then
+	 * preserves a pending LR while letting EL1 reach the unmask/IAR path.
 	 */
 	if (should_yield) {
 		yield_current();

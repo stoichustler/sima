@@ -80,6 +80,8 @@ int32_t arm64_gicv3_its_alloc_msix(uint32_t dev_id, uint32_t vector,
 	uint32_t *lpi, struct arm64_gicv3_msi_msg *msg);
 void arm64_gicv3_its_release_msix(uint32_t dev_id, uint32_t lpi);
 int32_t arm64_gicv3_its_map_msi(uint32_t lpi, struct arm64_gicv3_msi_msg *msg);
+void arm64_gicv3_set_local_irq_active(uint16_t pcpu_id, uint32_t intid);
+void arm64_gicv3_clear_local_irq_active(uint16_t pcpu_id, uint32_t intid);
 void arm64_gicv3_get_local_irq_state(uint16_t pcpu_id, uint32_t intid,
 	struct arm64_gicv3_local_irq_state *state);
 void arm64_gicv3_send_sgi(uint16_t pcpu_id, uint32_t sgi_id);

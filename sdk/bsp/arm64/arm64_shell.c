@@ -429,6 +429,11 @@ static void shell_dumpstat_guest_resume(const struct arm64_vcpu_guest_resume *la
 			shell_yes_no(last->timer_pending),
 			shell_yes_no(last->timer_active),
 			shell_yes_no(last->timer_level));
+		shell_item_line("            host27 valid:%s en:%s pend:%s act:%s",
+			shell_yes_no(last->host_valid),
+			shell_yes_no(last->host_enabled),
+			shell_yes_no(last->host_pending),
+			shell_yes_no(last->host_active));
 		shell_item_line("            lr0:0x%016lx lr1:0x%016lx live_lr0:0x%016lx live_lr1:0x%016lx",
 			last->sw_lr0, last->sw_lr1, last->live_lr0, last->live_lr1);
 	}
@@ -666,7 +671,7 @@ struct dumpstat_snapshot {
 	uint64_t irqs_pending_mask;
 	uint32_t live_cntv_ctl_el0;
 	uint8_t vtimer_lr_rescue_budget;
-	bool vtimer_stuck_rescue_armed;
+	bool cntv_timer_rescue_armed;
 	bool vtimer_wfi_rescue;
 	bool vtimer_lr_rescue;
 	bool has_timer_irq;
@@ -690,8 +695,8 @@ static void shell_dumpstat_capture(void *data)
 		snapshot->pending_req = snapshot->vcpu->pending_req;
 		snapshot->irqs_pending = snapshot->vcpu->arch.irqs_pending;
 		snapshot->irqs_pending_mask = snapshot->vcpu->arch.irqs_pending_mask;
-		snapshot->vtimer_stuck_rescue_armed =
-			snapshot->vcpu->arch.vtimer_stuck_rescue_armed;
+		snapshot->cntv_timer_rescue_armed =
+			snapshot->vcpu->arch.cntv_timer_rescue_armed;
 		snapshot->vtimer_wfi_rescue = snapshot->vcpu->arch.vtimer_wfi_rescue;
 		snapshot->vtimer_lr_rescue = snapshot->vcpu->arch.vtimer_lr_rescue;
 		snapshot->vtimer_lr_rescue_budget =
@@ -748,7 +753,7 @@ static const struct cpu_regs *shell_dumpstat_get_regs(struct acrn_vcpu *vcpu,
 	snapshot->pending_req = vcpu->pending_req;
 	snapshot->irqs_pending = vcpu->arch.irqs_pending;
 	snapshot->irqs_pending_mask = vcpu->arch.irqs_pending_mask;
-	snapshot->vtimer_stuck_rescue_armed = vcpu->arch.vtimer_stuck_rescue_armed;
+	snapshot->cntv_timer_rescue_armed = vcpu->arch.cntv_timer_rescue_armed;
 	snapshot->vtimer_wfi_rescue = vcpu->arch.vtimer_wfi_rescue;
 	snapshot->vtimer_lr_rescue = vcpu->arch.vtimer_lr_rescue;
 	snapshot->vtimer_lr_rescue_budget = vcpu->arch.vtimer_lr_rescue_budget;
@@ -804,8 +809,8 @@ static void shell_dumpstat_timer_state(const struct dumpstat_snapshot *snapshot)
 	shell_item_line("       cntv_ctl:0x%08x cntv_cval:0x%016lx el2_masked:%s",
 		gctx->cntv_ctl_el0, gctx->cntv_cval_el0,
 		shell_yes_no(gctx->cntv_el2_masked));
-	shell_item_line("       rescue:stuck:%s wfi:%s lr:%s budget:%u",
-		shell_yes_no(snapshot->vtimer_stuck_rescue_armed),
+	shell_item_line("       rescue:cntv:%s wfi:%s lr:%s budget:%u",
+		shell_yes_no(snapshot->cntv_timer_rescue_armed),
 		shell_yes_no(snapshot->vtimer_wfi_rescue),
 		shell_yes_no(snapshot->vtimer_lr_rescue),
 		snapshot->vtimer_lr_rescue_budget);
@@ -894,19 +899,14 @@ static void shell_dumpstat_vtimer_diag(const struct arm64_vcpu_vtimer_diag *diag
 	shell_item_line("pending-only-lr:seen:%lu preserve:%lu drop:%lu lost-no-eoi:%lu",
 		diag->pending_only_lr_seen, diag->pending_only_lr_preserve,
 		diag->pending_only_lr_drop, diag->lost_pending_lr);
-	shell_item_line("el2-mask:set:%lu clear:%lu requeue:%lu max-age.us:%lu active:%s",
+	shell_item_line("el2-mask:set:%lu clear:%lu max-age.us:%lu active:%s",
 		diag->el2_mask_set, diag->el2_mask_clear,
-		diag->masked_timer_requeue, ticks_to_us(mask_ticks),
+		ticks_to_us(mask_ticks),
 		shell_yes_no(diag->el2_mask_since_ticks != 0UL));
-	shell_item_line("stale-lr:seen:%lu unmask:%lu drop:%lu handoff:%lu skip:%lu reinject:%lu max-age.us:%lu",
-		diag->stale_pending_lr, diag->stale_pending_lr_mask_release,
-		diag->stale_pending_lr_drop, diag->stale_pending_lr_handoff,
-		diag->stale_pending_lr_skip_flush, diag->stale_pending_lr_reinject,
-		ticks_to_us(diag->stale_pending_lr_max_age_ticks));
-	shell_item_line("pre-eret-flush:run:%lu masked-skip:%lu lr-rescue:%lu masked-expired:%lu budget-exhaust:%lu",
-		diag->pre_eret_flush, diag->pre_eret_flush_skip,
+	shell_item_line("pre-eret-flush:run:%lu lr-rescue:%lu expired:%lu budget-exhaust:%lu",
+		diag->pre_eret_flush,
 		diag->pre_eret_flush_lr_rescue,
-		diag->pre_eret_flush_masked_expired,
+		diag->pre_eret_flush_expired,
 		diag->lr_rescue_budget_exhaust);
 }
 
@@ -1314,7 +1314,7 @@ static void shell_vmstat_vcpu_diag(const struct acrn_vcpu *vcpu,
 	 *   current RTDS period should have rolled", which is a stronger signal that
 	 *   the shared core is behind schedule.
 	 *
-	 * vtimer-rescue:
+	 * cntv-rescue:
 	 *   The ARM64 virtual timer stuck or WFI rescue path is active. Linux relies
 	 *   on virtual timer interrupts for scheduler ticks, timeouts and RCU
 	 *   progress; if the rescue path is active, the guest can look idle or frozen
@@ -1336,8 +1336,8 @@ static void shell_vmstat_vcpu_diag(const struct acrn_vcpu *vcpu,
 	if (has_rtds && cpu_wait && (rtds->deadline_ticks <= now)) {
 		shell_vmstat_append_flag(flags, flags_len, "rtds-overrun");
 	}
-	if (vcpu->arch.vtimer_stuck_rescue_armed || vcpu->arch.vtimer_wfi_rescue) {
-		shell_vmstat_append_flag(flags, flags_len, "vtimer-rescue");
+	if (vcpu->arch.cntv_timer_rescue_armed || vcpu->arch.vtimer_wfi_rescue) {
+		shell_vmstat_append_flag(flags, flags_len, "cntv-rescue");
 	}
 
 	if (flags[0] == '\0') {
@@ -1399,10 +1399,10 @@ static void shell_vmstat_vcpus(const struct acrn_vm *vm)
 				(rtds.deadline_ticks > now) ?
 					ticks_to_us(rtds.deadline_ticks - now) : 0UL);
 		}
-		shell_item_line("      timer:virq:%u cntv_ctl:0x%08x cntv_cval:0x%016lx rescue:stuck:%s wfi:%s lr:%s",
+		shell_item_line("      timer:virq:%u cntv_ctl:0x%08x cntv_cval:0x%016lx rescue:cntv:%s wfi:%s lr:%s",
 			vcpu->arch.gctx.timer_virq, vcpu->arch.gctx.cntv_ctl_el0,
 			vcpu->arch.gctx.cntv_cval_el0,
-			shell_yes_no(vcpu->arch.vtimer_stuck_rescue_armed),
+			shell_yes_no(vcpu->arch.cntv_timer_rescue_armed),
 			shell_yes_no(vcpu->arch.vtimer_wfi_rescue),
 			shell_yes_no(vcpu->arch.vtimer_lr_rescue));
 		shell_item_line("      cpuif:used-lrs:%u hcr:0x%016lx vmcr:0x%016lx pmr:0x%016lx",

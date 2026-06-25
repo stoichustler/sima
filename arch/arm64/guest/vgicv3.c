@@ -49,6 +49,8 @@
 #include <asm/trap.h>
 #include <asm/guest/vgicv3.h>
 
+#include "vgicv3_its.h"
+
 /*
  * vGICv3 virtualization principle:
  *
@@ -103,11 +105,14 @@
  *
  * vtimer virtualization flow:
  *
- *   guest CNTP/CNTV sysreg write or live CNTV PPI
- *        -> vCPU timer shadow + live CNTV sample
- *        -> virtual timer IRQ descriptor and pending bitmap
+ *   guest CNTV sysreg write or live CNTV PPI
+ *        -> CNTV shadow + live CNTV sample
+ *        -> PPI27 descriptor and pending bitmap
  *        -> LR delivery to EL1
  *        -> guest reprogram/EOI lowers or completes the level source
+ *
+ * Guest CNTP is software-emulated in vtimer.c and injects PPI30 as an ordinary
+ * level IRQ. It does not use the CNTV-specific host-mask/LR rescue paths below.
  *
  * Linux SMP boot depends on a precise edge-SGI lifecycle. A representative
  * failure was VM2 reaching the PL011 console and then stalling with CPU0 in
@@ -144,19 +149,6 @@
  * WFI but before first timer delivery.
  */
 #define BIT32(n)			(1U << (n))
-
-/*
- * A pending-only virtual timer LR is a valid transient state: it can wake Linux
- * from WFI before EL1 unmasks interrupts and acknowledges PPI27. It must not
- * become a permanent owner of the timer source, though. If host PPI27 remains
- * priority-masked for much longer than a normal Linux timer interrupt handling
- * window, clear the stale vGIC/LR owner and hand ownership back to host CNTV
- * PPI delivery. The next real PPI or guest timer write rebuilds guest-visible
- * injection through the ordinary path. The value is intentionally conservative:
- * the failure mode lasts for seconds, while healthy WFI-to-IRQ handoff should
- * complete well below 50ms.
- */
-#define VTIMER_PENDING_LR_STALL_US	50000U
 
 #define VGICD_CTLR			0x0000U
 #define VGICD_TYPER			0x0004U
@@ -221,59 +213,13 @@
 #define GIC_IROUTER_AFF3_SHIFT		32U
 #define GIC_IROUTER_AFF_MASK		0xffUL
 #define GIC_IROUTER_LOW_MASK		0xffffffffUL
+#define GIC_PRIORITY_LOCAL		0x00U
 #define GIC_PRIORITY_DEFAULT		0x80U
 #define GIC_PRIORITY_LOWEST		0xffU
 #define GIC_PIDR2_ARCH_GICV3		(3U << 4U)
 #define VGIC_ICFGR_IRQS_PER_REG	16U
 #define VGIC_INVALID_VCPU_ID		0xffffU
 #define VGIC_INVALID_AFFINITY		0xffUL
-
-#define GITS_CTLR			0x0000U
-#define GITS_IIDR			0x0004U
-#define GITS_TYPER			0x0008U
-#define GITS_MPIDR			0x0018U
-#define GITS_CBASER			0x0080U
-#define GITS_CWRITER			0x0088U
-#define GITS_CREADR			0x0090U
-#define GITS_BASER			0x0100U
-#define GITS_TRANSLATER		0x10040U
-#define GITS_PIDR2			0xFFE8U
-#define GITS_CIDR0			0xFFF0U
-#define GITS_CIDR1			0xFFF4U
-#define GITS_CIDR2			0xFFF8U
-#define GITS_CIDR3			0xFFFCU
-
-#define GITS_CTLR_ENABLE		BIT32(0U)
-#define GITS_CTLR_QUIESCENT		BIT32(31U)
-#define GITS_CBASER_VALID		(1UL << 63U)
-#define GITS_CBASER_ADDRESS_MASK	0x0000fffffffff000UL
-#define GITS_CBASER_SIZE_MASK		0xffUL
-#define GITS_BASER_VALID		(1UL << 63U)
-#define GITS_CMD_ITT_ADDRESS_MASK	0x000fffffffffff00UL
-#define GITS_BASER_TYPE_SHIFT		56U
-#define GITS_BASER_ENTRY_SIZE_SHIFT	48U
-#define GITS_BASER_TYPE_DEVICE	1U
-#define GITS_BASER_TYPE_COLLECTION	4U
-#define GITS_TYPER_PLPIS		(1UL << 0U)
-#define GITS_TYPER_ITT_ENTRY_SIZE_SHIFT	4U
-#define GITS_TYPER_IDBITS_SHIFT	8U
-#define GITS_TYPER_DEVBITS_SHIFT	13U
-#define GITS_CMD_SIZE			32U
-#define GITS_CMD_MAPD			0x08U
-#define GITS_CMD_MAPC			0x09U
-#define GITS_CMD_MAPTI			0x0aU
-#define GITS_CMD_MAPI			0x0bU
-#define GITS_CMD_MOVI			0x01U
-#define GITS_CMD_INT			0x03U
-#define GITS_CMD_CLEAR			0x04U
-#define GITS_CMD_SYNC			0x05U
-#define GITS_CMD_INV			0x0cU
-#define GITS_CMD_INVALL		0x0dU
-#define GITS_CMD_MOVALL		0x0eU
-#define GITS_CMD_DISCARD		0x0fU
-#define GITS_DEVBITS			15U
-#define GITS_ITT_ENTRY_SIZE		16U
-#define GITS_CMD_QUEUE_BUDGET		1024U
 
 static uint32_t vgic_lr_count;
 static bool vgic_global_initialized;
@@ -283,10 +229,6 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current);
 static bool vgicv3_timer_live_stuck_locked(struct acrn_vcpu *vcpu);
 static int32_t vgic_inject_locked(struct arm64_vgicv3 *vgic,
 	struct acrn_vcpu *target_vcpu, uint32_t virq, bool level);
-static struct arm64_vits_event *vits_find_event(struct arm64_vits *its,
-	uint32_t device_id, uint32_t event_id);
-static void vits_inject_event_locked(struct acrn_vm *vm, struct arm64_vgicv3 *vgic,
-	struct arm64_vits_event *event);
 static uint32_t vgic_lpi_index(uint32_t lpi);
 static bool vgic_irq_is_lpi(uint32_t virq);
 
@@ -407,51 +349,20 @@ static void vgic_set_pending(struct arm64_vgicv3 *vgic, uint16_t vcpu_id,
 	}
 }
 
-static bool vgic_is_vtimer_irq(const struct acrn_vcpu *vcpu, uint32_t virq)
+void arm64_vgicv3_set_pending_locked(struct arm64_vgicv3 *vgic,
+	uint16_t vcpu_id, struct arm64_vgic_irq *desc, bool pending)
 {
-	uint32_t timer_virq = (vcpu->arch.gctx.timer_virq == 0U) ?
-		ARM64_GIC_PPI_VIRTUAL_TIMER : vcpu->arch.gctx.timer_virq;
-
-	return virq == timer_virq;
+	vgic_set_pending(vgic, vcpu_id, desc, pending);
 }
 
-static uint64_t vgic_its_baser_type(uint32_t type, uint32_t entry_size)
+static bool vgic_is_vtimer_irq(__unused const struct acrn_vcpu *vcpu, uint32_t virq)
 {
-	return ((uint64_t)type << GITS_BASER_TYPE_SHIFT) |
-		((uint64_t)(entry_size - 1U) << GITS_BASER_ENTRY_SIZE_SHIFT);
-}
-
-static bool vits_offset_aligned(uint64_t offset)
-{
-	return (offset & (GITS_CMD_SIZE - 1UL)) == 0UL;
-}
-
-static void vgic_its_init(struct arm64_vgicv3 *vgic)
-{
-	struct arm64_vits *its = &vgic->its;
-	uint32_t idx;
-
-	(void)memset(its, 0U, sizeof(*its));
 	/*
-	 * Advertise a conservative ITS: physical LPIs only, 14-bit INTID space
-	 * starting at 8192, 16-bit device IDs, and 16-byte ITT entries. vGICv4
-	 * VLPIs are deliberately not exposed in this first model. The software
-	 * vITS stores only a small active event window; it does not preallocate
-	 * descriptors for the whole advertised LPI space.
+	 * Only PPI27 is backed by the live CNTV comparator and participates in
+	 * CNTV-specific host-mask/LR rescue. Guest CNTP/PPI30 is now a separate
+	 * software-emulated level interrupt and must follow the normal vGIC path.
 	 */
-	its->ctlr = GITS_CTLR_QUIESCENT;
-	its->typer = GITS_TYPER_PLPIS |
-		((uint64_t)(GITS_ITT_ENTRY_SIZE - 1U) << GITS_TYPER_ITT_ENTRY_SIZE_SHIFT) |
-		((uint64_t)(ARM64_VGIC_LPI_IDBITS - 1U) << GITS_TYPER_IDBITS_SHIFT) |
-		((uint64_t)(GITS_DEVBITS - 1U) << GITS_TYPER_DEVBITS_SHIFT);
-	its->baser[0U] = vgic_its_baser_type(GITS_BASER_TYPE_DEVICE, 8U);
-	its->baser[1U] = vgic_its_baser_type(GITS_BASER_TYPE_COLLECTION, 8U);
-
-	for (idx = 0U; idx < ARM64_VGIC_ITS_COLLECTION_NUM; idx++) {
-		its->collection[idx].collection_id = (uint16_t)idx;
-		its->collection[idx].target_vcpu = (uint16_t)idx;
-		its->collection[idx].valid = (idx < vgic->vcpu_count);
-	}
+	return virq == ARM64_GIC_PPI_VIRTUAL_TIMER;
 }
 
 static struct acrn_vcpu *vgic_irq_target_vcpu(struct acrn_vcpu *vcpu,
@@ -487,7 +398,8 @@ static uint64_t make_lr_state(const struct arm64_vgic_irq *desc, bool pending, b
 		state = pending ? ICH_LR_STATE_PENDING : ICH_LR_STATE_INVALID;
 	}
 
-	lr |= ((uint64_t)desc->priority << ICH_LR_PRIORITY_SHIFT);
+	lr |= ((uint64_t)((desc->virq < ARM64_VGIC_LOCAL_IRQ_NUM) ?
+		GIC_PRIORITY_LOCAL : desc->priority) << ICH_LR_PRIORITY_SHIFT);
 	lr |= state << ICH_LR_STATE_SHIFT;
 	lr |= ICH_LR_GROUP1;
 
@@ -559,6 +471,39 @@ static uint32_t lr_state(uint64_t lr)
 	return (uint32_t)((lr >> ICH_LR_STATE_SHIFT) & 0x3UL);
 }
 
+static uint32_t lr_pintid(uint64_t lr)
+{
+	return (uint32_t)((lr >> ICH_LR_PINTID_SHIFT) & 0x3ffUL);
+}
+
+static bool vgicv3_lr_is_hw_cntv_timer(uint64_t lr)
+{
+	return (lr_state(lr) != ICH_LR_STATE_INVALID) &&
+		((lr & ICH_LR_HW) != 0UL) &&
+		(lr_vintid(lr) == ARM64_GIC_PPI_VIRTUAL_TIMER) &&
+		(lr_pintid(lr) == ARM64_GIC_PPI_VIRTUAL_TIMER);
+}
+
+static void vgicv3_mark_local_cntv_timer_active(const struct arm64_vgicv3_vcpu_ctx *ctx)
+{
+	uint32_t idx;
+
+	/*
+	 * A hardware LR binds guest PPI27 to the physical PPI27. The physical
+	 * redistributor active bit is part of that handoff: without it the LR can
+	 * be visible in ICH_LR<n> but never become an interrupt that EL1 can
+	 * acknowledge and later deactivate. Set it immediately before publishing
+	 * the LR state to the local virtual CPU interface.
+	 */
+	for (idx = 0U; idx < ctx->used_lrs; idx++) {
+		if (vgicv3_lr_is_hw_cntv_timer(ctx->lr[idx])) {
+			arm64_gicv3_set_local_irq_active(get_pcpu_id(),
+				ARM64_GIC_PPI_VIRTUAL_TIMER);
+			break;
+		}
+	}
+}
+
 static int32_t find_lr_for_virq(const struct acrn_vcpu *vcpu, uint32_t virq)
 {
 	uint32_t idx;
@@ -597,13 +542,13 @@ static bool vgicv3_timer_live_stuck_locked(struct acrn_vcpu *vcpu)
 		return false;
 	}
 
-	virq = (gctx->timer_virq == 0U) ? ARM64_GIC_PPI_VIRTUAL_TIMER : gctx->timer_virq;
+	virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 	desc = vgic_irq_desc(vcpu, virq);
 
 	/*
 	 * Once LR rescue owns a pending-only timer LR, the virtual interrupt is
-	 * already materialized for EL1. Re-arming TWI from the backup timer only
-	 * traps the Linux idle loop again before it can naturally reach daifclr.
+	 * already materialized for EL1. Re-arming TWI only traps the idle loop
+	 * again before it can naturally reach interrupt unmask and IAR.
 	 */
 	return (desc != NULL) && desc->level && desc->pending && !desc->active &&
 		!vcpu->arch.vtimer_lr_rescue && vgicv3_vtimer_pending_only_lr(vcpu, virq);
@@ -643,89 +588,6 @@ static void remove_lr(struct acrn_vcpu *vcpu, uint32_t idx)
 	}
 }
 
-static bool vgicv3_vtimer_pending_lr_stalled(struct acrn_vcpu *vcpu,
-	const struct arm64_vgic_irq *desc, uint32_t state, bool line_asserted,
-	uint64_t *age_ticks)
-{
-	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
-	const struct arm64_vcpu_vtimer_diag *diag = &vcpu->arch.debug.vtimer_diag;
-	uint64_t age = 0UL;
-	bool stalled;
-
-	if (diag->el2_mask_since_ticks != 0UL) {
-		uint64_t now = cpu_ticks();
-
-		age = (now > diag->el2_mask_since_ticks) ?
-			(now - diag->el2_mask_since_ticks) : 0UL;
-	}
-
-	if (age_ticks != NULL) {
-		*age_ticks = age;
-	}
-
-	/*
-	 * A stalled timer has all owners pointing at the same due line:
-	 * EL2 host mask is set, CNTV is still asserted, and the LR is pending-only
-	 * for longer than a healthy WFI-to-IAR window.
-	 */
-	stalled = gctx->cntv_el2_masked && desc->level && desc->pending &&
-		!desc->active && line_asserted &&
-		((state & ICH_LR_STATE_PENDING) != 0U) &&
-		((state & ICH_LR_STATE_ACTIVE) == 0U) &&
-		(age >= us_to_ticks(VTIMER_PENDING_LR_STALL_US));
-
-	return stalled;
-}
-
-static void vgicv3_release_stale_vtimer_lr(struct acrn_vcpu *vcpu,
-	struct arm64_vgicv3 *vgic, struct arm64_vgic_irq *desc, uint32_t lr_idx,
-	uint64_t age_ticks)
-{
-	struct arm64_vcpu_vtimer_diag *diag = &vcpu->arch.debug.vtimer_diag;
-
-	/*
-	 * This is an ownership handoff, not an interrupt loss. The stale state means
-	 * vGIC/LR delivery has failed to produce guest acknowledgement for too long.
-	 * Clear only the stale vGIC owner, unmask the host virtual timer PPI, and
-	 * let the next real CNTV PPI rebuild the guest interrupt through the normal
-	 * injection path. Keeping desc->pending set here would let the same flush
-	 * path immediately recreate the stale pending-only LR.
-	 */
-	diag->stale_pending_lr++;
-	diag->stale_pending_lr_mask_release++;
-	diag->stale_pending_lr_drop++;
-	diag->stale_pending_lr_handoff++;
-	if (age_ticks > diag->stale_pending_lr_max_age_ticks) {
-		diag->stale_pending_lr_max_age_ticks = age_ticks;
-	}
-	vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
-	desc->active = false;
-	vcpu->arch.vtimer_host_handoff = true;
-	arm64_vgicv3_clear_vtimer_rescue(vcpu);
-	arm64_vtimer_set_host_mask(vcpu, false);
-	remove_lr(vcpu, lr_idx);
-	arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_STALL,
-		vcpu->arch.gctx.timer_virq, UINT32_MAX, UINT64_MAX, false, false);
-}
-
-static bool vgicv3_skip_vtimer_host_handoff_flush(struct acrn_vcpu *vcpu,
-	const struct arm64_vgic_irq *desc)
-{
-	bool skip = vcpu->arch.vtimer_host_handoff &&
-		vgic_is_vtimer_irq(vcpu, desc->virq) && desc->level;
-
-	if (skip) {
-		/*
-		 * While host handoff is active, the host CNTV PPI owns rediscovery of
-		 * the expired timer. Re-flushing from a leftover software pending bit
-		 * would recreate the same pending-only LR without a fresh hardware event.
-		 */
-		vcpu->arch.debug.vtimer_diag.stale_pending_lr_skip_flush++;
-	}
-
-	return skip;
-}
-
 static void vgic_update_irq_lr(struct acrn_vcpu *vcpu, const struct arm64_vgic_irq *desc)
 {
 	int32_t lr_idx = find_lr_for_virq(vcpu, desc->virq);
@@ -758,6 +620,12 @@ static void vgic_update_irq_row_lr(struct acrn_vm *vm, uint16_t vcpu_id,
 			vgic_update_irq_lr(target_vcpu, desc);
 		}
 	}
+}
+
+void arm64_vgicv3_update_irq_row_lr_locked(struct acrn_vm *vm,
+	uint16_t vcpu_id, const struct arm64_vgic_irq *desc)
+{
+	vgic_update_irq_row_lr(vm, vcpu_id, desc);
 }
 
 static uint16_t vgic_valid_target_vcpu(const struct arm64_vgicv3 *vgic, uint16_t target_vcpu_id)
@@ -822,9 +690,11 @@ static uint64_t vgicv3_control_hcr(uint64_t hcr)
 
 static void vgicv3_write_cpuif(const struct arm64_vgicv3_vcpu_ctx *ctx)
 {
+	write_icc_pmr_el1(ctx->pmr);
 	write_ich_vmcr_el2(ctx->vmcr);
 	write_ich_ap0r0_el2(ctx->ap0r0);
 	write_ich_ap1r0_el2(ctx->ap1r0);
+	vgicv3_mark_local_cntv_timer_active(ctx);
 	vgicv3_write_lrs(ctx);
 	write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
 }
@@ -836,6 +706,7 @@ static void vgicv3_write_lrs_hcr(const struct arm64_vgicv3_vcpu_ctx *ctx)
 	 * controls. VMCR/AP are guest CPU-interface state; replaying old snapshots
 	 * while the vCPU is running can resurrect stale active-priority state.
 	 */
+	vgicv3_mark_local_cntv_timer_active(ctx);
 	vgicv3_write_lrs(ctx);
 	write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
 }
@@ -848,6 +719,7 @@ static void vgicv3_write_cpuif_control(const struct arm64_vgicv3_vcpu_ctx *ctx)
 	 * state, which is owned by the hardware interrupt acknowledge/EOI path.
 	 */
 	write_icc_sre_el1(ctx->sre | ICC_SRE_SRE);
+	write_icc_pmr_el1(ctx->pmr);
 	write_ich_vmcr_el2(ctx->vmcr);
 }
 
@@ -1134,6 +1006,16 @@ void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity)
 			desc->level = (virq >= ARM64_VGIC_SGI_NUM);
 			desc->group1 = true;
 			desc->groupmod = false;
+			if (virq == ARM64_GIC_PPI_VIRTUAL_TIMER) {
+				/*
+				 * CNTV/PPI27 has a real per-CPU physical source. Using a
+				 * hardware-backed LR lets the GIC CPU interface track the
+				 * acknowledge/EOI side of the timer line instead of treating
+				 * it as a pure software level IRQ.
+				 */
+				desc->pirq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+				desc->hw = true;
+			}
 		}
 		for (virq = 0U; virq < ARM64_VGIC_LPI_NUM; virq++) {
 			struct arm64_vgic_irq *desc = &vgic->lpi[idx][virq];
@@ -1154,7 +1036,7 @@ void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity)
 	}
 
 	if (vgic->its_enabled) {
-		vgic_its_init(vgic);
+		arm64_vgicv3_its_init(vgic);
 	}
 	vgic->initialized = true;
 }
@@ -1342,7 +1224,7 @@ void arm64_vgicv3_reset_vcpu_boot_state(struct acrn_vcpu *vcpu)
 		return;
 	}
 
-	arm64_vgicv3_cancel_vtimer_backup(vcpu);
+	arm64_vgicv3_cancel_cntv_timer(vcpu);
 	arm64_vgicv3_reset_vcpu(vcpu);
 	vgic = &vcpu->vm->arch_vm.vgic;
 	if (!vgic->initialized || (vcpu->vcpu_id >= ARM64_VGIC_MAX_VCPUS)) {
@@ -1432,69 +1314,15 @@ static bool vgicv3_complete_timer_lr(struct acrn_vcpu *vcpu,
 	return true;
 }
 
-bool arm64_vgicv3_requeue_lost_masked_timer(struct acrn_vcpu *vcpu)
-{
-	struct arm64_vgicv3 *vgic;
-	struct arm64_vgic_irq *desc;
-	uint64_t flags;
-	uint32_t virq;
-	bool requeued = false;
-
-	if ((vcpu == NULL) || (vcpu->vm == NULL) || !vcpu->vm->arch_vm.vgic.initialized) {
-		return false;
-	}
-	if (!vcpu->arch.gctx.cntv_el2_masked) {
-		return false;
-	}
-
-	/*
-	 * Repair path:
-	 *
-	 *   host-masked expired CNTV + no descriptor/LR owner
-	 *        -> recreate software pending timer line -> flush into LR
-	 */
-	vgic = &vcpu->vm->arch_vm.vgic;
-	virq = vcpu->arch.gctx.timer_virq;
-	if (virq == 0U) {
-		virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
-		vcpu->arch.gctx.timer_virq = virq;
-	}
-
-	spinlock_irqsave_obtain(&vgic->lock, &flags);
-	vgicv3_sync_vcpu(vcpu, true);
-	desc = vgic_irq_desc(vcpu, virq);
-	if ((desc != NULL) && !desc->pending && !desc->active &&
-		(find_lr_for_virq(vcpu, virq) < 0) && arm64_vtimer_sample_current(vcpu)) {
-		/*
-		 * EL2 may have masked live CNTV while a timer LR was in flight, then later
-		 * observe no LR/descriptor owner after hardware consumed the pending-only
-		 * entry. Requeue from the live CNTV level so the next flush has a normal
-		 * virtual interrupt to present.
-		 */
-		vgic_set_pending(vgic, vcpu->vcpu_id, desc, true);
-		vgicv3_flush_vcpu(vcpu, true);
-		vcpu->arch.debug.vtimer_diag.masked_timer_requeue++;
-		arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_REQUEUE, virq,
-			UINT32_MAX, UINT64_MAX, false, false);
-		requeued = true;
-	}
-	spinlock_irqrestore_release(&vgic->lock, flags);
-
-	return requeued;
-}
-
 static void vgicv3_sync_timer_line_locked(struct acrn_vcpu *vcpu, bool is_current,
 	bool line_asserted)
 {
 	struct arm64_vgicv3 *vgic = &vcpu->vm->arch_vm.vgic;
 	struct arm64_vgic_irq *desc;
-	uint32_t virq = vcpu->arch.gctx.timer_virq;
+	uint32_t virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 	int32_t lr_idx;
 
-	if (virq == 0U) {
-		virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
-		vcpu->arch.gctx.timer_virq = virq;
-	}
+	vcpu->arch.gctx.timer_virq = virq;
 
 	desc = vgic_irq_desc(vcpu, virq);
 	if (desc == NULL) {
@@ -1504,7 +1332,7 @@ static void vgicv3_sync_timer_line_locked(struct acrn_vcpu *vcpu, bool is_curren
 	/*
 	 * Timer line sync bridges vtimer and vGIC ownership:
 	 *
-	 *   CNTV sample -> descriptor pending bit -> timer LR -> host PPI27 mask
+	 *   CNTV sample -> descriptor pending bit -> timer LR -> live CNTV mask
 	 *
 	 * The timer interrupt is a level line whose source is CNTV while loaded
 	 * and the saved CNTV deadline while offline. Lowering the line must remove
@@ -1528,15 +1356,21 @@ static void vgicv3_sync_timer_line_locked(struct acrn_vcpu *vcpu, bool is_curren
 			remove_lr(vcpu, (uint32_t)lr_idx);
 		}
 	}
-	arm64_vtimer_set_host_mask(vcpu, line_asserted || desc->active);
+	/*
+	 * CNTV_CTL.IMASK suppresses the hardware comparator itself. Keep it tied
+	 * only to the sampled CNTV level: after the guest programs a future
+	 * deadline the line is low, and the next PPI27 must be allowed to fire
+	 * even if the previous virtual interrupt is still active until EOI/DIR.
+	 */
+	arm64_vtimer_set_host_mask(vcpu, line_asserted);
 	if (!line_asserted) {
 		if (is_current || vgicv3_vcpu_is_loaded(vcpu)) {
-			arm64_vgicv3_cancel_vtimer_backup(vcpu);
+			arm64_vgicv3_cancel_cntv_timer(vcpu);
 		} else {
-			arm64_vgicv3_arm_vtimer_backup(vcpu);
+			arm64_vgicv3_arm_cntv_timer(vcpu);
 		}
 	} else {
-		arm64_vgicv3_cancel_vtimer_backup(vcpu);
+		arm64_vgicv3_cancel_cntv_timer(vcpu);
 	}
 	vgicv3_flush_vcpu(vcpu, is_current);
 }
@@ -1647,16 +1481,6 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				if (timer_line_asserted) {
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_preserve++;
 					arm64_vgicv3_keep_vtimer_rescue(vcpu);
-					if ((vcpu->arch.regs.spsr & DAIF_IRQ) != 0UL) {
-						/*
-						 * The LR disappeared without EOI while CNTV is still
-						 * due. QEMU can consume a pending-only vtimer LR as
-						 * the next WFI wake before Linux reaches daifclr; trap
-						 * one more WFI so EL2 can re-flush the LR after WFI
-						 * retires instead of letting WFI consume it again.
-						 */
-						arm64_vtimer_arm_wfi_rescue(vcpu);
-					}
 				} else {
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_drop++;
 					arm64_vgicv3_clear_vtimer_rescue(vcpu);
@@ -1723,8 +1547,6 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 			if (loaded && desc->level && vgic_is_vtimer_irq(vcpu, virq) &&
 				lr_pending && !lr_active) {
 				bool line_asserted = arm64_vtimer_sample_current(vcpu);
-				uint64_t stall_age_ticks = 0UL;
-				bool stale_released = false;
 
 				/*
 				 * QEMU can consume a pending-only timer LR as a WFI wake event
@@ -1732,11 +1554,6 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				 * software level line asserted while CNTV is still due; otherwise
 				 * EL2 can be left with a host-masked expired CNTV source and no
 				 * descriptor state from which to rebuild delivery.
-				 *
-				 * The counters distinguish a healthy preservation loop from a
-				 * real drop: seen counts the hardware pattern, preserve means CNTV
-				 * still required delivery, and drop means the live timer was no
-				 * longer due so the pending-only LR could be retired.
 				 */
 				vcpu->arch.debug.vtimer_diag.pending_only_lr_seen++;
 				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id,
@@ -1746,21 +1563,14 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 					arm64_vtimer_set_host_mask(vcpu, false);
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_drop++;
 					remove_lr(vcpu, idx);
-				} else if (vgicv3_vtimer_pending_lr_stalled(vcpu, desc, state,
-					line_asserted, &stall_age_ticks)) {
-					vgicv3_release_stale_vtimer_lr(vcpu, &vcpu->vm->arch_vm.vgic,
-						desc, idx, stall_age_ticks);
-					stale_released = true;
 				} else {
 					arm64_vtimer_set_host_mask(vcpu, true);
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_preserve++;
 					idx++;
 				}
-				if (!stale_released) {
-					arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_PENDING_LR,
-						virq, UINT32_MAX, UINT64_MAX, false,
-						line_asserted);
-				}
+				arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_PENDING_LR,
+					virq, UINT32_MAX, UINT64_MAX, false,
+					line_asserted);
 				continue;
 			}
 
@@ -2018,10 +1828,6 @@ bool arm64_vgicv3_pending_irq_blocks_reschedule(struct acrn_vcpu *vcpu)
 			struct arm64_vgic_irq *desc = &vgic->irq[vcpu->vcpu_id][virq];
 
 			bits &= ~BIT32(bit);
-			if (vgicv3_skip_vtimer_host_handoff_flush(vcpu, desc)) {
-				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
-				continue;
-			}
 			if (desc->pending && vgic_irq_deliverable(vgic, vcpu, desc) &&
 				(!desc->level || (find_lr_for_virq(vcpu, virq) < 0)) &&
 				vgicv3_pending_vtimer_rescue_blocks_reschedule(vcpu, virq)) {
@@ -2083,10 +1889,6 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 
 			bits &= ~BIT32(bit);
 			if (!desc->pending) {
-				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
-				continue;
-			}
-			if (vgicv3_skip_vtimer_host_handoff_flush(vcpu, desc)) {
 				vgic_set_pending(vgic, vcpu->vcpu_id, desc, false);
 				continue;
 			}
@@ -2221,6 +2023,11 @@ static void vgicv3_flush_vm(struct acrn_vcpu *current_vcpu)
 	}
 }
 
+void arm64_vgicv3_flush_vm_locked(struct acrn_vcpu *current_vcpu)
+{
+	vgicv3_flush_vm(current_vcpu);
+}
+
 static int32_t vgic_inject_locked(struct arm64_vgicv3 *vgic, struct acrn_vcpu *target_vcpu,
 	uint32_t virq, bool level)
 {
@@ -2247,6 +2054,12 @@ static int32_t vgic_inject_locked(struct arm64_vgicv3 *vgic, struct acrn_vcpu *t
 	}
 
 	return ret;
+}
+
+int32_t arm64_vgicv3_inject_irq_locked(struct arm64_vgicv3 *vgic,
+	struct acrn_vcpu *target_vcpu, uint32_t virq, bool level)
+{
+	return vgic_inject_locked(vgic, target_vcpu, virq, level);
 }
 
 static int32_t arm64_vgicv3_inject_irq_to(struct acrn_vcpu *source_vcpu,
@@ -2301,18 +2114,13 @@ int32_t arm64_vgicv3_inject_irq(struct acrn_vcpu *vcpu, uint32_t virq, bool leve
 int32_t arm64_vgicv3_inject_msi(struct acrn_vm *vm, uint32_t device_id, uint32_t event_id)
 {
 	struct arm64_vgicv3 *vgic;
-	struct arm64_vits_event *event;
 	uint64_t flags;
 	int32_t ret = -EINVAL;
 
 	if ((vm != NULL) && vm->arch_vm.vgic.initialized && vm->arch_vm.vgic.its_enabled) {
 		vgic = &vm->arch_vm.vgic;
 		spinlock_irqsave_obtain(&vgic->lock, &flags);
-		event = vits_find_event(&vgic->its, device_id, event_id);
-		if (event != NULL) {
-			vits_inject_event_locked(vm, vgic, event);
-			ret = 0;
-		}
+		ret = arm64_vgicv3_its_inject_msi(vm, vgic, device_id, event_id);
 		spinlock_irqrestore_release(&vgic->lock, flags);
 	}
 
@@ -3088,363 +2896,6 @@ static void vgic_write_irouter_word(struct acrn_vm *vm, struct arm64_vgicv3 *vgi
 	vgic_set_spi_target(vm, reg->virq, target_vcpu_id);
 }
 
-static struct arm64_vits_collection *vits_find_collection(struct arm64_vits *its,
-	uint16_t collection_id)
-{
-	uint32_t idx;
-
-	for (idx = 0U; idx < ARM64_VGIC_ITS_COLLECTION_NUM; idx++) {
-		if (its->collection[idx].collection_id == collection_id) {
-			return &its->collection[idx];
-		}
-	}
-
-	return NULL;
-}
-
-static struct arm64_vits_device *vits_find_device(struct arm64_vits *its, uint32_t device_id)
-{
-	uint32_t idx;
-
-	for (idx = 0U; idx < ARM64_VGIC_ITS_DEVICE_NUM; idx++) {
-		if (its->device[idx].valid && (its->device[idx].device_id == device_id)) {
-			return &its->device[idx];
-		}
-	}
-
-	return NULL;
-}
-
-static struct arm64_vits_device *vits_alloc_device(struct arm64_vits *its, uint32_t device_id)
-{
-	uint32_t idx;
-
-	for (idx = 0U; idx < ARM64_VGIC_ITS_DEVICE_NUM; idx++) {
-		if (!its->device[idx].valid) {
-			its->device[idx].device_id = device_id;
-			its->device[idx].valid = true;
-			return &its->device[idx];
-		}
-	}
-
-	return NULL;
-}
-
-static uint32_t vits_device_index(const struct arm64_vits *its,
-	const struct arm64_vits_device *device)
-{
-	uint32_t idx = ARM64_VGIC_ITS_DEVICE_NUM;
-
-	if (device != NULL) {
-		idx = (uint32_t)(device - its->device);
-		if (idx >= ARM64_VGIC_ITS_DEVICE_NUM) {
-			idx = ARM64_VGIC_ITS_DEVICE_NUM;
-		}
-	}
-
-	return idx;
-}
-
-static struct arm64_vits_event *vits_find_event(struct arm64_vits *its,
-	uint32_t device_id, uint32_t event_id)
-{
-	uint32_t dev_idx;
-	uint32_t evt_idx;
-
-	for (dev_idx = 0U; dev_idx < ARM64_VGIC_ITS_DEVICE_NUM; dev_idx++) {
-		if (!its->device[dev_idx].valid || (its->device[dev_idx].device_id != device_id)) {
-			continue;
-		}
-		for (evt_idx = 0U; evt_idx < ARM64_VGIC_ITS_EVENT_NUM; evt_idx++) {
-			if (its->event[dev_idx][evt_idx].valid &&
-				(its->event[dev_idx][evt_idx].event_id == event_id)) {
-				return &its->event[dev_idx][evt_idx];
-			}
-		}
-	}
-
-	return NULL;
-}
-
-static struct arm64_vits_event *vits_alloc_event(struct arm64_vits *its,
-	uint32_t device_id, uint32_t event_id)
-{
-	uint32_t dev_idx;
-	uint32_t evt_idx;
-
-	for (dev_idx = 0U; dev_idx < ARM64_VGIC_ITS_DEVICE_NUM; dev_idx++) {
-		if (!its->device[dev_idx].valid || (its->device[dev_idx].device_id != device_id)) {
-			continue;
-		}
-		if (event_id >= its->device[dev_idx].event_count) {
-			break;
-		}
-		for (evt_idx = 0U; evt_idx < ARM64_VGIC_ITS_EVENT_NUM; evt_idx++) {
-			if (!its->event[dev_idx][evt_idx].valid) {
-				its->event[dev_idx][evt_idx].device_id = device_id;
-				its->event[dev_idx][evt_idx].event_id = event_id;
-				its->event[dev_idx][evt_idx].valid = true;
-				return &its->event[dev_idx][evt_idx];
-			}
-		}
-	}
-
-	return NULL;
-}
-
-static uint16_t vits_target_vcpu_id(struct arm64_vgicv3 *vgic, uint16_t collection_id)
-{
-	struct arm64_vits_collection *collection = vits_find_collection(&vgic->its, collection_id);
-	uint16_t target = VGIC_INVALID_VCPU_ID;
-
-	if ((collection != NULL) && collection->valid) {
-		target = vgic_valid_target_vcpu(vgic, collection->target_vcpu);
-	}
-
-	return target;
-}
-
-static void vits_inject_event_locked(struct acrn_vm *vm, struct arm64_vgicv3 *vgic,
-	struct arm64_vits_event *event)
-{
-	struct acrn_vcpu *target_vcpu;
-	struct arm64_vgic_irq *desc;
-	uint16_t target_vcpu_id;
-
-	if ((event == NULL) || !event->valid || !vgic_irq_is_lpi(event->lpi)) {
-		return;
-	}
-
-	target_vcpu_id = vits_target_vcpu_id(vgic, event->collection_id);
-	if (target_vcpu_id >= vgic->vcpu_count) {
-		return;
-	}
-	target_vcpu = vcpu_from_vid(vm, target_vcpu_id);
-	desc = vgic_irq_desc(target_vcpu, event->lpi);
-	if (desc != NULL) {
-		desc->target_vcpu = (uint8_t)target_vcpu_id;
-		desc->level = false;
-		vgic_inject_locked(vgic, target_vcpu, event->lpi, false);
-		if (target_vcpu->state != VCPU_OFFLINE) {
-			vcpu_make_request(target_vcpu, ARM64_VCPU_REQUEST_EVENT);
-			signal_event(&target_vcpu->events[ARM64_VCPU_EVENT_VIRTUAL_INTERRUPT]);
-			if (target_vcpu->state == VCPU_RUNNING) {
-				kick_vcpu(target_vcpu);
-			}
-		}
-	}
-}
-
-static void vits_drop_device(struct arm64_vits *its, uint32_t device_id)
-{
-	uint32_t dev_idx;
-	uint32_t evt_idx;
-
-	for (dev_idx = 0U; dev_idx < ARM64_VGIC_ITS_DEVICE_NUM; dev_idx++) {
-		if (!its->device[dev_idx].valid || (its->device[dev_idx].device_id != device_id)) {
-			continue;
-		}
-		for (evt_idx = 0U; evt_idx < ARM64_VGIC_ITS_EVENT_NUM; evt_idx++) {
-			its->event[dev_idx][evt_idx].valid = false;
-		}
-		(void)memset(&its->device[dev_idx], 0U, sizeof(its->device[dev_idx]));
-		break;
-	}
-}
-
-static void vits_execute_cmd(struct acrn_vm *vm, struct arm64_vgicv3 *vgic,
-	const uint64_t cmd[4])
-{
-	struct arm64_vits *its = &vgic->its;
-	uint32_t opcode = (uint32_t)(cmd[0] & 0xffUL);
-	uint32_t device_id = (uint32_t)(cmd[0] >> 32U);
-	uint32_t event_id = (uint32_t)(cmd[1] & UINT32_MAX);
-	uint32_t lpi = (uint32_t)(cmd[1] >> 32U);
-	uint16_t collection_id = (uint16_t)(cmd[2] & 0xffffUL);
-	bool valid = ((cmd[2] & (1UL << 63U)) != 0UL);
-	struct arm64_vits_device *device;
-	struct arm64_vits_event *event;
-	struct arm64_vits_collection *collection;
-	uint32_t dev_idx;
-
-	switch (opcode) {
-	case GITS_CMD_MAPD:
-		if (!valid) {
-			vits_drop_device(its, device_id);
-			break;
-		}
-		device = vits_find_device(its, device_id);
-		if (device == NULL) {
-			device = vits_alloc_device(its, device_id);
-		}
-		if (device != NULL) {
-			uint32_t size = (uint32_t)(cmd[1] & 0x1fUL) + 1U;
-			uint64_t itt_addr = cmd[2] & GITS_CMD_ITT_ADDRESS_MASK;
-			uint16_t event_count = (size < 16U) ? (uint16_t)(1U << size) :
-				ARM64_VGIC_ITS_EVENT_NUM;
-
-			if (event_count > ARM64_VGIC_ITS_EVENT_NUM) {
-				event_count = ARM64_VGIC_ITS_EVENT_NUM;
-			}
-			if ((device->itt_addr != itt_addr) || (device->event_count != event_count)) {
-				dev_idx = vits_device_index(its, device);
-				if (dev_idx < ARM64_VGIC_ITS_DEVICE_NUM) {
-					(void)memset(its->event[dev_idx], 0U, sizeof(its->event[dev_idx]));
-				}
-			}
-
-			device->itt_addr = itt_addr;
-			device->event_count = event_count;
-		}
-		break;
-	case GITS_CMD_MAPC:
-		collection = vits_find_collection(its, collection_id);
-		if (collection != NULL) {
-			collection->valid = valid;
-			collection->target_vcpu =
-				vgic_valid_target_vcpu(vgic, (uint16_t)((cmd[2] >> 16U) & 0xffffU));
-		}
-		break;
-	case GITS_CMD_MAPI:
-		lpi = ARM64_VGIC_LPI_BASE + event_id;
-		/* fall through */
-	case GITS_CMD_MAPTI:
-		device = vits_find_device(its, device_id);
-		collection = vits_find_collection(its, collection_id);
-		if (!vgic_irq_is_lpi(lpi) || (device == NULL) ||
-			(event_id >= device->event_count) ||
-			(collection == NULL) || !collection->valid) {
-			break;
-		}
-		event = vits_find_event(its, device_id, event_id);
-		if (event == NULL) {
-			event = vits_alloc_event(its, device_id, event_id);
-		}
-		if (event != NULL) {
-			event->lpi = lpi;
-			event->collection_id = collection_id;
-			if (vgic_irq_is_lpi(lpi)) {
-				uint32_t lpi_idx = vgic_lpi_index(lpi);
-				uint16_t target;
-
-				for (target = 0U; target < vgic->vcpu_count; target++) {
-					vgic->lpi[target][lpi_idx].enabled = true;
-					vgic->lpi[target][lpi_idx].priority = GIC_PRIORITY_DEFAULT;
-				}
-			}
-		}
-		break;
-	case GITS_CMD_MOVI:
-		event = vits_find_event(its, device_id, event_id);
-		collection = vits_find_collection(its, collection_id);
-		if ((event != NULL) && (collection != NULL) && collection->valid) {
-			event->collection_id = collection_id;
-		}
-		break;
-	case GITS_CMD_DISCARD:
-		event = vits_find_event(its, device_id, event_id);
-		if (event != NULL) {
-			event->valid = false;
-		}
-		break;
-	case GITS_CMD_INT:
-		vits_inject_event_locked(vm, vgic, vits_find_event(its, device_id, event_id));
-		break;
-	case GITS_CMD_CLEAR:
-		event = vits_find_event(its, device_id, event_id);
-		if ((event != NULL) && vgic_irq_is_lpi(event->lpi)) {
-			uint16_t target = vits_target_vcpu_id(vgic, event->collection_id);
-
-			if (target < vgic->vcpu_count) {
-				struct arm64_vgic_irq *desc =
-					&vgic->lpi[target][vgic_lpi_index(event->lpi)];
-
-				vgic_set_pending(vgic, target, desc, false);
-				desc->active = false;
-				vgic_update_irq_row_lr(vm, target, desc);
-			}
-		}
-		break;
-	case GITS_CMD_INV:
-	case GITS_CMD_INVALL:
-	case GITS_CMD_SYNC:
-	case GITS_CMD_MOVALL:
-		break;
-	default:
-		break;
-	}
-}
-
-static uint64_t vits_cmd_queue_base(const struct arm64_vits *its)
-{
-	return its->cbaser & GITS_CBASER_ADDRESS_MASK;
-}
-
-static uint64_t vits_cmd_queue_size(const struct arm64_vits *its)
-{
-	return (((its->cbaser & GITS_CBASER_SIZE_MASK) + 1UL) * PAGE_SIZE);
-}
-
-static bool vits_process_command_queue(struct acrn_vm *vm, struct arm64_vgicv3 *vgic)
-{
-	struct arm64_vits *its = &vgic->its;
-	uint64_t base = vits_cmd_queue_base(its);
-	uint64_t size = vits_cmd_queue_size(its);
-	uint64_t reader = its->creadr;
-	uint64_t writer = its->cwriter;
-	uint32_t processed = 0U;
-	bool flush = false;
-
-	if (((its->ctlr & GITS_CTLR_ENABLE) == 0U) ||
-		((its->cbaser & GITS_CBASER_VALID) == 0UL) ||
-		(size < GITS_CMD_SIZE)) {
-		its->creadr = writer;
-		return false;
-	}
-
-	/*
-	 * The ITS command queue is guest owned, but EL2 processes it while holding
-	 * the vGIC lock. Enforce command-size alignment and a per-entry budget so
-	 * malformed queues cannot keep unrelated vGIC operations blocked forever.
-	 */
-	if ((reader >= size) || (writer >= size) ||
-		!vits_offset_aligned(reader) || !vits_offset_aligned(writer)) {
-		its->creadr = writer;
-		return false;
-	}
-
-	while ((reader != writer) && (processed < GITS_CMD_QUEUE_BUDGET)) {
-		uint64_t cmd[4];
-
-		if (copy_from_gpa(vm, cmd, base + reader, sizeof(cmd)) != 0) {
-			break;
-		}
-		vits_execute_cmd(vm, vgic, cmd);
-		flush = true;
-		reader += GITS_CMD_SIZE;
-		processed++;
-		if (reader >= size) {
-			reader = 0UL;
-		}
-	}
-
-	its->creadr = reader;
-	return flush;
-}
-
-static void vits_write_translater(struct acrn_vm *vm, struct arm64_vgicv3 *vgic,
-	uint32_t event_id)
-{
-	/*
-	 * A real MSI write carries the requester/device identity in the bus
-	 * transaction. The current QEMU SDK path has no PCI requester plumbing yet,
-	 * so direct writes to the vITS doorbell use DeviceID 0 as a deterministic
-	 * local test path. Passthrough/MSI code should call arm64_vgicv3_inject_msi()
-	 * with the real DeviceID once that layer exists.
-	 */
-	vits_inject_event_locked(vm, vgic, vits_find_event(&vgic->its, 0U, event_id));
-}
-
 static void vgicd_mmio_read(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 	struct acrn_mmio_request *mmio, uint32_t offset)
 {
@@ -3901,202 +3352,6 @@ static int32_t vgicr_mmio_access(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vg
 	return ret;
 }
 
-static uint32_t vits_baser_index(uint32_t offset)
-{
-	return (offset - GITS_BASER) / 8U;
-}
-
-static bool vits_mmio_read(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
-	struct acrn_mmio_request *mmio, uint32_t offset)
-{
-	struct arm64_vits *its = &vgic->its;
-	uint64_t value64 = 0UL;
-	bool flush = false;
-
-	if ((offset >= GITS_BASER) &&
-		(offset < (GITS_BASER + (ARM64_VGIC_ITS_BASER_NUM * 8U)))) {
-		uint32_t idx = vits_baser_index(offset);
-
-		value64 = its->baser[idx];
-		mmio->value = ((offset & 0x4U) == 0U) ?
-			(value64 & UINT32_MAX) : (value64 >> 32U);
-		return false;
-	}
-
-	switch (offset) {
-	case GITS_CTLR:
-		mmio->value = its->ctlr;
-		break;
-	case GITS_IIDR:
-		mmio->value = arm64_platform_gic_iidr();
-		break;
-	case GITS_TYPER:
-		mmio->value = its->typer & UINT32_MAX;
-		break;
-	case GITS_TYPER + 4U:
-		mmio->value = its->typer >> 32U;
-		break;
-	case GITS_MPIDR:
-		mmio->value = vcpu_get_vmpidr(vcpu_from_vid(vcpu->vm, BSP_CPU_ID));
-		break;
-	case GITS_CBASER:
-		mmio->value = its->cbaser & UINT32_MAX;
-		break;
-	case GITS_CBASER + 4U:
-		mmio->value = its->cbaser >> 32U;
-		break;
-	case GITS_CWRITER:
-		mmio->value = its->cwriter & UINT32_MAX;
-		break;
-	case GITS_CWRITER + 4U:
-		mmio->value = its->cwriter >> 32U;
-		break;
-	case GITS_CREADR:
-		flush = vits_process_command_queue(vcpu->vm, vgic);
-		mmio->value = its->creadr & UINT32_MAX;
-		break;
-	case GITS_CREADR + 4U:
-		flush = vits_process_command_queue(vcpu->vm, vgic);
-		mmio->value = its->creadr >> 32U;
-		break;
-	case GITS_PIDR2:
-		mmio->value = GIC_PIDR2_ARCH_GICV3;
-		break;
-	case GITS_CIDR0:
-		mmio->value = 0x0dU;
-		break;
-	case GITS_CIDR1:
-		mmio->value = 0xf0U;
-		break;
-	case GITS_CIDR2:
-		mmio->value = 0x05U;
-		break;
-	case GITS_CIDR3:
-		mmio->value = 0xb1U;
-		break;
-	default:
-		mmio->value = 0UL;
-		break;
-	}
-
-	return flush;
-}
-
-static bool vits_mmio_write(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
-	const struct acrn_mmio_request *mmio, uint32_t offset)
-{
-	struct arm64_vits *its = &vgic->its;
-	uint64_t value = mmio->value & UINT32_MAX;
-	bool flush = false;
-
-	if ((offset >= GITS_BASER) &&
-		(offset < (GITS_BASER + (ARM64_VGIC_ITS_BASER_NUM * 8U)))) {
-		uint32_t idx = vits_baser_index(offset);
-
-		if ((offset & 0x4U) == 0U) {
-			its->baser[idx] = (its->baser[idx] & 0xffffffff00000000UL) | value;
-		} else {
-			its->baser[idx] = (its->baser[idx] & UINT32_MAX) | (value << 32U);
-		}
-		return false;
-	}
-
-	switch (offset) {
-	case GITS_CTLR:
-		its->ctlr = ((uint32_t)value & GITS_CTLR_ENABLE) |
-			(((value & GITS_CTLR_ENABLE) == 0U) ? GITS_CTLR_QUIESCENT : 0U);
-		if ((its->ctlr & GITS_CTLR_ENABLE) != 0U) {
-			flush = vits_process_command_queue(vcpu->vm, vgic);
-		}
-		break;
-	case GITS_CBASER:
-		its->cbaser = (its->cbaser & 0xffffffff00000000UL) | value;
-		its->creadr = 0UL;
-		its->cwriter = 0UL;
-		break;
-	case GITS_CBASER + 4U:
-		its->cbaser = (its->cbaser & UINT32_MAX) | (value << 32U);
-		its->creadr = 0UL;
-		its->cwriter = 0UL;
-		break;
-	case GITS_CWRITER:
-		its->cwriter = (its->cwriter & 0xffffffff00000000UL) | value;
-		flush = vits_process_command_queue(vcpu->vm, vgic);
-		break;
-	case GITS_CWRITER + 4U:
-		its->cwriter = (its->cwriter & UINT32_MAX) | (value << 32U);
-		flush = vits_process_command_queue(vcpu->vm, vgic);
-		break;
-	case GITS_TRANSLATER:
-		vits_write_translater(vcpu->vm, vgic, (uint32_t)value);
-		flush = true;
-		break;
-	default:
-		break;
-	}
-
-	return flush;
-}
-
-static int32_t vits_mmio_access(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
-	struct acrn_mmio_request *mmio)
-{
-	uint32_t offset = (uint32_t)(mmio->address - arm64_platform_guest_its_base(vcpu->vm->vm_id));
-	int32_t ret = 0;
-
-	if (!vgic_word_access(offset, mmio->size)) {
-		ret = -EINVAL;
-	} else {
-		switch (mmio->direction) {
-		case ACRN_IOREQ_DIR_READ:
-			if (vits_mmio_read(vcpu, vgic, mmio, offset)) {
-				vgicv3_flush_vm(vcpu);
-			}
-			break;
-		case ACRN_IOREQ_DIR_WRITE:
-			if (vits_mmio_write(vcpu, vgic, mmio, offset)) {
-				vgicv3_flush_vm(vcpu);
-			}
-			break;
-		default:
-			ret = -EINVAL;
-			break;
-		}
-	}
-
-	return ret;
-}
-
-static bool vits_mmio_access64(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
-	struct acrn_mmio_request *mmio, int32_t *status)
-{
-	struct arm64_vits *its = &vgic->its;
-	uint32_t offset = (uint32_t)(mmio->address - arm64_platform_guest_its_base(vcpu->vm->vm_id));
-	bool handled = false;
-
-	if (status != NULL) {
-		*status = -ENODEV;
-	}
-	if ((offset == GITS_CWRITER) && (mmio->size == 8UL) &&
-		(mmio->direction == ACRN_IOREQ_DIR_WRITE)) {
-		handled = true;
-		/*
-		 * CWRITER is a 64-bit producer pointer. Update the full value before
-		 * consuming commands so a split low/high emulation does not run the
-		 * queue against a half-written writer offset.
-		 */
-		its->cwriter = mmio->value;
-		if (vits_process_command_queue(vcpu->vm, vgic)) {
-			vgicv3_flush_vm(vcpu);
-		}
-		if (status != NULL) {
-			*status = 0;
-		}
-	}
-
-	return handled;
-}
-
 static int32_t vgicv3_mmio_dispatch(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 	struct acrn_mmio_request *mmio)
 {
@@ -4111,7 +3366,7 @@ static int32_t vgicv3_mmio_dispatch(struct acrn_vcpu *vcpu, struct arm64_vgicv3 
 	} else if (vgic->its_enabled &&
 		addr_in_range(mmio->address, arm64_platform_guest_its_base(vcpu->vm->vm_id),
 		arm64_platform_guest_its_size(vcpu->vm->vm_id))) {
-		ret = vits_mmio_access(vcpu, vgic, mmio);
+		ret = arm64_vgicv3_its_mmio_access(vcpu, vgic, mmio);
 	}
 
 	return ret;
@@ -4127,7 +3382,7 @@ static int32_t vgicv3_mmio_dispatch64(struct acrn_vcpu *vcpu, struct arm64_vgicv
 	if (vgic->its_enabled &&
 		addr_in_range(mmio->address, arm64_platform_guest_its_base(vcpu->vm->vm_id),
 		arm64_platform_guest_its_size(vcpu->vm->vm_id)) &&
-		vits_mmio_access64(vcpu, vgic, mmio, &ret)) {
+		arm64_vgicv3_its_mmio_access64(vcpu, vgic, mmio, &ret)) {
 		return ret;
 	}
 

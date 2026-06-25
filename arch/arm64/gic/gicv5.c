@@ -428,6 +428,14 @@ bool arm64_gicv3_map_spi_msi(uint32_t intid, uint64_t *addr, uint32_t *data)
 	return true;
 }
 
+void arm64_gicv3_set_local_irq_active(uint16_t pcpu_id __unused, uint32_t intid __unused)
+{
+}
+
+void arm64_gicv3_clear_local_irq_active(uint16_t pcpu_id __unused, uint32_t intid __unused)
+{
+}
+
 void arm64_gicv3_get_local_irq_state(uint16_t pcpu_id __unused, uint32_t intid __unused,
 	struct arm64_gicv3_local_irq_state *state)
 {

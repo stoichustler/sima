@@ -406,34 +406,19 @@ struct arm64_vcpu_vtimer_diag {
 	uint64_t lost_pending_lr;
 	/*
 	 * EL2 masks the host virtual-timer PPI while the interrupt is owned by vGIC
-	 * state. Long mask age or requeue events indicate the host-masked timer had
-	 * to be rebuilt from live CNTV instead of normal LR/EOI flow.
-	 * stale_pending_lr is the bounded escape hatch for the pathological loop:
-	 * the same expired timer is still pending-only in an LR, no EOI arrived, and
-	 * the host PPI stayed masked too long. In that case EL2 hands ownership back
-	 * to the host CNTV PPI: clear the stale vGIC pending/LR owner, unmask the host
-	 * PPI, and skip timer re-flush until a real PPI or guest timer write rebuilds
-	 * delivery.
+	 * state. Long mask age indicates that guest timer completion is not making
+	 * normal LR/EOI progress.
 	 */
 	uint64_t el2_mask_set;
 	uint64_t el2_mask_clear;
-	uint64_t masked_timer_requeue;
-	uint64_t stale_pending_lr;
-	uint64_t stale_pending_lr_mask_release;
-	uint64_t stale_pending_lr_drop;
-	uint64_t stale_pending_lr_handoff;
-	uint64_t stale_pending_lr_skip_flush;
-	uint64_t stale_pending_lr_reinject;
-	uint64_t stale_pending_lr_max_age_ticks;
 	/*
 	 * pre-ERET flush counters summarize the last-chance vtimer/vGIC refresh
 	 * before returning to EL1. They stay out of the trace ring because this path
 	 * can be hot and would otherwise overwrite rarer pending-only LR evidence.
 	 */
 	uint64_t pre_eret_flush;
-	uint64_t pre_eret_flush_skip;
 	uint64_t pre_eret_flush_lr_rescue;
-	uint64_t pre_eret_flush_masked_expired;
+	uint64_t pre_eret_flush_expired;
 	uint64_t lr_rescue_budget_exhaust;
 	uint64_t max_el2_mask_ticks;
 	uint64_t el2_mask_since_ticks;
@@ -470,13 +455,14 @@ struct acrn_vcpu_arch {
 	struct arm64_vcpu_debug_info debug;
 	uint64_t irqs_pending;
 	uint64_t irqs_pending_mask;
-	struct hv_timer vtimer_backup;
+	struct hv_timer cntv_timer;
+	struct hv_timer cntp_timer;
 	uint8_t vtimer_lr_rescue_budget;
-	bool vtimer_backup_initialized;
-	bool vtimer_stuck_rescue_armed;
+	bool cntv_timer_initialized;
+	bool cntp_timer_initialized;
+	bool cntv_timer_rescue_armed;
 	bool vtimer_wfi_rescue;
 	bool vtimer_lr_rescue;
-	bool vtimer_host_handoff;
 } __aligned(PAGE_SIZE);
 
 struct acrn_vcpu;

@@ -81,6 +81,7 @@ VP_C_SRCS += arch/arm64/guest/vm.c
 VP_C_SRCS += arch/arm64/guest/vcpu_exit.c
 VP_C_SRCS += arch/arm64/guest/virq.c
 VP_C_SRCS += arch/arm64/guest/vgicv3.c
+VP_C_SRCS += arch/arm64/guest/vgicv3_its.c
 VP_C_SRCS += arch/arm64/guest/vtimer.c
 VP_C_SRCS += arch/arm64/guest/vpl011.c
 ifeq ($(PLATFORM),qemu)

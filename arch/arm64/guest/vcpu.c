@@ -115,7 +115,7 @@ void arm64_prepare_linux_vcpu_context(struct acrn_vcpu *vcpu, uint64_t entry, ui
 		return;
 	}
 
-	arm64_vgicv3_cancel_vtimer_backup(vcpu);
+	arm64_vtimer_cancel_all(vcpu);
 	vcpu->pending_req = 0UL;
 	vcpu->arch.irqs_pending = 0UL;
 	vcpu->arch.irqs_pending_mask = 0UL;
@@ -199,19 +199,19 @@ void arm64_vcpu_trace_vtimer(struct acrn_vcpu *vcpu, uint32_t event,
 	vgic_ctx = &vcpu->arch.vgic;
 	trace = &vcpu->arch.debug.vtimer_trace;
 	if (virq == 0U) {
-		virq = (gctx->timer_virq == 0U) ?
-			ARM64_GIC_PPI_VIRTUAL_TIMER : gctx->timer_virq;
+		virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 	}
 
 	current = (get_running_vcpu(get_pcpu_id()) == vcpu);
 	physical_timer = (virq == ARM64_GIC_PPI_PHYSICAL_TIMER);
-	now = current ? read_cntvct_el0() : (cpu_ticks() + gctx->cntvoff_el2);
+	now = physical_timer ? cpu_ticks() :
+		(current ? read_cntvct_el0() : (cpu_ticks() - gctx->cntvoff_el2));
 	if (ctl == UINT32_MAX) {
-		ctl = current ? read_cntv_ctl_el0() :
+		ctl = (!physical_timer && current) ? read_cntv_ctl_el0() :
 			(physical_timer ? gctx->cntp_ctl_el0 : gctx->cntv_ctl_el0);
 	}
 	if (cval == UINT64_MAX) {
-		cval = current ? read_cntv_cval_el0() :
+		cval = (!physical_timer && current) ? read_cntv_cval_el0() :
 			(physical_timer ? gctx->cntp_cval_el0 : gctx->cntv_cval_el0);
 	}
 	if ((vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS) && (virq < ARM64_VGIC_IRQ_NUM)) {
@@ -291,10 +291,8 @@ void arm64_vtimer_diag_mark_pre_eret(struct acrn_vcpu *vcpu,
 			diag->pre_eret_flush_lr_rescue++;
 		}
 		if (masked_expired) {
-			diag->pre_eret_flush_masked_expired++;
+			diag->pre_eret_flush_expired++;
 		}
-	} else {
-		diag->pre_eret_flush_skip++;
 	}
 }
 
@@ -367,22 +365,21 @@ void load_vcpu(__unused struct acrn_vcpu *vcpu)
 	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
 
 	/*
-	 * VTTBR/VTCR select the VM's stage-2 table, VMPIDR gives the guest its
-	 * virtual CPU identity, and CNTHCTL keeps guest timer programming trapped
-	 * while allowing EL1 counter reads to stay direct. The host keeps the
-	 * physical timer for scheduler ticks, while guest timer programming is
-	 * carried in the vCPU's CNTV state and reconciled with the vGIC on writes.
+	 * VTTBR/VTCR select the VM's stage-2 table and VMPIDR gives the guest its
+	 * virtual CPU identity. CNTV is direct guest hardware state saved/restored
+	 * on vCPU switches, while CNTP stays trapped so EL2 keeps ownership of the
+	 * host physical timer.
 	 *
 	 * The EL1 register image and vGIC state must be loaded before guest entry
 	 * so address translation, exception return state, and pending virtual
 	 * interrupts are visible immediately after ERET.
 	 */
-	arm64_vgicv3_cancel_vtimer_backup(vcpu);
+	arm64_vtimer_cancel_all(vcpu);
 	write_vtcr_el2(gctx->vtcr_el2);
 	write_vttbr_el2(gctx->vttbr_el2);
 	flush_stage2_tlb_local();
 	write_vmpidr_el2(vcpu_get_vmpidr(vcpu));
-	write_cnthctl_el2(CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1TVT);
+	write_cnthctl_el2(CNTHCTL_EL2_EL1PCTEN);
 	asm volatile ("msr cntvoff_el2, %0; isb" : : "r" (gctx->cntvoff_el2) : "memory");
 	restore_el1_sysregs(gctx);
 	arm64_vtimer_load_current(vcpu);
@@ -408,7 +405,7 @@ void unload_vcpu(__unused struct acrn_vcpu *vcpu)
 	arm64_vtimer_trace_switch(vcpu, ARM64_VTIMER_TRACE_UNLOAD);
 	arm64_vtimer_disable_current();
 	arm64_vgicv3_save_vcpu(vcpu);
-	arm64_vgicv3_arm_vtimer_backup(vcpu);
+	arm64_vgicv3_arm_cntv_timer(vcpu);
 	write_hcr_el2(0UL);
 	write_vttbr_el2(0UL);
 	flush_stage2_tlb_local();
@@ -470,7 +467,7 @@ int32_t arch_init_vcpu(struct acrn_vcpu *vcpu)
 
 void arch_deinit_vcpu(__unused struct acrn_vcpu *vcpu)
 {
-	arm64_vgicv3_cancel_vtimer_backup(vcpu);
+	arm64_vtimer_cancel_all(vcpu);
 }
 
 void arch_vcpu_thread(struct thread_object *obj)
@@ -508,7 +505,7 @@ void arch_vcpu_thread(struct thread_object *obj)
 
 void arch_reset_vcpu(struct acrn_vcpu *vcpu)
 {
-	arm64_vgicv3_cancel_vtimer_backup(vcpu);
+	arm64_vtimer_cancel_all(vcpu);
 	memset(&vcpu->arch, 0, sizeof(vcpu->arch));
 	arm64_prepare_linux_vcpu_context(vcpu, 0UL, 0UL);
 }
