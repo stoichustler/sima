@@ -69,9 +69,9 @@
  *   deadline.
  * - timer_virq is the guest ABI number. Linux uses virtual timer PPI27; an RTOS
  *   can choose the physical-timer PPI while BEAU still backs it with CNTV.
- * - A timer sysreg write is a guest ownership boundary: update the shadow,
- *   update the live CNTV registers if this vCPU is loaded, and let vGIC refresh
- *   the level line.
+ * - Timer reads and inactive-source probe writes do not choose the guest ABI.
+ *   An enabled active-source control write selects timer_virq; active-source
+ *   writes update the shadow, refresh live CNTV, and let vGIC refresh the line.
  *
  * Loaded-vCPU path:
  *
@@ -110,15 +110,26 @@
 
 static void vtimer_arm_wfi_rescue(struct acrn_vcpu *vcpu);
 
+static uint32_t vtimer_active_virq(const struct arm64_vcpu_guest_ctx *gctx)
+{
+	return ((gctx != NULL) && (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER)) ?
+		ARM64_GIC_PPI_PHYSICAL_TIMER : ARM64_GIC_PPI_VIRTUAL_TIMER;
+}
+
+static bool vtimer_source_active(const struct arm64_vcpu_guest_ctx *gctx, uint32_t virq)
+{
+	return vtimer_active_virq(gctx) == virq;
+}
+
 static uint32_t vtimer_guest_ctl(const struct arm64_vcpu_guest_ctx *gctx)
 {
-	return (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
+	return (vtimer_active_virq(gctx) == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
 		gctx->cntp_ctl_el0 : gctx->cntv_ctl_el0;
 }
 
 static uint64_t vtimer_guest_cval(const struct arm64_vcpu_guest_ctx *gctx)
 {
-	return (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
+	return (vtimer_active_virq(gctx) == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
 		gctx->cntp_cval_el0 : gctx->cntv_cval_el0;
 }
 
@@ -223,7 +234,7 @@ bool arm64_vtimer_sample_current(struct acrn_vcpu *vcpu)
 	uint64_t cval = read_cntv_cval_el0();
 	uint64_t now = read_cntvct_el0();
 
-	if (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+	if (vtimer_source_active(gctx, ARM64_GIC_PPI_PHYSICAL_TIMER)) {
 		gctx->cntp_ctl_el0 = ctl;
 		gctx->cntp_cval_el0 = cval;
 	} else {
@@ -274,7 +285,7 @@ void arm64_vtimer_load_current(struct acrn_vcpu *vcpu)
 		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
 			ARM64_GIC_PRIORITY_DEFAULT);
 	}
-	if (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+	if (vtimer_source_active(gctx, ARM64_GIC_PPI_PHYSICAL_TIMER)) {
 		write_cntv_cval_el0(gctx->cntp_cval_el0);
 		ctl = gctx->cntp_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
 	} else {
@@ -319,7 +330,7 @@ void arm64_vtimer_save_current(struct acrn_vcpu *vcpu)
 			gctx->cntv_el2_masked = false;
 		}
 	}
-	if (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+	if (vtimer_source_active(gctx, ARM64_GIC_PPI_PHYSICAL_TIMER)) {
 		gctx->cntp_cval_el0 = cval;
 		gctx->cntp_ctl_el0 = ctl;
 	} else {
@@ -342,6 +353,23 @@ bool arm64_vtimer_sysreg(uint64_t sysreg)
 		(sysreg == SYSREG_CNTP_CTL_EL0) || (sysreg == SYSREG_CNTP_CVAL_EL0) ||
 		(sysreg == SYSREG_CNTP_TVAL_EL0) || (sysreg == SYSREG_CNTV_CTL_EL0) ||
 		(sysreg == SYSREG_CNTV_CVAL_EL0) || (sysreg == SYSREG_CNTV_TVAL_EL0);
+}
+
+static uint32_t vtimer_sysreg_virq(uint64_t sysreg,
+	const struct arm64_vcpu_guest_ctx *gctx)
+{
+	switch (sysreg) {
+	case SYSREG_CNTP_CTL_EL0:
+	case SYSREG_CNTP_CVAL_EL0:
+	case SYSREG_CNTP_TVAL_EL0:
+		return ARM64_GIC_PPI_PHYSICAL_TIMER;
+	case SYSREG_CNTV_CTL_EL0:
+	case SYSREG_CNTV_CVAL_EL0:
+	case SYSREG_CNTV_TVAL_EL0:
+		return ARM64_GIC_PPI_VIRTUAL_TIMER;
+	default:
+		return vtimer_active_virq(gctx);
+	}
 }
 
 static bool vtimer_has_irq_state(const struct acrn_vcpu *vcpu, uint32_t virq)
@@ -398,6 +426,12 @@ static void vtimer_write_live_ctl(struct acrn_vcpu *vcpu)
 	write_cntv_ctl_el0(ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
 }
 
+static void vtimer_load_live_guest(struct acrn_vcpu *vcpu)
+{
+	write_cntv_cval_el0(vtimer_guest_cval(&vcpu->arch.gctx));
+	vtimer_write_live_ctl(vcpu);
+}
+
 int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 	bool read, uint64_t *reg)
 {
@@ -406,6 +440,7 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 	uint64_t now = read_cntvct_el0();
 	uint64_t write_value = (reg != NULL) ? *reg : 0UL;
 	uint32_t write_ctl = (uint32_t)(write_value & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
+	uint32_t access_virq;
 	uint64_t val;
 	int32_t ret = 0;
 
@@ -415,14 +450,14 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 
 	/*
 	 * Sysreg emulation is the guest-controlled side of timer ownership. Reads
-	 * return the guest timer view; writes update the shadow, refresh the live
-	 * CNTV register for the running vCPU, and clear stale host handoff.
+	 * return the guest timer view. Writes update the matching shadow; only the
+	 * enabled active source owns the live CNTV register.
 	 */
 	gctx = &vcpu->arch.gctx;
 	last = &vcpu->arch.debug.last_timer;
+	access_virq = vtimer_sysreg_virq(sysreg, gctx);
 	switch (sysreg) {
 	case SYSREG_CNTPCT_EL0:
-		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
 				*reg = read_cntvct_el0();
@@ -432,7 +467,6 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 		}
 		break;
 	case SYSREG_CNTVCT_EL0:
-		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
 				*reg = read_cntvct_el0();
@@ -442,7 +476,6 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 		}
 		break;
 	case SYSREG_CNTP_CTL_EL0:
-		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
 				*reg = vtimer_ctl_value(gctx->cntp_ctl_el0,
@@ -450,11 +483,12 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 			}
 		} else {
 			gctx->cntp_ctl_el0 = write_ctl;
-			vtimer_write_live_ctl(vcpu);
+			if ((write_ctl & CNTV_CTL_ENABLE) != 0U) {
+				gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
+			}
 		}
 		break;
 	case SYSREG_CNTV_CTL_EL0:
-		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
 				*reg = vtimer_ctl_value(gctx->cntv_ctl_el0,
@@ -462,35 +496,30 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 			}
 		} else {
 			gctx->cntv_ctl_el0 = write_ctl;
-			vtimer_write_live_ctl(vcpu);
+			if ((write_ctl & CNTV_CTL_ENABLE) != 0U) {
+				gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+			}
 		}
 		break;
 	case SYSREG_CNTP_CVAL_EL0:
-		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
 				*reg = gctx->cntp_cval_el0;
 			}
 		} else {
 			gctx->cntp_cval_el0 = write_value;
-			write_cntv_cval_el0(gctx->cntp_cval_el0);
-			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	case SYSREG_CNTV_CVAL_EL0:
-		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
 				*reg = gctx->cntv_cval_el0;
 			}
 		} else {
 			gctx->cntv_cval_el0 = write_value;
-			write_cntv_cval_el0(gctx->cntv_cval_el0);
-			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	case SYSREG_CNTP_TVAL_EL0:
-		gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
 				*reg = (uint32_t)(gctx->cntp_cval_el0 - now);
@@ -498,12 +527,9 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 		} else {
 			val = now + (uint64_t)(int32_t)(uint32_t)write_value;
 			gctx->cntp_cval_el0 = val;
-			write_cntv_cval_el0(val);
-			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	case SYSREG_CNTV_TVAL_EL0:
-		gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		if (read) {
 			if (reg != NULL) {
 				*reg = (uint32_t)(gctx->cntv_cval_el0 - now);
@@ -511,8 +537,6 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 		} else {
 			val = now + (uint64_t)(int32_t)(uint32_t)write_value;
 			gctx->cntv_cval_el0 = val;
-			write_cntv_cval_el0(val);
-			vtimer_write_live_ctl(vcpu);
 		}
 		break;
 	default:
@@ -520,17 +544,19 @@ int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
 		break;
 	}
 
-	last->cval = vtimer_guest_cval(gctx);
-	last->ctl = (gctx->timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
+	last->cval = (access_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
+		gctx->cntp_cval_el0 : gctx->cntv_cval_el0;
+	last->ctl = (access_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) ?
 		vtimer_ctl_value(gctx->cntp_ctl_el0, gctx->cntp_cval_el0, now) :
 		vtimer_ctl_value(gctx->cntv_ctl_el0, gctx->cntv_cval_el0, now);
-	last->virq = gctx->timer_virq;
+	last->virq = access_virq;
 	last->sysreg = (uint32_t)sysreg;
 	last->status = ret;
 	last->write = !read;
 	last->injected = false;
 	last->tsc = cpu_ticks();
-	if (!read) {
+	if (!read && (ret == 0) && vtimer_source_active(gctx, access_virq)) {
+		vtimer_load_live_guest(vcpu);
 		/*
 		 * A guest timer write is an explicit ownership boundary: Linux either
 		 * reprogrammed the deadline or masked/disabled the source after taking
@@ -851,6 +877,7 @@ void arm64_vgicv3_virtual_timer_irq_handler(__unused uint32_t irq, __unused void
 void arm64_vgicv3_poll_current_vtimer(struct acrn_vcpu *vcpu)
 {
 	uint32_t ctl;
+	uint32_t virq;
 	uint64_t cval;
 	uint64_t now;
 
@@ -879,10 +906,9 @@ void arm64_vgicv3_poll_current_vtimer(struct acrn_vcpu *vcpu)
 		return;
 	}
 
-	if (vcpu->arch.gctx.timer_virq == 0U) {
-		vcpu->arch.gctx.timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
-	}
-	if (vcpu->arch.gctx.timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+	virq = vtimer_active_virq(&vcpu->arch.gctx);
+	vcpu->arch.gctx.timer_virq = virq;
+	if (virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
 		vcpu->arch.gctx.cntp_cval_el0 = cval;
 		vcpu->arch.gctx.cntp_ctl_el0 = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
 	} else {
@@ -891,8 +917,8 @@ void arm64_vgicv3_poll_current_vtimer(struct acrn_vcpu *vcpu)
 	}
 	vtimer_set_host_mask(vcpu, true);
 	arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_POLL,
-		vcpu->arch.gctx.timer_virq, ctl, cval, false, false);
-	if (vcpu->arch.gctx.timer_virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
+		virq, ctl, cval, false, false);
+	if (virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
 		(void)vtimer_inject_current(vcpu, ARM64_GIC_PPI_PHYSICAL_TIMER,
 			vcpu->arch.gctx.cntp_ctl_el0, cval);
 	} else {
