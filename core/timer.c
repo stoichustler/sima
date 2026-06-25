@@ -15,6 +15,44 @@
 
 #define MAX_TIMER_ACTIONS	32U
 
+/*
+ * Common timer principle:
+ *
+ * BEAU keeps one software timer list per pCPU and programs the architecture
+ * hardware timer only with the earliest deadline on the local list.
+ *
+ *   per-pCPU timer_list, sorted by timeout
+ *
+ *      head
+ *       |
+ *       v
+ *   +---------+   +---------+   +---------+
+ *   | timer A |-->| timer B |-->| timer C |
+ *   | t=100   |   | t=200   |   | t=500   |
+ *   +---------+   +---------+   +---------+
+ *       |
+ *       v
+ *   arch_set_timer_count(100)
+ *
+ * When the physical timer IRQ fires, architecture code raises SOFTIRQ_TIMER.
+ * The softirq runs callbacks for expired timers, advances periodic timers past
+ * missed periods, reinserts active periodic timers, and finally reprograms the
+ * hardware timer to the new list head.
+ *
+ *   hardware timer IRQ
+ *          |
+ *          v
+ *   SOFTIRQ_TIMER
+ *     - remove expired head timers
+ *     - run callback
+ *     - one-shot: stop by clearing timeout
+ *     - periodic: advance to the next future deadline and reinsert
+ *     - program hardware timer from new head
+ *
+ * Timers are local objects: add_timer() and del_timer() operate on the current
+ * pCPU list with local IRQs disabled. Remote users must arrange execution on
+ * the target pCPU instead of editing another pCPU's timer list directly.
+ */
 bool timer_expired(const struct hv_timer *timer, uint64_t now, uint64_t *delta)
 {
 	bool ret = true;

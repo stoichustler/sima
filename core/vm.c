@@ -279,6 +279,49 @@ bool is_ready_for_system_shutdown(void)
  * @pre vm_config != NULL
  * @Application constraint: The validity of vm_config->cpu_affinity should be guaranteed before run-time.
  */
+/*
+ * Static VM creation-to-run flow:
+ *
+ * The platform VM table is the policy source. Common VM code consumes only the
+ * configured load order, CPU affinity, guest flags, and boot image metadata; it
+ * does not invent board-specific placement or boot rules.
+ *
+ *   platform vm_config[]
+ *          |
+ *          v
+ *   launch_vms(pcpu_id)
+ *     - only the configured launch pCPU creates this VM
+ *     - service/pre-launched VMs are autostart candidates
+ *          |
+ *          v
+ *   create_vm()
+ *     - initialize common VM object and locks
+ *     - arch_init_vm() builds architecture state, including stage-2 root
+ *     - create_vm_vcpus() creates one scheduler thread per affinity bit
+ *          |
+ *          v
+ *   VM_CREATED
+ *          |
+ *          v
+ *   init_vm_boot_info() / prepare_os_image()
+ *     - discover configured boot modules
+ *     - copy or place the guest image into the VM memory contract
+ *          |
+ *          v
+ *   start_vm()
+ *     - arch_vm_prepare_bsp() finalizes the BSP entry state
+ *     - launch_vcpu(BSP) wakes the BSP vCPU thread
+ *          |
+ *          v
+ *   VM_RUNNING
+ *          |
+ *          v
+ *   scheduler picks vCPU thread -> arch_vcpu_thread() -> guest EL1 entry
+ *
+ * VM_CREATED means VM/vCPU objects and architecture state exist, but no guest
+ * code has run yet. VM_RUNNING is set only after the BSP vCPU is made runnable;
+ * AP vCPUs are later brought up by the guest-visible CPU_ON path.
+ */
 void launch_vms(uint16_t pcpu_id)
 {
 #if CONFIG_AUTOSTART_VM

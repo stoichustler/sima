@@ -8,6 +8,42 @@
 #include <logmsg.h>
 #include <cpu.h>
 
+/*
+ * Scheduler event principle:
+ *
+ * sched_event is a tiny exclusive wait primitive for one scheduler thread. It
+ * is not a counting semaphore and not a multi-waiter queue. The state is just:
+ *
+ *   +-------------------+
+ *   | set flag          |
+ *   | waiting_thread    |
+ *   +-------------------+
+ *
+ * Wait path:
+ *
+ *   current thread
+ *        |
+ *        v
+ *   event.lock
+ *     - record waiting_thread
+ *     - while !set: sleep_thread(waiter), drop lock, schedule()
+ *        |
+ *        v
+ *   signal wakes waiter or leaves set=true for the waiter to observe
+ *
+ * Signal path:
+ *
+ *   signal_event()
+ *        |
+ *        v
+ *   event.lock
+ *     - set = true
+ *     - wake waiting_thread if present
+ *
+ * The wakeup is not lost when signal_event() races with schedule(): the event
+ * flag remains set under the event lock, and wake_thread() raises scheduler
+ * state so the waiter or idle thread will re-check scheduling before continuing.
+ */
 void init_event(struct sched_event *event)
 {
 	spinlock_init(&event->lock);

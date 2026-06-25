@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2020-2022 Intel Corporation.
+ * Copyright (c) 2026 Hustler Lo
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -44,6 +45,61 @@
  */
 #define BVT_WARP_LIMIT_DEFAULT	1U
 
+/*
+ * BVT principle:
+ *
+ * BVT is a proportional-share scheduler built on virtual time. Real CPU
+ * runtime is charged to each runnable thread as AVT (actual virtual time).
+ * The charge rate is inverse to the thread weight, so a high-weight thread
+ * advances AVT more slowly and therefore receives a larger long-term CPU
+ * share. The runqueue is sorted by EVT (effective virtual time), and the
+ * lowest EVT runs first.
+ *
+ *   real runtime
+ *        |
+ *        v
+ *   +---------+     weight high      AVT grows slowly
+ *   | threadA |  ------------------------------------+
+ *   +---------+                                      |
+ *                                                    v
+ *                                                +-------+
+ *                                                |  AVT  |
+ *                                                +-------+
+ *                                                    |
+ *   +---------+     weight low       AVT grows fast  |
+ *   | threadB |  ------------------------------------+
+ *   +---------+
+ *
+ *   runqueue order:
+ *
+ *       lower EVT                       higher EVT
+ *   +-------------+   +-------------+   +-------------+
+ *   | next thread |-->| peer thread |-->| peer thread |
+ *   +-------------+   +-------------+   +-------------+
+ *
+ * SVT is the minimum AVT among runnable threads. A waking thread that slept
+ * for a long time is moved up to SVT instead of keeping an ancient AVT, which
+ * prevents unbounded catch-up execution after long sleep.
+ *
+ * Bounded warp is an ordering boost, not fairness credit:
+ *
+ *       event / wake
+ *            |
+ *            v
+ *      EVT = AVT - warp_value
+ *            |
+ *            v
+ *      reinsert by lower EVT
+ *
+ * AVT remains the long-term fairness ledger. warp_left is consumed only while
+ * the boosted thread actually runs; after the bounded window, EVT returns to
+ * AVT and normal proportional sharing resumes.
+ *
+ * The local one-shot timer is programmed from the first two runnable EVTs. It
+ * fires when the selected thread is expected to catch the next runnable peer,
+ * plus the context-switch allowance, and then asks the common scheduler to
+ * pick again.
+ */
 struct sched_bvt_data {
 	/* keep list as the first item */
 	struct list_head list;

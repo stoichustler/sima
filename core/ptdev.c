@@ -17,12 +17,39 @@
 #define PTIRQ_ENTRY_HASHBITS	9U
 #define PTIRQ_ENTRY_HASHSIZE	(1U << PTIRQ_ENTRY_HASHBITS)
 
+/*
+ * Pass-through IRQ remapping model
+ *
+ * A ptirq_remapping_info is the common software join point between the host
+ * interrupt source and the interrupt identity visible to a VM:
+ *
+ *   physical device IRQ
+ *          |
+ *   ptirq_interrupt_handler()       hard IRQ context, keep it short
+ *          |
+ *   per-pCPU softirq_dev_entry_list
+ *          |
+ *   SOFTIRQ_PTDEV                  bottom-half delivery point
+ *          |
+ *   ptirq_dequeue_softirq()
+ *          |
+ *   arch ptirq_softirq()           injects virtual INTx/MSI to the VM
+ *
+ * The common layer owns entry lifetime, lookup, hard-IRQ deferral, and the
+ * optional injection delay used for User VM interrupt storms. The architecture
+ * layer owns the actual virtual interrupt injection and chipset-specific
+ * remapping details.
+ *
+ * Two hash tables keep both directions cheap:
+ * - phys_sid_htable: physical-source lookup from the host IRQ path, vm == NULL.
+ * - virt_sid_htable: virtual-source lookup inside one VM for control paths.
+ */
 #define PTIRQ_BITMAP_ARRAY_SIZE	INT_DIV_ROUNDUP(CONFIG_MAX_PT_IRQ_ENTRIES, 64U)
 struct ptirq_remapping_info ptirq_entries[CONFIG_MAX_PT_IRQ_ENTRIES];
 static uint64_t ptirq_entry_bitmaps[PTIRQ_BITMAP_ARRAY_SIZE];
 spinlock_t ptdev_lock = { .head = 0U, .tail = 0U, };
 
-/* lookup mapping info from phyical sid, hashing from sid + acrn_vm structure address (NULL) */
+/* lookup mapping info from physical sid, hashing from sid + acrn_vm structure address (NULL) */
 static struct hlist_head phys_sid_htable[PTIRQ_ENTRY_HASHSIZE];
 /* lookup mapping info from virtual sid within a vm, hashing from sid + acrn_vm structure address */
 static struct hlist_head virt_sid_htable[PTIRQ_ENTRY_HASHSIZE];
@@ -55,7 +82,7 @@ static inline uint64_t ptirq_hash_key(const struct acrn_vm *vm,
 }
 
 /*
- * to find ptirq_remapping_info from phyical source id (vm == NULL) or
+ * to find ptirq_remapping_info from physical source id (vm == NULL) or
  * virtual source id in a vm.
  */
 struct ptirq_remapping_info *find_ptirq_entry(uint32_t intr_type,
@@ -182,7 +209,14 @@ void ptirq_release_entry(struct ptirq_remapping_info *entry)
 	(void)memset((void *)entry, 0U, sizeof(struct ptirq_remapping_info));
 }
 
-/* interrupt context */
+/*
+ * Physical IRQ handler.
+ *
+ * This path runs in hard IRQ context, so it does not inspect guest state or
+ * inject directly. It records interrupt pressure, optionally arms a delay
+ * timer for User VM storm control, and schedules SOFTIRQ_PTDEV to do the
+ * virtual delivery work at the common bottom-half boundary.
+ */
 static void ptirq_interrupt_handler(__unused uint32_t irq, void *data)
 {
 	struct ptirq_remapping_info *entry = (struct ptirq_remapping_info *) data;

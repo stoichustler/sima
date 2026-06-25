@@ -1,5 +1,6 @@
 /*-
  * Copyright (c) 2015 The FreeBSD Foundation
+ * Copyright (c) 2026 Hustler Lo
  *
  * This software was developed by Semihalf under
  * the sponsorship of the FreeBSD Foundation.

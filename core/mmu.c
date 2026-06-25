@@ -16,6 +16,37 @@
  * Architecture code logs the effective memory maps at boot.
  */
 #define DBG_LEVEL_MMU	(LOG_DEBUG + 1U)
+
+/*
+ * Generic page-table engine:
+ *
+ * core/mmu.c is the architecture-neutral walker used by both host MMU maps and
+ * VM second-stage maps. It does not know ARM64 descriptor bits or x86/EPT
+ * memory-type bits. Instead, each caller supplies a struct pgtable with:
+ *
+ *   +----------------------+        +-----------------------------+
+ *   | common walker        | -----> | architecture pgtable hooks  |
+ *   | - allocate pages     |        | - present test              |
+ *   | - walk levels 3..0   |        | - set descriptor            |
+ *   | - split large pages  |        | - cache/pagewalk flush      |
+ *   | - add/modify/delete  |        | - large-page capability     |
+ *   +----------------------+        +-----------------------------+
+ *
+ * The walker treats mappings as:
+ *
+ *     [vaddr_base, vaddr_base + size)
+ *          |
+ *          v
+ *     [paddr_base, paddr_base + size)
+ *
+ * For EL2 stage-1, vaddr is a host virtual address. For VM stage-2, vaddr is
+ * the guest physical/IPA address. The descriptor format is still supplied by
+ * the architecture hook, so the same traversal code can build ARM64 stage-1,
+ * ARM64 stage-2, x86 host, or EPT-style page tables.
+ *
+ * Page-table pages come from a small reserved pool. New tables are sanitized
+ * before use, so unused entries are never left with stale descriptors.
+ */
 void init_page_pool(struct page_pool *pool, uint64_t *page_base, uint64_t *bitmap_base, int page_num)
 {
        uint64_t bitmap_size = page_num / 8;
@@ -131,6 +162,26 @@ static void try_to_free_pgtable_page(const struct pgtable *table,
 
 /*
  * Split a large page table into next level page table.
+ *
+ * Large mappings are used when alignment and attributes allow one descriptor to
+ * cover a wide range. A later modify/delete may touch only part of that range.
+ * The walker then replaces the large leaf with a child table whose entries
+ * reproduce the original mapping at smaller granularity:
+ *
+ *   before:
+ *      PGTL2 leaf -> PA base, covers 1GB
+ *
+ *   split:
+ *      PGTL2 table pointer
+ *             |
+ *             v
+ *      +----------+----------+----------+
+ *      | PGTL1[0] | PGTL1[1] | ...      |
+ *      | same PA  | same PA  |          |
+ *      +----------+----------+----------+
+ *
+ * After the split, the caller can change or delete only the requested
+ * subrange, while the rest of the original large mapping remains equivalent.
  *
  * @pre: level could only PGT_LVL2 or PGT_LVL1
  */
@@ -316,6 +367,28 @@ static void modify_or_del_pgtl2(const uint64_t *pgtl3e, uint64_t vaddr_start, ui
  * address range is specified by [vaddr_base, vaddr_base + size). It is used when changing the access permissions of a
  * memory region or when freeing a previously mapped region. This operation is critical for dynamic memory management,
  * allowing the system to adapt to changes in memory usage patterns or to reclaim resources.
+ *
+ * Modify/delete principle:
+ *
+ *   target range
+ *        |
+ *        v
+ *   walk existing page-table hierarchy
+ *        |
+ *        +-- large leaf fully covers target chunk:
+ *        |       modify/delete that leaf directly
+ *        |
+ *        +-- large leaf partially overlaps target chunk:
+ *        |       split large leaf, then continue at lower level
+ *        |
+ *        +-- type == MR_MODIFY:
+ *        |       clear prot_clr bits, set prot_set bits
+ *        |
+ *        +-- type == MR_DEL:
+ *                sanitize leaf entry and free now-empty child tables
+ *
+ * The sanitized entry is architecture-defined. On ARM64 it is zero by default;
+ * on x86 it can point at a safe sanitized page.
  *
  * For error case behaviors:
  * - If the 'type' is MR_MODIFY and any page referenced by the PML4E in the specified address range is not present, the
@@ -522,6 +595,23 @@ static void add_pgtl2(const uint64_t *pgtl3e, uint64_t paddr_start, uint64_t vad
  *
  * This function maps a virtual address range specified by [vaddr_base, vaddr_base + size) to a physical address range
  * starting from 'paddr_base'.
+ *
+ * Add-map principle:
+ *
+ *   pgtable_add_map()
+ *          |
+ *          v
+ *   walk PGTL3 -> PGTL2 -> PGTL1 -> PGTL0
+ *          |
+ *          +-- if range is aligned and architecture allows it:
+ *          |       install a large leaf mapping
+ *          |
+ *          +-- otherwise:
+ *                  allocate the next-level table and continue walking
+ *
+ * The physical address advances by the same byte distance as the virtual
+ * address. Passing identical paddr/vaddr bases therefore builds an identity
+ * map; passing different bases builds an offset map.
  *
  * - If any subrange within [vaddr_base, vaddr_base + size) is already mapped, there is no change to the corresponding
  * mapping and it continues the operation.

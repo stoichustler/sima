@@ -1,6 +1,7 @@
 /*-
  * Copyright (c) 2015-2016 The FreeBSD Foundation
  * Copyright (c) 2023 Arm Ltd
+ * Copyright (c) 2026 Hustler Lo
  *
  * This software was developed by Andrew Turner under
  * the sponsorship of the FreeBSD Foundation.
@@ -101,8 +102,7 @@ void beau_gicv3_its_init(uint64_t base, uint64_t size)
 
 		if ((ctlr & GITS_CTLR_QUIESCENT) != 0U) {
 			beau_gicv3_its_ready = true;
-			pr_info("GICv3 ITS at 0x%08lx (0x%08lx) typer:0x%08lx",
-				base, size, beau_gits_read_8(GITS_TYPER));
+			pr_info("GICv3 ITS at 0x%08lx (0x%08lx)", base, size);
 			return;
 		}
 		cpu_relax();

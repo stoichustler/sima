@@ -7,9 +7,67 @@
  *
  * This scheduler is based on public real-time scheduling theory: each thread
  * is modeled as a periodic budget server, and runnable servers are ordered by
- * earliest absolute deadline. The implementation is written against BEAU's
- * scheduler and timer interfaces and intentionally does not copy, translate,
- * or preserve the structure, names, comments, or queue mechanics of Xen RTDS.
+ * earliest absolute deadline.
+ *
+ * Principle:
+ *
+ * Each non-idle thread owns one periodic server:
+ *
+ *     period = 10ms
+ *     budget = 3ms
+ *
+ *     |<--------------- period --------------->|
+ *     +===========+-----------------------------+
+ *     |  budget   |          no budget          |
+ *     +===========+-----------------------------+
+ *     ^                                         ^
+ *     current replenishment                     deadline / next replenishment
+ *
+ * Only actual execution consumes remaining_ticks. At each period boundary,
+ * unused budget is discarded, remaining_ticks is reset to budget_ticks, and
+ * deadline_ticks advances to the next period boundary.
+ *
+ * Queue model on each pCPU:
+ *
+ *  wake / runnable / period refresh
+ *                 |
+ *                 v
+ *    +-------------------------+
+ *    | remaining_ticks > 0 ?   |
+ *    +-------------------------+
+ *          |           |
+ *          | yes       | no
+ *          v           v
+ *   +-------------+   +----------------+
+ *   | ready_queue |   | depleted_queue |
+ *   | EDF ordered |   | no budget      |
+ *   +------+------+   +-------+--------+
+ *          |                  |
+ *          v                  |
+ *   earliest deadline         |
+ *          |                  |
+ *          v                  |
+ *   selected to run <---------+
+ *          work-conserving slack only when ready_queue is empty
+ *
+ * The ready_queue is ordered by earliest absolute deadline. The depleted_queue
+ * holds runnable threads that exhausted the current-period budget. BEAU keeps
+ * RTDS partitioned: each pCPU owns its own queues and timer, and threads do
+ * not migrate between pCPUs.
+ *
+ * Timer model:
+ *
+ *     running server
+ *          |
+ *          v
+ *   min(budget exhaustion, period boundary, earliest replenishment)
+ *          |
+ *          v
+ *   local one-shot timer -> account runtime -> request schedule()
+ *
+ * The timer callback does not directly pick the next thread. It records
+ * accounting, refreshes queues, raises NEED_RESCHEDULE, and lets the common
+ * scheduler path reprogram the next local one-shot deadline.
  *
  * Design model:
  * - BEAU already partitions schedulable objects by pCPU through thread->pcpu_id.
@@ -573,7 +631,7 @@ bool sched_get_rtds_stats(const struct thread_object *obj, struct sched_rtds_sta
 
 struct acrn_scheduler sched_rtds = {
 	.name		= "sched_rtds",
-	.stat_desc	= "work-conserving partitioned-edf default:period=10ms budget=3ms",
+	.stat_desc	= "work-conserving partitioned-edf:period=10ms budget=3ms",
 	.init		= sched_rtds_init,
 	.init_data	= sched_rtds_init_data,
 	.pick_next	= sched_rtds_pick_next,

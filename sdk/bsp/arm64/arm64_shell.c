@@ -297,6 +297,23 @@ static const char *shell_vtimer_trace_event_to_str(uint32_t event)
 {
 	const char *str;
 
+	/*
+	 * dumpstat prints short event names in the vtimer ring:
+	 * load/unload : vCPU switch boundary saved or restored timer state.
+	 * sysreg      : guest timer sysreg access updated the EL2 shadow.
+	 * ppi         : host generic-timer PPI reached EL2.
+	 * poll        : EL2 sampled an expired timer at a bounded sync point.
+	 * update      : timer state was synchronized into the vGIC line.
+	 * inject      : an expired timer became a guest-visible PPI.
+	 * eoi         : guest completed the virtual timer interrupt.
+	 * requeue     : timer line was queued again after vGIC/timer sync.
+	 * backup      : rescue backup timer fired or was armed for recovery.
+	 * wfi         : WFI rescue path trapped guest idle for one retry.
+	 * pending-lr  : timer exists only as a pending virtual LR.
+	 * lost-lr     : pending-only LR disappeared before guest completion.
+	 * mask        : EL2 host PPI priority mask changed.
+	 * stall       : stale pending LR/host handoff stall was detected.
+	 */
 	switch (event) {
 	case ARM64_VTIMER_TRACE_LOAD:
 		str = "load";
@@ -356,9 +373,10 @@ static const char *shell_guest_trace_event_to_str(uint8_t event)
 	const char *str;
 
 	/*
-	 * enter  : vCPU thread -> EL1.
-	 * exit   : EL1 -> EL2.
-	 * resume : EL2 -> EL1.
+	 * Guest trace event names describe EL1/EL2 control boundaries:
+	 * enter  : vCPU thread is about to enter guest EL1.
+	 * exit   : guest returned to EL2 because of a trap or IRQ.
+	 * resume : EL2 handled the exit and is about to return to EL1.
 	 */
 	switch (event) {
 	case ARM64_VCPU_GUEST_TRACE_ENTER:

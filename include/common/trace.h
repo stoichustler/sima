@@ -12,7 +12,24 @@
 #ifndef TRACE_H
 #define TRACE_H
 #include <asm/per_cpu.h>
- /* TIMER EVENT */
+
+/*
+ * Common trace event ID layout:
+ * - 0x0001..0x0004: common timer queue and hardware IRQ events.
+ * - 0x0010..0x0011: VM enter/exit boundaries.
+ * - 0x0020: scheduler choice, currently emitted with the next thread name.
+ * - 0x10000 + reason: VM-exit namespace. On x86 the low bits mirror VMX
+ *   basic exit reasons, so trace decoders can subtract TRACE_VMEXIT_ENTRY
+ *   and compare the result with the architecture manual.
+ * - 0x20000: fallback event for a VM exit that reached the unhandled path.
+ *
+ * Payload helper contract:
+ * - TRACE_2L stores two 64-bit values.
+ * - TRACE_4I stores four 32-bit values.
+ * - TRACE_16STR stores a short, NUL-terminated diagnostic string.
+ */
+
+/* TIMER EVENT */
 #define TRACE_TIMER_ACTION_ADDED	0x1U
 #define TRACE_TIMER_ACTION_PCKUP	0x2U
 #define TRACE_TIMER_ACTION_UPDAT	0x3U

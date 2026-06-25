@@ -157,24 +157,48 @@ static void init_hv_mapping(void)
 	ppt_mmu_top_addr = (uint64_t *)alloc_page(&ppt_page_pool);
 
 	/*
-	 * Build a conservative identity map for EL2:
-	 * - platform MMIO is mapped as device memory,
-	 * - host RAM is mapped as normal memory,
-	 * - FDT reserved regions are removed,
-	 * - the hypervisor image is made executable while the rest remains NX.
+	 * EL2 stage-1 identity-map principle:
 	 *
-	 * pgtable_add_map() takes (physical base, virtual base, size). Passing
-	 * the same address for both bases is the whole 1:1 stage-1 construction:
-	 * every EL2 virtual address used by early boot, exception code, memcpy,
-	 * and MMIO helpers resolves to the same host physical address. Attributes
-	 * still differ by range, so RAM receives normal-cacheable descriptors and
-	 * device windows receive device descriptors even though both are identity
-	 * mapped.
+	 * BEAU keeps the host bootstrap address model simple: the virtual address
+	 * used by EL2 is the same numeric value as the host physical address placed
+	 * in the descriptor. Translation is still enabled, but it preserves the
+	 * address number while attaching ARM64 memory attributes and permissions.
 	 *
-	 * Reserved FDT ranges are deleted after the broad RAM identity map so EL2
-	 * does not accidentally access firmware-owned memory. The hypervisor image
-	 * remains identity mapped, but its leaf descriptors are modified to allow
-	 * instruction fetch while the rest of the identity RAM map stays NX.
+	 *      EL2 VA / HVA                 stage-1 page table                 HPA
+	 *   +--------------+        +-----------------------------+       +--------------+
+	 *   | 0x48000000   | -----> | output address: 0x48000000  | ----> | 0x48000000   |
+	 *   +--------------+        | attr: normal/device, XN/RW  |       +--------------+
+	 *                           +-----------------------------+
+	 *
+	 * pgtable_add_map(root, paddr, vaddr, size, ...) receives the physical base
+	 * first and the virtual base second. Passing the same value for both bases
+	 * builds the 1:1 relationship:
+	 *
+	 *      paddr_base == vaddr_base
+	 *              |
+	 *              v
+	 *      [VA start, VA end) -> [same-number PA start, same-number PA end)
+	 *
+	 * 1:1 does not mean all ranges are equivalent. The address relation stays
+	 * identity, while descriptor attributes remain range-specific:
+	 *
+	 *   +---------+  device memory, no normal caching    +----------------+
+	 *   |  MMIO   | -----------------------------------> | device window  |
+	 *   +---------+                                      +----------------+
+	 *
+	 *   +---------+  normal cacheable RAM, mostly NX     +----------------+
+	 *   |  RAM    | -----------------------------------> | physical RAM   |
+	 *   +---------+                                      +----------------+
+	 *
+	 *   +---------+  same VA==PA, executable code/data   +----------------+
+	 *   | HV image| -----------------------------------> | BEAU image     |
+	 *   +---------+                                      +----------------+
+	 *
+	 * The map is built broad-to-narrow: map platform MMIO, map RAM, delete FDT
+	 * reserved ranges from the RAM map, then relax XN only for the hypervisor
+	 * image. This keeps early boot, exception vectors, memcpy, and MMIO helpers
+	 * using direct physical-looking addresses without giving reserved firmware
+	 * memory or ordinary RAM unintended execute permission.
 	 */
 	mmio_regions = arm64_get_platform_mmio_regions(&mmio_region_count);
 	for (idx = 0U; idx < mmio_region_count; idx++) {

@@ -30,6 +30,27 @@
 #define ARM64_VCPU_DEBUG_INVALID_VCPU_ID	0xffffU
 #define ARM64_VCPU_DEBUG_VGIC_SYNC		1U
 #define ARM64_VCPU_DEBUG_VGIC_MAINTENANCE	2U
+
+/*
+ * ARM64 dumpstat trace event IDs.
+ *
+ * vtimer events record semantic edges in virtual timer delivery, not every
+ * guest exit:
+ * - LOAD/UNLOAD: vCPU switch-in/out loads or saves guest timer state.
+ * - SYSREG: guest CNT{P,V}_* system-register access updated shadow state.
+ * - PPI/POLL/UPDATE: EL2 found an expired timer via host PPI, bounded poll,
+ *   or explicit sync point and synchronized the vGIC timer line.
+ * - INJECT/EOI/REQUEUE: guest-visible timer PPI was injected, completed by
+ *   EOI, or requeued after timer/vGIC state changed.
+ * - BACKUP/WFI: rescue paths for a running or sleeping vCPU whose timer could
+ *   otherwise stay hidden behind a masked host PPI or stale LR.
+ * - PENDING_LR/LOST_LR/MASK/STALL: diagnostics for LR ownership and host PPI
+ *   masking when investigating lost or repeated timer interrupts.
+ *
+ * Guest trace events describe EL1/EL2 boundaries: ENTER enters guest EL1, EXIT
+ * records a trap/IRQ back to EL2, and RESUME records return to EL1 after EL2
+ * has handled that exit.
+ */
 #define ARM64_VCPU_VTIMER_TRACE_NUM		8U
 #define ARM64_VTIMER_TRACE_LOAD		1U
 #define ARM64_VTIMER_TRACE_UNLOAD		2U

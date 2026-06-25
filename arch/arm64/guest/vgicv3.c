@@ -50,23 +50,56 @@
 #include <asm/guest/vgicv3.h>
 
 /*
- * ARM64 GICv3 virtualization has a split model:
- * - hardware list registers (LRs) are loaded for the currently running vCPU,
- * - software descriptors keep the guest-visible pending/active/enable state,
- * - guest MMIO/system-register accesses mutate the software model.
+ * vGICv3 virtualization principle:
  *
- * Sync pulls completed LR state back into software. Flush pushes pending
- * software state into available LRs. This keeps the common scheduler free to
- * switch vCPUs without losing in-flight virtual interrupt state.
+ * The guest sees a GIC Distributor, Redistributors, CPU interface, and optional
+ * ITS. EL2 backs that view with software descriptors and uses hardware list
+ * registers only as a short-lived delivery cache for the currently loaded vCPU.
  *
- * Interrupt virtualization flow:
+ *   authoritative software model              hardware delivery cache
+ *   +-----------------------------+   flush   +-----------------------------+
+ *   | irq descriptor              | --------> | ICH_LR<n>                   |
+ *   | - enabled / pending         |           | - virq / priority           |
+ *   | - active / level            |           | - pending / active bits     |
+ *   | - priority / target vCPU    |           +-----------------------------+
+ *   +--------------+--------------+                         |
+ *                  ^                                        |
+ *                  | sync / maintenance / guest exit        |
+ *                  +----------------------------------------+
  *
- *   guest ICC/GIC access or host event
- *        -> vGIC descriptor + pending bitmap
- *        -> vgicv3_sync_vcpu() reads completed LR state
- *        -> vgicv3_flush_vcpu() writes deliverable IRQs into LRs
- *        -> guest IAR/EOIR consumes the virtual interrupt
- *        -> maintenance IRQ or next sync reconciles active/pending state
+ * Pending bitmaps are indexes, not authority:
+ *
+ *   event source / guest GIC write
+ *              |
+ *              v
+ *   +-------------------+     set/clear      +------------------+
+ *   | irq descriptor    | -----------------> | pending bitmap   |
+ *   +-------------------+                    +------------------+
+ *              |
+ *              v
+ *   flush scans bitmap, checks descriptor rules, and fills free LRs
+ *
+ * Normal interrupt lifecycle:
+ *
+ *   device/MSI/SGI/timer event
+ *        -> descriptor.pending = true
+ *        -> optional wake/reschedule of target vCPU
+ *        -> vgicv3_flush_vcpu() publishes deliverable IRQs into LRs
+ *        -> EL1 reads IAR and later EOIs/deactivates
+ *        -> maintenance IRQ or vgicv3_sync_vcpu() copies LR evidence back
+ *        -> descriptor pending/active state becomes authoritative again
+ *
+ * This split keeps scheduling and interrupt delivery independent. A vCPU can
+ * be switched out with in-flight virtual interrupts because sync saves LR
+ * evidence into software, and a later flush reconstructs the guest-visible CPU
+ * interface when that vCPU runs again.
+ *
+ * Guest MMIO/system-register accesses mutate only the software model first:
+ *
+ *   GICD/GICR/GITS MMIO or ICC_* trap
+ *        -> sync current LRs
+ *        -> emulate register access against descriptors/ITS tables
+ *        -> flush if the guest-visible delivery state changed
  *
  * vtimer virtualization flow:
  *
@@ -1024,9 +1057,21 @@ void arm64_vgicv3_global_init(void)
 {
 	if (!vgic_global_initialized) {
 		/*
-		 * ICH_VTR_EL2 reports the hardware LR count minus one. Clamp to
-		 * the static context array size so the save/restore path has a
-		 * fixed bound even on larger GIC implementations.
+		 * ICH_VTR_EL2 reports the hardware LR count minus one. The value is a
+		 * property of the GICv3 CPU interface implemented by the platform or CPU
+		 * model, not a BEAU policy knob. QEMU virt currently reports ListRegs=3,
+		 * so BEAU prints "4 list registers":
+		 *
+		 *     ICH_VTR_EL2.ListRegs = 3
+		 *                |
+		 *                v
+		 *     usable LR slots = ListRegs + 1 = 4
+		 *
+		 * Four LRs only limit how many virtual interrupts can be resident in
+		 * hardware at one time. Extra pending IRQs stay in the software
+		 * descriptor/pending-bitmap model and are flushed into LRs after sync or
+		 * maintenance frees a slot. Clamp to the static context array size so the
+		 * save/restore path has a fixed bound even on larger GIC implementations.
 		 */
 		vgic_lr_count = (uint32_t)((read_ich_vtr_el2() & 0x1fUL) + 1UL);
 		if (vgic_lr_count > ARM64_VGIC_MAX_LRS) {

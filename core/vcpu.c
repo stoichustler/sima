@@ -15,6 +15,52 @@
 
 #include <asm/notify.h>
 
+/*
+ * Common vCPU lifecycle principle:
+ *
+ * The common layer treats a vCPU as a schedulable thread bound to one pCPU.
+ * Architecture code owns guest register/MMU/interrupt state; this file owns
+ * object lifetime, pCPU binding, generic requests, and the bridge into the
+ * scheduler.
+ *
+ *   VM cpu_affinity bit
+ *          |
+ *          v
+ *   create_vcpu(vm, pcpu)
+ *     - assign vcpu_id from creation order
+ *     - bind thread_obj to per-pCPU sched_ctl
+ *     - initialize events and arch-private vCPU state
+ *          |
+ *          v
+ *      VCPU_INIT
+ *          |
+ *          v
+ *   launch_vcpu()
+ *     - set VCPU_RUNNING
+ *     - wake vCPU thread
+ *          |
+ *          v
+ *   scheduler picks thread_obj
+ *          |
+ *          v
+ *   arch_vcpu_thread() enters guest
+ *
+ * Generic event delivery is deferred through pending_req. Producers set a bit,
+ * ask the scheduler for priority treatment, and kick the pCPU if the target
+ * vCPU is currently running remotely. The architecture vCPU thread consumes the
+ * request at a safe guest-entry boundary.
+ *
+ *   injector / device / vGIC
+ *          |
+ *          v
+ *   vcpu_make_request()
+ *     - pending_req bit
+ *     - request_thread_priority()
+ *     - remote kick if needed
+ *          |
+ *          v
+ *   target vCPU thread handles request before next EL1 entry
+ */
 bool is_vcpu_bsp(const struct acrn_vcpu *vcpu)
 {
 	return (vcpu->vcpu_id == BSP_CPU_ID);
@@ -172,7 +218,7 @@ int32_t create_vcpu(struct acrn_vm *vm, uint16_t pcpu_id)
 		 * needs revise.
 		 */
 
-		pr_info("create vm%d:vcpu%d, role: %s",
+		pr_info("create vm%d:vcpu%d runs as %s vcpu",
 				vcpu->vm->vm_id, vcpu->vcpu_id,
 				is_vcpu_bsp(vcpu) ? "  primary" : "secondary");
 

@@ -39,6 +39,61 @@
 #include <asm/sysreg.h>
 #include <asm/guest/vgicv3.h>
 
+/*
+ * vtimer virtualization principle:
+ *
+ * The physical CPU exposes one live CNTV register bank. BEAU saves each guest
+ * timer as vCPU shadow state and loads that shadow only while the vCPU is
+ * scheduled. The guest-visible interrupt is delivered through the vGIC, not by
+ * handing the host scheduler's physical timer to EL1.
+ *
+ *   guest programmed timer shadow             live pCPU timer state
+ *   +-----------------------------+  load    +-----------------------------+
+ *   | cntv_ctl/cval or cntp_ctl   | -------> | CNTV_CTL_EL0 / CNTV_CVAL    |
+ *   | timer_virq                  |          | physical PPI27 to EL2       |
+ *   | cntvoff_el2                 |          +-------------+---------------+
+ *   +--------------+--------------+                        |
+ *                  ^                                       |
+ *                  | save                                  v
+ *                  +---------------------------+   EL2 PPI handler
+ *                                              |
+ *                                              v
+ *                                      +----------------+
+ *                                      | vGIC timer IRQ |
+ *                                      +----------------+
+ *
+ * Ownership rules:
+ *
+ * - CNTP/PPI30 is reserved for the EL2 scheduler tick.
+ * - CNTV/PPI27 is the hardware source used to detect the loaded guest's timer
+ *   deadline.
+ * - timer_virq is the guest ABI number. Linux uses virtual timer PPI27; an RTOS
+ *   can choose the physical-timer PPI while BEAU still backs it with CNTV.
+ * - A timer sysreg write is a guest ownership boundary: update the shadow,
+ *   update the live CNTV registers if this vCPU is loaded, and let vGIC refresh
+ *   the level line.
+ *
+ * Loaded-vCPU path:
+ *
+ *   EL1 writes CNTV/CNTP
+ *        -> trap/emulate or sample live CNTV
+ *        -> update vCPU shadow
+ *        -> expired line asserts descriptor.pending in vGIC
+ *        -> vGIC flush creates a timer LR
+ *        -> EL1 IAR/EOI or reprogram lowers/completes the line
+ *
+ * Switched-out path:
+ *
+ *   save live CNTV shadow
+ *        -> disable live CNTV for the next vCPU
+ *        -> arm host backup timer for saved deadline
+ *        -> backup handler injects the same timer_virq if the deadline expires
+ *
+ * Host PPI27 masking is private EL2 bookkeeping. When a timer LR owns an
+ * expired guest line, BEAU can lower PPI27 priority so the host does not keep
+ * taking the same physical interrupt, while the guest shadow still reports the
+ * original CNTV_CTL state.
+ */
 #define	VTIMER_STUCK_RESCUE_US			500U
 #define	VTIMER_LR_RESCUE_RESCHED_BUDGET	4U
 

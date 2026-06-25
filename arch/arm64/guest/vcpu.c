@@ -21,13 +21,49 @@
 #include <asm/guest/vgicv3.h>
 
 /*
- * CPU virtualization keeps two layers of state:
- * - vcpu->arch.regs is the persistent guest register image.
- * - gctx/vgic fields are EL2 control state loaded around scheduling.
+ * vCPU virtualization principle:
  *
- * The scheduler treats each vCPU as a thread. Context switch hooks program the
- * EL2 virtualization registers before the thread enters the guest and save
- * them back when the thread is switched out.
+ * BEAU models each vCPU as a scheduler thread. The thread owns a durable guest
+ * state image, while the physical CPU holds a live copy only between
+ * arch_context_switch_in() and arch_context_switch_out().
+ *
+ *   durable vCPU state                         live pCPU state
+ *   +----------------------+    switch in     +----------------------+
+ *   | vcpu->arch.regs      | ---------------> | EL1 GPR/sysregs      |
+ *   | vcpu->arch.gctx      |                  | HCR/VTTBR/VTCR       |
+ *   | vcpu->arch.vgic      |                  | GIC list registers   |
+ *   | vtimer shadow state  |                  | CNTV registers       |
+ *   +----------------------+                  +----------------------+
+ *             ^                                         |
+ *             |                  switch out             |
+ *             +-----------------------------------------+
+ *
+ * Guest execution is therefore a repeated ownership handoff:
+ *
+ *   scheduler picks vCPU thread
+ *          |
+ *          v
+ *   load_vcpu()
+ *     - install stage-2 root through VTTBR/VTCR
+ *     - restore guest EL1 sysregs and saved GPR frame
+ *     - load vtimer state and vGIC LRs
+ *          |
+ *          v
+ *   ERET to EL1 guest
+ *          |
+ *          v
+ *   trap / IRQ / request exits to EL2
+ *          |
+ *          v
+ *   handle exit, sync vGIC/vtimer, update vcpu->arch.regs
+ *          |
+ *          v
+ *   either re-enter guest or save state on scheduler switch-out
+ *
+ * The persistent register block is not used as the live EL2 stack. Guest entry
+ * builds a temporary restore frame on the vCPU thread stack, and guest exits
+ * copy the hardware frame back into vcpu->arch.regs. This keeps scheduler
+ * context switches independent from guest register save/restore mechanics.
  */
 #define SPSR_EL2_MODE_EL1H	0x5UL
 #define ARM64_GUEST_SCTLR_EL1_INIT	0x00c50078UL
