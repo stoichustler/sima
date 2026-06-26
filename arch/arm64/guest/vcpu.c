@@ -377,7 +377,17 @@ void load_vcpu(__unused struct acrn_vcpu *vcpu)
 	write_vttbr_el2(gctx->vttbr_el2);
 	flush_stage2_tlb_local();
 	write_vmpidr_el2(vcpu_get_vmpidr(vcpu));
-	write_cnthctl_el2(CNTHCTL_EL2_EL1PCTEN);
+	/*
+	 * 2026-06-26, vCPU/vtimer principle:
+	 *
+	 *   CNTVCT_EL0 read  -> hardware CNTVCT = CNTPCT - CNTVOFF_EL2
+	 *   CNTV timer regs  -> EL2 trap -> guest shadow -> live CNTV
+	 *
+	 * EL2 may mask the live CNTV comparator while vGIC owns PPI27. Trap the
+	 * guest CNTV control path so Linux reads the guest-visible timer status
+	 * from the shadow state, not from EL2's private live IMASK bit.
+	 */
+	write_cnthctl_el2(CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1TVT);
 	asm volatile ("msr cntvoff_el2, %0; isb" : : "r" (gctx->cntvoff_el2) : "memory");
 	restore_el1_sysregs(gctx);
 	arm64_vtimer_load_current(vcpu);

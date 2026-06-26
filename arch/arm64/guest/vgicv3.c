@@ -1401,9 +1401,16 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				bool line_asserted = arm64_vtimer_sample_current(vcpu);
 
 				/*
-				 * PPI27 is now a software level IRQ in the vGIC. Pending-only
-				 * state is synchronized from the sampled CNTV line, but it is not
-				 * promoted into a separate owner state.
+				 * 2026-06-26, vtimer/vGIC sync:
+				 *
+				 *   CNTV level high
+				 *          |
+				 *          v
+				 *   pending-only PPI27 LR -> keep pending, clear LR.EOI
+				 *
+				 * PPI27 is a software level IRQ sourced by CNTV. A pending-only
+				 * LR has not been acknowledged by EL1; preserving ICH_LR_EOI can
+				 * report fake EOI maintenance around the same masked source.
 				 */
 				vcpu->arch.debug.vtimer_diag.pending_only_lr_seen++;
 				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id,
@@ -1414,6 +1421,14 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_drop++;
 					remove_lr(vcpu, idx);
 				} else {
+					uint64_t clean_lr = lr & ~ICH_LR_EOI;
+
+					if (clean_lr != lr) {
+						ctx->lr[idx] = clean_lr;
+						if (loaded) {
+							write_ich_lr_el2((uint8_t)idx, clean_lr);
+						}
+					}
 					arm64_vtimer_set_host_mask(vcpu, true);
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_preserve++;
 					idx++;

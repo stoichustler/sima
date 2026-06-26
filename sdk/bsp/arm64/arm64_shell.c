@@ -274,25 +274,6 @@ static const char *shell_yes_no(bool value)
 	return value ? "Y" : "N";
 }
 
-static const char *shell_vgic_source_to_str(uint32_t source)
-{
-	const char *str;
-
-	switch (source) {
-	case ARM64_VCPU_DEBUG_VGIC_SYNC:
-		str = "sync";
-		break;
-	case ARM64_VCPU_DEBUG_VGIC_MAINTENANCE:
-		str = "maintenance";
-		break;
-	default:
-		str = "none";
-		break;
-	}
-
-	return str;
-}
-
 static const char *shell_vtimer_trace_event_to_str(uint32_t event)
 {
 	const char *str;
@@ -308,8 +289,8 @@ static const char *shell_vtimer_trace_event_to_str(uint32_t event)
 	 * eoi         : guest completed the virtual timer interrupt.
 	 * requeue     : timer line was queued again after vGIC/timer sync.
 	 * backup      : offline backup timer fired for an unloaded vCPU.
-	 * pending-lr  : timer exists only as a pending virtual LR.
-	 * lost-lr     : pending-only LR disappeared before guest completion.
+	 * lr-pending  : pending-only timer PPI already resides in a guest LR.
+	 * lr-noeoi    : old pending timer LR is absent and no EOI was reported.
 	 * mask        : EL2 live CNTV IMASK ownership changed.
 	 * stall       : stale pending LR/host handoff stall was detected.
 	 */
@@ -345,10 +326,10 @@ static const char *shell_vtimer_trace_event_to_str(uint32_t event)
 		str = "backup";
 		break;
 	case ARM64_VTIMER_TRACE_PENDING_LR:
-		str = "pending-lr";
+		str = "lr-pending";
 		break;
 	case ARM64_VTIMER_TRACE_LOST_LR:
-		str = "lost-lr";
+		str = "lr-noeoi";
 		break;
 	case ARM64_VTIMER_TRACE_MASK:
 		str = "mask";
@@ -392,64 +373,6 @@ static const char *shell_guest_trace_event_to_str(uint8_t event)
 	return str;
 }
 
-static void shell_dumpstat_vgic_event(const char *label,
-	const struct arm64_vcpu_last_vgic *last)
-{
-	/*
-	 * These lines expose the last hardware/software vGIC sync boundary so a
-	 * stalled guest can be classified without adding noisy interrupt logs.
-	 */
-	if (last->tsc == 0UL) {
-		shell_item_line("%s:none", label);
-	} else {
-		shell_item_line("%s:src:%s count:%u used_lrs:%u misr:0x%016lx tsc:0x%08lx",
-			label, shell_vgic_source_to_str(last->source),
-			last->count, last->used_lrs, last->misr, last->tsc);
-		shell_item_line("         hcr:0x%016lx  vmcr:0x%016lx eisr:0x%016lx elrsr:0x%016lx",
-			last->hcr, last->vmcr, last->eisr, last->elrsr);
-		shell_item_line("       ap0r0:0x%016lx ap1r0:0x%016lx  lr0:0x%016lx   lr1:0x%016lx",
-			last->ap0r0, last->ap1r0, last->lr0, last->lr1);
-	}
-}
-
-static void shell_dumpstat_guest_resume(const struct arm64_vcpu_guest_resume *last)
-{
-	if (last->tsc == 0UL) {
-		shell_item_line("last-resume:none");
-	} else {
-		shell_item_line("last-resume:src:%u pc:0x%016lx spsr:0x%016lx tsc:0x%08lx",
-			last->source, last->elr, last->spsr, last->tsc);
-		shell_item_line("            cntv_ctl:0x%08x cntv_exp:%s el2_mask:%s virq:%u p/a/l:%s/%s/%s",
-			last->cntv_ctl, shell_yes_no(last->cntv_expired),
-			shell_yes_no(last->cntv_el2_masked), last->timer_virq,
-			shell_yes_no(last->timer_pending),
-			shell_yes_no(last->timer_active),
-			shell_yes_no(last->timer_level));
-		shell_item_line("            htimer_ctl:0x%08x cval:0x%016lx delta:%ld",
-			last->host_timer_ctl, last->host_timer_cval,
-			(int64_t)(last->host_timer_cval - last->host_cntpct));
-		shell_item_line("            cntv_irq valid:%s en:%s pend:%s act:%s",
-			shell_yes_no(last->host_valid),
-			shell_yes_no(last->host_enabled),
-			shell_yes_no(last->host_pending),
-			shell_yes_no(last->host_active));
-		shell_item_line("            lr0:0x%016lx lr1:0x%016lx live_lr0:0x%016lx live_lr1:0x%016lx",
-			last->sw_lr0, last->sw_lr1, last->live_lr0, last->live_lr1);
-	}
-}
-
-static void shell_dumpstat_last_exit(const struct arm64_vcpu_last_exit *last)
-{
-	if (last->tsc == 0UL) {
-		shell_item_line("last-exit:none");
-	} else {
-		shell_item_line("last-exit:src:%u ec:0x%x status:%d elr:0x%016lx esr:0x%016lx",
-			last->source, last->ec, last->status, last->elr, last->esr);
-		shell_item_line("          far:0x%016lx hpfar:0x%016lx tsc:0x%08lx",
-			last->far, last->hpfar, last->tsc);
-	}
-}
-
 static void shell_dumpstat_guest_trace(const struct arm64_vcpu_guest_trace *trace)
 {
 	uint32_t count = trace->count;
@@ -478,15 +401,15 @@ static void shell_dumpstat_guest_trace(const struct arm64_vcpu_guest_trace *trac
 			0UL : ticks_to_us(entry->tsc - prev_tsc);
 
 		if (entry->ec == ARM64_VCPU_DEBUG_EXIT_EC_INVALID) {
-			shell_item_line("gt[%02u] %-6s pcpu:%hu src:0x%02x ec:N/A  status:%3d delta.us:%8lu tsc:0x%016lx",
+			shell_item_line("gt[%02u] %-6s pcpu:%hu src:0x%02x ec:N/A  status:%3d delta.us:%8lu",
 				idx, shell_guest_trace_event_to_str(entry->event),
 				entry->pcpu_id, entry->source, entry->status,
-				delta_us, entry->tsc);
+				delta_us);
 		} else {
-			shell_item_line("gt[%02u] %-6s pcpu:%hu src:0x%02x ec:0x%02x status:%3d delta.us:%8lu tsc:0x%016lx",
+			shell_item_line("gt[%02u] %-6s pcpu:%hu src:0x%02x ec:0x%02x status:%3d delta.us:%8lu",
 				idx, shell_guest_trace_event_to_str(entry->event),
 				entry->pcpu_id, entry->source, entry->ec, entry->status,
-				delta_us, entry->tsc);
+				delta_us);
 		}
 		shell_item_line("       elr:0x%016lx esr:0x%016lx far:0x%016lx hpfar:0x%016lx",
 			entry->elr, entry->esr, entry->far, entry->hpfar);
@@ -515,16 +438,15 @@ static void shell_dumpstat_vtimer_trace(const struct arm64_vcpu_vtimer_trace *tr
 		const struct arm64_vcpu_vtimer_trace_entry *entry = &trace->entry[ring_idx];
 		int64_t delta = (int64_t)(entry->cval - entry->cntvct);
 
-		shell_item_line("vt[%02u] %-7s pcpu:%hu virq:%u ctl:0x%08x exp:%s mask:%s p/a/l:%s/%s/%s wr:%s inj:%s delta:%ld",
+		shell_item_line("vt[%02u] %-10s pcpu:%hu virq:%u ctl:0x%08x exp:%s mask:%s p/a/l:%s/%s/%s wr:%s inj:%s delta:%ld",
 			idx, shell_vtimer_trace_event_to_str(entry->event),
 			entry->pcpu_id, entry->virq, entry->ctl,
 			shell_yes_no(entry->expired), shell_yes_no(entry->masked),
 			shell_yes_no(entry->pending), shell_yes_no(entry->active),
 			shell_yes_no(entry->level), shell_yes_no(entry->write),
 			shell_yes_no(entry->injected), delta);
-		shell_item_line("       cval:0x%016lx cntvct:0x%016lx lr0:0x%016lx hcr:0x%016lx misr:0x%016lx tsc:0x%08lx",
-			entry->cval, entry->cntvct, entry->lr0, entry->hcr,
-			entry->misr, entry->tsc);
+		shell_item_line("       cval:0x%016lx cntvct:0x%016lx lr0:0x%016lx hcr:0x%016lx",
+			entry->cval, entry->cntvct, entry->lr0, entry->hcr);
 	}
 }
 
@@ -558,8 +480,6 @@ static void shell_dumpstat_unwind_host_stack(uint64_t sp, uint64_t fp, uint64_t 
 	uint64_t stack_start, uint64_t stack_end)
 {
 	uint32_t idx;
-
-	shell_item_line("stack range:0x%016lx-0x%016lx", stack_start, stack_end);
 
 	if (!shell_stack_contains(stack_start, stack_end, sp, sizeof(uint64_t))) {
 		shell_item_line("trace unavailable: sp is outside the stack");
@@ -597,8 +517,6 @@ static void shell_dumpstat_vm_stack(struct acrn_vcpu *vcpu, const struct cpu_reg
 	uint64_t lr = regs->lr;
 	uint32_t idx;
 
-	shell_item_line("pc:0x%016lx  sp:0x%016lx", regs->elr, regs->sp);
-
 	if ((fp == 0UL) && (lr == 0UL)) {
 		shell_item_line("trace unavailable: empty frame registers");
 		return;
@@ -612,7 +530,6 @@ static void shell_dumpstat_vm_stack(struct acrn_vcpu *vcpu, const struct cpu_reg
 		}
 
 		if (copy_from_gpa(vcpu->vm, &frame, fp, sizeof(frame)) != 0) {
-			shell_item_line("trace stopped: guest fp is not directly readable as GPA");
 			break;
 		}
 		if ((frame.fp == 0UL) || (frame.fp <= fp)) {
@@ -635,7 +552,6 @@ static void shell_dumpstat_host_stack(const struct acrn_vcpu *vcpu)
 		return;
 	}
 
-	shell_item_line("pcpu:%hu from vcpu", pcpuid_from_vcpu(vcpu));
 	shell_dumpstat_unwind_host_stack(vcpu->thread_obj.host_sp,
 		saved_frame->x29, saved_frame->lr, stack_start, stack_end);
 }
@@ -653,17 +569,8 @@ struct dumpstat_snapshot {
 	uint64_t live_cntpct_el0;
 	uint64_t live_cntvoff_el2;
 	uint64_t live_cntv_cval_el0;
-	uint64_t live_vbar_el1;
-	uint64_t live_sp_el0;
-	uint64_t live_elr_el1;
-	uint64_t live_spsr_el1;
 	uint64_t live_ich_hcr_el2;
 	uint64_t live_ich_vmcr_el2;
-	uint64_t live_ich_misr_el2;
-	uint64_t live_ich_eisr_el2;
-	uint64_t live_ich_elrsr_el2;
-	uint64_t live_ich_ap0r0_el2;
-	uint64_t live_ich_ap1r0_el2;
 	uint64_t live_ich_lr[4U];
 	uint64_t pending_req;
 	uint64_t irqs_pending;
@@ -696,22 +603,8 @@ static void shell_dumpstat_capture(void *data)
 		snapshot->live_cntvoff_el2 = read_cntvoff_el2();
 		snapshot->live_cntv_cval_el0 = read_cntv_cval_el0();
 		snapshot->live_cntv_ctl_el0 = read_cntv_ctl_el0();
-		/*
-		 * EL1 exception state explains whether Linux will vector to the
-		 * expected kernel table and whether EL1t stack state is drifting
-		 * from the shadow context kept by the vCPU scheduler.
-		 */
-		snapshot->live_vbar_el1 = read_vbar_el1();
-		snapshot->live_sp_el0 = read_sp_el0();
-		snapshot->live_elr_el1 = read_elr_el1();
-		snapshot->live_spsr_el1 = read_spsr_el1();
 		snapshot->live_ich_hcr_el2 = read_ich_hcr_el2();
 		snapshot->live_ich_vmcr_el2 = read_ich_vmcr_el2();
-		snapshot->live_ich_misr_el2 = read_ich_misr_el2();
-		snapshot->live_ich_eisr_el2 = read_ich_eisr_el2();
-		snapshot->live_ich_elrsr_el2 = read_ich_elrsr_el2();
-		snapshot->live_ich_ap0r0_el2 = read_ich_ap0r0_el2();
-		snapshot->live_ich_ap1r0_el2 = read_ich_ap1r0_el2();
 		/*
 		 * Live LRs can differ from the saved software copy while the vCPU
 		 * is running. Capturing both views identifies save/restore drift
@@ -762,93 +655,70 @@ static const struct cpu_regs *shell_dumpstat_get_regs(struct acrn_vcpu *vcpu,
 	return snapshot->captured ? &snapshot->regs : &vcpu->arch.regs;
 }
 
-static void shell_dumpstat_el1_state(const struct dumpstat_snapshot *snapshot)
-{
-	const struct arm64_vcpu_guest_ctx *gctx = &snapshot->gctx;
-
-	shell_item_line("shadow:vbar:0x%016lx sp_el0:0x%016lx",
-		gctx->vbar_el1, gctx->sp_el0);
-	shell_item_line("       elr_el1:0x%016lx spsr_el1:0x%016lx",
-		gctx->elr_el1, gctx->spsr_el1);
-	shell_item_line("         sctlr:0x%016lx      tcr:0x%016lx cntkctl:0x%016lx",
-		gctx->sctlr_el1, gctx->tcr_el1, gctx->cntkctl_el1);
-	shell_item_line("         ttbr0:0x%016lx    ttbr1:0x%016lx",
-		gctx->ttbr0_el1, gctx->ttbr1_el1);
-	if (snapshot->captured) {
-		shell_item_line("  live:vbar:0x%016lx sp_el0:0x%016lx",
-			snapshot->live_vbar_el1, snapshot->live_sp_el0);
-		shell_item_line("       elr_el1:0x%016lx spsr_el1:0x%016lx",
-			snapshot->live_elr_el1, snapshot->live_spsr_el1);
-	} else {
-		shell_item_line("  live:none");
-	}
-}
-
 static void shell_dumpstat_timer_state(const struct dumpstat_snapshot *snapshot)
 {
 	const struct arm64_vcpu_guest_ctx *gctx = &snapshot->gctx;
-	uint32_t idx;
+	const struct arm64_gicv3_local_irq_state *host_irq = &snapshot->host_timer_irq;
+	const struct arm64_vgic_irq *timer_irq = snapshot->has_timer_irq ?
+		&snapshot->timer_irq : NULL;
 
-	shell_item_line("shadow:virq:%u cntp_ctl:0x%08x cntp_cval:0x%016lx",
-		gctx->timer_virq, gctx->cntp_ctl_el0, gctx->cntp_cval_el0);
-	shell_item_line("       cntv_ctl:0x%08x cntv_cval:0x%016lx el2_masked:%s",
-		gctx->cntv_ctl_el0, gctx->cntv_cval_el0,
-		shell_yes_no(gctx->cntv_el2_masked));
 	if (snapshot->has_live_timer) {
 		uint64_t guest_now = snapshot->live_cntvct_el0;
-		const struct arm64_gicv3_local_irq_state *host_irq = &snapshot->host_timer_irq;
 
-		shell_item_line("  live:cnthctl:0x%016lx cntvct:0x%016lx cntpct:0x%016lx",
-			snapshot->live_cnthctl_el2, snapshot->live_cntvct_el0,
-			snapshot->live_cntpct_el0);
-		shell_item_line("       cntvoff:0x%016lx cntv_ctl:0x%08x cntv_cval:0x%016lx",
-			snapshot->live_cntvoff_el2, snapshot->live_cntv_ctl_el0,
-			snapshot->live_cntv_cval_el0);
-		shell_item_line("       guest_delta:%ld",
-			(int64_t)(snapshot->live_cntv_cval_el0 - guest_now));
-		if (host_irq->valid) {
-			shell_item_line("       host_gic:intid:%u en:%s pend:%s act:%s group:%s prio:0x%02x",
-				DUMPSTAT_VTIMER_VIRQ,
-				shell_yes_no(host_irq->enabled != 0U),
-				shell_yes_no(host_irq->pending != 0U),
-				shell_yes_no(host_irq->active != 0U),
-				shell_yes_no(host_irq->group != 0U),
-				host_irq->priority);
-		} else {
-			shell_item_line("       host_gic:none");
-		}
+		shell_item_line("PPI%u cntv_ctl:0x%08x cntv_cval:0x%016lx cntvct:0x%016lx delta:%ld el2_mask:%s",
+			gctx->timer_virq, snapshot->live_cntv_ctl_el0,
+			snapshot->live_cntv_cval_el0, snapshot->live_cntvct_el0,
+			(int64_t)(snapshot->live_cntv_cval_el0 - guest_now),
+			shell_yes_no(gctx->cntv_el2_masked));
+		shell_item_line("      cntpct:0x%016lx cntvoff:0x%016lx cnthctl:0x%016lx",
+			snapshot->live_cntpct_el0, snapshot->live_cntvoff_el2,
+			snapshot->live_cnthctl_el2);
 	} else {
-		shell_item_line("  live:none");
+		shell_item_line("PPI%u live:none el2_mask:%s",
+			gctx->timer_virq, shell_yes_no(gctx->cntv_el2_masked));
 	}
 
-	if (snapshot->has_timer_irq) {
-		const struct arm64_vgic_irq *irq = &snapshot->timer_irq;
-
-		shell_item_line("  vgic:virq:%u enabled:%s pending:%s active:%s level:%s",
-			irq->virq, shell_yes_no(irq->enabled), shell_yes_no(irq->pending),
-			shell_yes_no(irq->active), shell_yes_no(irq->level));
+	if (host_irq->valid && (timer_irq != NULL)) {
+		shell_item_line("      irq host en:%s pend:%s act:%s group:%s prio:0x%02x | vm en:%s pend:%s act:%s level:%s",
+			shell_yes_no(host_irq->enabled != 0U),
+			shell_yes_no(host_irq->pending != 0U),
+			shell_yes_no(host_irq->active != 0U),
+			shell_yes_no(host_irq->group != 0U),
+			host_irq->priority,
+			shell_yes_no(timer_irq->enabled), shell_yes_no(timer_irq->pending),
+			shell_yes_no(timer_irq->active), shell_yes_no(timer_irq->level));
+	} else if (host_irq->valid) {
+		shell_item_line("      irq host en:%s pend:%s act:%s group:%s prio:0x%02x | vm:none",
+			shell_yes_no(host_irq->enabled != 0U),
+			shell_yes_no(host_irq->pending != 0U),
+			shell_yes_no(host_irq->active != 0U),
+			shell_yes_no(host_irq->group != 0U),
+			host_irq->priority);
+	} else if (timer_irq != NULL) {
+		shell_item_line("      irq host:none | vm en:%s pend:%s act:%s level:%s",
+			shell_yes_no(timer_irq->enabled), shell_yes_no(timer_irq->pending),
+			shell_yes_no(timer_irq->active), shell_yes_no(timer_irq->level));
 	} else {
-		shell_item_line("  vgic:none");
+		shell_item_line("      irq host:none | vm:none");
 	}
-	shell_item_line(" cpuif:vmcr:0x%016lx hcr:0x%016lx     ctlr:0x%016lx",
-		snapshot->vgic_ctx.vmcr, snapshot->vgic_ctx.hcr, snapshot->vgic_ctx.ctlr);
-	shell_item_line("        sre:0x%016lx pmr:0x%016lx used_lrs:%u",
-		snapshot->vgic_ctx.sre, snapshot->vgic_ctx.pmr, snapshot->vgic_ctx.used_lrs);
+	shell_item_line("hyp:hcr:0x%016lx vtcr:0x%016lx vttbr:0x%016lx vmpidr:0x%016lx",
+		gctx->hcr_el2, gctx->vtcr_el2, gctx->vttbr_el2,
+		vcpu_get_vmpidr(snapshot->vcpu));
+	shell_item_line("cpuif:vmcr:0x%016lx hcr:0x%016lx used_lrs:%u pmr:0x%016lx",
+		snapshot->vgic_ctx.vmcr, snapshot->vgic_ctx.hcr,
+		snapshot->vgic_ctx.used_lrs, snapshot->vgic_ctx.pmr);
 	if (snapshot->has_live_timer) {
-		shell_item_line("         live_hcr:0x%016lx  live_vmcr:0x%016lx misr:0x%016lx",
-			snapshot->live_ich_hcr_el2, snapshot->live_ich_vmcr_el2,
-			snapshot->live_ich_misr_el2);
-		shell_item_line("             eisr:0x%016lx      elrsr:0x%016lx",
-			snapshot->live_ich_eisr_el2, snapshot->live_ich_elrsr_el2);
-		shell_item_line("       live_ap0r0:0x%016lx live_ap1r0:0x%016lx",
-			snapshot->live_ich_ap0r0_el2, snapshot->live_ich_ap1r0_el2);
-		shell_item_line("         live_lr0:0x%016lx   live_lr1:0x%016lx",
+		shell_item_line("      live_cpuif:hcr:0x%016lx vmcr:0x%016lx",
+			snapshot->live_ich_hcr_el2, snapshot->live_ich_vmcr_el2);
+		shell_item_line("      live_lr0:0x%016lx live_lr1:0x%016lx",
 			snapshot->live_ich_lr[0U], snapshot->live_ich_lr[1U]);
-		shell_item_line("         live_lr2:0x%016lx   live_lr3:0x%016lx",
-			snapshot->live_ich_lr[2U], snapshot->live_ich_lr[3U]);
-	}
-	for (idx = 0U; idx < snapshot->vgic_ctx.used_lrs; idx++) {
-		shell_item_line("   lr%u:0x%016lx", idx, snapshot->vgic_ctx.lr[idx]);
+	} else {
+		uint64_t lr0 = (snapshot->vgic_ctx.used_lrs > 0U) ?
+			snapshot->vgic_ctx.lr[0U] : 0UL;
+		uint64_t lr1 = (snapshot->vgic_ctx.used_lrs > 1U) ?
+			snapshot->vgic_ctx.lr[1U] : 0UL;
+
+		shell_item_line("      saved_lr0:0x%016lx saved_lr1:0x%016lx", lr0, lr1);
 	}
 }
 
@@ -875,7 +745,7 @@ static void shell_dumpstat_vtimer_diag(const struct arm64_vcpu_vtimer_diag *diag
 	 */
 	shell_item_line("wfi:trap:%lu irq-masked:%lu pending-irq:%lu",
 		diag->wfi_trap, diag->wfi_irq_masked, diag->wfi_pending_irq);
-	shell_item_line("pending-only-lr:seen:%lu preserve:%lu drop:%lu lost-no-eoi:%lu",
+	shell_item_line("lr-pending-only:seen:%lu preserve:%lu drop:%lu missing-no-eoi:%lu",
 		diag->pending_only_lr_seen, diag->pending_only_lr_preserve,
 		diag->pending_only_lr_drop, diag->lost_pending_lr);
 	shell_item_line("el2-mask:set:%lu clear:%lu max-age.us:%lu active:%s",
@@ -913,38 +783,22 @@ static int32_t shell_dumpstat_vcpu(struct acrn_vcpu *vcpu)
 		snapshot.irqs_pending_mask);
 	shell_item_section("vcpu stats");
 	/*
-	 * vcpu stats keeps the vCPU execution context together: EL1 guest
-	 * registers, saved EL1 system state, and the two stacks that explain where
-	 * the guest and BEAU vCPU thread were stopped. Timer/vGIC-specific evidence
-	 * is printed in the separate section below to avoid mixing scheduler/stack
-	 * state with interrupt-delivery state.
+	 * vcpu stats keeps the execution context compact. Timer/vGIC-specific
+	 * evidence is printed below without the older shadow-register block.
 	 */
 	shell_item_line("guest regs:");
 	shell_dumpstat_regs(regs);
-	/*
-	 * Keep one compact exit record in the generic block. The older all-events
-	 * dump repeated timer/vGIC details already present below and made the
-	 * command expensive to scan during pressure runs.
-	 */
-	shell_dumpstat_last_exit(&debug->last_exit);
-	shell_dumpstat_guest_resume(&debug->last_resume);
 	shell_dumpstat_guest_trace(&debug->guest_trace);
-	shell_item_line("system regs:");
-	shell_dumpstat_el1_state(&snapshot);
 	if (vcpu->state != VCPU_OFFLINE) {
-		shell_item_line("vm stack:");
+		shell_item_line("vcpu stack:");
 		shell_dumpstat_vm_stack(vcpu, regs);
 		shell_item_line("pcpu stack:");
 		shell_dumpstat_host_stack(vcpu);
 	}
 	shell_item_section("vgic/vtimer");
-	shell_item_line("basic:");
 	shell_dumpstat_timer_state(&snapshot);
-	shell_dumpstat_vgic_event("vgic-sync", &debug->last_vgic_sync);
-	shell_dumpstat_vgic_event("vgic-maint", &debug->last_vgic_maintenance);
-	shell_item_line("diagnosis:");
 	shell_dumpstat_vtimer_diag(&vcpu->arch.debug.vtimer_diag);
-	shell_item_line("trace:");
+	shell_item_line("vtimer trace:");
 	shell_dumpstat_vtimer_trace(&debug->vtimer_trace);
 	shell_item_end();
 

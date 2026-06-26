@@ -34,6 +34,12 @@ description: Develop, debug, validate, and document the BEAU hypervisor in this 
      underlying principle and the purpose of the code, especially around boot,
      interrupt, timer, scheduler, vCPU, and console behavior.
    - Add English comments for design intent, architecture invariants, ownership, and failure modes.
+   - For touched ARM64 virtualization modules, write compact comments that include:
+     date, involved-module principle, and code-flow analysis.
+   - Pair non-obvious comments with `sdk/item.md`-style ASCII flow/framework
+     diagrams so the reader can follow ownership and state transitions quickly.
+   - Keep these diagrams small and close to the relevant code; prefer one
+     focused flow over broad architecture narration.
    - Avoid comments that restate assignments or obvious branches.
    - Do not write machine-local directory or file paths into documentation,
      code design notes, or this skill. Use variables such as `BEAU_TOOLCHAINS`
@@ -42,6 +48,8 @@ description: Develop, debug, validate, and document the BEAU hypervisor in this 
 4. Validate before final response:
    - Before any build or regression, confirm `BEAU_TOOLCHAINS` is set and
      points to a valid bare-metal toolchain bin directory.
+   - After any hypervisor code update, run the matching build validation before
+     the final response and report the result.
    - Build ARM64 QEMU:
      ```bash
      ./scripts/kick.py --build --dry-run

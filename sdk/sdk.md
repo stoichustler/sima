@@ -17,21 +17,19 @@ vGICv3, vtimer, vCPU entry/exit, trap, or scheduler handoff flows, combine short
 text with `sdk/item.md`-style ASCII diagrams so the ownership transition can be
 followed quickly. In short: 注释风格: 简洁易懂，图(`sdk/item.md`)文结合.
 
-BEAU development uses a human-run build and validation flow. Codex must not run
-BEAU builds, QEMU boots, hardware flashing, or `scripts/regress.py` unless the
-user explicitly asks for that specific run in the current task. By default,
-Codex should provide the exact build, launch, regression, and hardware
-validation commands for the user to run manually, and should treat their logs or
-reported results as the source of validation truth. This repository-level rule
-overrides any build or regression guidance in `sdk/codex/SKILL.md` or
-`sdk/codex/references/architecture.md`.
+BEAU development now requires Codex-run build validation after code updates.
+When Codex changes hypervisor code, Codex must run the matching build command
+before the final response and report the result. QEMU boots, hardware flashing,
+and `scripts/regress.py` still require an explicit task request or a clear
+validation need for the current change. Treat human-provided runtime logs as the
+source of truth for boot, regression, and hardware behavior that Codex did not
+run.
 
-Codex may run lightweight local checks that do not build or boot BEAU, such as
-text searches, `git diff --check`, script syntax checks, DT source compilation
-after an approved DTS change, and command dry-runs that only print commands.
-The final response must clearly separate lightweight checks Codex actually ran
-from manual build, QEMU, regression, or hardware validation that still requires
-human confirmation.
+Codex may also run lightweight local checks such as text searches,
+`git diff --check`, script syntax checks, DT source compilation after an
+approved DTS change, and command dry-runs that only print commands. The final
+response must clearly separate checks Codex actually ran from QEMU, regression,
+or hardware validation that still requires human confirmation.
 
 Optimizations or behavior changes under `core/` require explicit human
 confirmation before implementation. Document and discuss common-code timer,
@@ -860,11 +858,16 @@ Important rules:
 - Do not clear an edge SGI only because a pending-only LR disappeared. Linux
   can wake from WFI with PSTATE.I masked, and the SGI handler may not run until
   after `local_irq_enable()`.
-- Do not mark every pending-only timer LR as EOI-maintained. That produced
-  maintenance storms because a still-high CNTV level source immediately rebuilt
-  the same LR.
+- Do not blindly mark pending-only timer LRs as EOI-maintained. In BEAU's
+  current LR sync model that can produce maintenance storms or early boot
+  stalls because a still-high CNTV level source immediately rebuilds the same
+  LR.
 - Do not manufacture Active+Pending for a pending-only vtimer LR. That can
   model an interrupt acknowledgement that EL1 has not actually performed.
+- Do not infer HVC return-PC handling from `last-resume pc == last-exit elr`
+  alone. Symbolicate the ELR and decode the current exit source first; an IRQ
+  exit can resume at the same ordinary guest instruction many times without
+  being an HVC replay loop.
 - GICD/GICR MMIO windows must stay vio/MMIO, not stage-2 RAM mappings. A
   stage-2 data abort is the intended dispatch path for guest
   interrupt-controller register access.
@@ -1223,8 +1226,11 @@ Selected repair direction after comparing Xen:
 
 ### Experiments Not To Repeat
 
-- Marking pending-only software timer LRs with EOI caused maintenance storms
-  and broke AP bring-up.
+- Marking pending-only timer LRs with EOI caused maintenance storms or early
+  boot stalls in BEAU's current vGIC model. Xen's newer vGIC sets EOI for
+  software level IRQs, but it also has AP-list/LR fold semantics that BEAU does
+  not yet fully mirror. Do not reintroduce timer EOI maintenance without that
+  broader sync model.
 - Requesting underflow maintenance (`HCR.UIE`) for rescued pending-only timer
   LRs caused an underflow maintenance storm: dumps showed `HCR.UIE`, `MISR.U`,
   one still-valid pending timer LR, and hundreds of thousands of vGIC
@@ -1336,22 +1342,50 @@ CNTHP/hypervisor timer:
 - `constat 2` showed no input backlog and a full VM2 console ring. The VM2
   console path was congested because Linux kept printing or had printed enough
   to fill the ring, but there was no shell-input blockage causing the WDT miss.
+- A later per-vCPU dump initially looked like a repeated HVC because older
+  trace entries contained `EC=0x16`, but the live `last-exit` source was the
+  IRQ path and its EC field was invalid diagnostic filler. Symbolicating
+  `elr:0xffff8000804ef9ec` against the VM2 Linux image maps it to
+  `tioclinux()` in `drivers/tty/vt/vt.c`, not to the WDT HVC site. The WDT
+  driver's actual `hvc #0` is in `beau_wdt_timerfn()`.
+- In that same dump, VM2 had only vCPU0/vCPU1 running while vCPU2/vCPU3 were
+  still `init/blocked`. vCPU0 had `requests:pending:0x2`, the virtual timer
+  line was `enabled:Y pending:Y active:N level:Y`, and LR0 was
+  `0x500002000000001b`: a pending-only timer LR with the EOI bit still set.
+  The maintenance snapshot showed `MISR.EOI` and the pending-only timer
+  preserve counters were in the millions. This stale EOI-marked timer LR can
+  keep EL2 in a maintenance loop while the live CNTV source remains masked.
+- A later dump after clearing the stale EOI bit still showed no Linux WDT
+  growth. The timer offset relation was valid: live `CNTVCT` matched
+  `CNTPCT - CNTVOFF_EL2` within the expected sampling window, so the counter
+  offset formula was not the active fault. The remaining bad state was
+  `CNTV_CTL=0x3` in the live register, `cntv_el2_masked:Y`, PPI27
+  pending/level in vGIC state, and no new guest timer sysreg writes.
+- That points to a guest-visible timer-control problem: BEAU masks the live
+  CNTV comparator with `CNTV_CTL.IMASK` while vGIC owns PPI27, but VM2 Linux
+  reads `CNTV_CTL` in `arch_timer_handler_virt()` before running its clockevent
+  handler. If Linux sees EL2's private IMASK instead of guest-visible
+  `ISTATUS`, it treats the interrupt as not handled and never reprograms the
+  next deadline.
 
 Conclusion from this run:
 
-- The single Linux WDT kick proves the WDT hypercall and BEAU WDT accounting
-  work at least once. The later timeout is not primarily a watchdog-driver or
-  hypercall-dispatch failure.
-- The failure chain is now more specific than "timer/vGIC issue": VM2 pCPUs do
-  not receive continuing htimer/CNTV local interrupts, while the vGIC timer line
-  remains stuck pending/level with EL2's live CNTV comparator masked. Guest EL1
-  keeps running but does not reach the timer EOI/reprogram path that would clear
-  the line and schedule the next Linux watchdog worker.
-- The next fix should focus on why VM2 pCPUs stop receiving local timer
-  interrupts and why the masked CNTV/vGIC timer line is not retired or
-  rearmed. Do not treat console backlog, VM2 CPU scheduling, or the Linux WDT
-  hypercall path as the primary root cause unless new evidence contradicts this
-  run.
+- The single Linux WDT kick proves the guest driver reached
+  `HC_VM_WDT_KICK` once, but the supplied dump does not prove an HVC replay
+  loop. A generic `handle_hvc64()` ELR advance experiment made 3OS startup
+  abnormal and must not be kept as the VM2 WDT fix.
+- The actionable bad state remains timer/vGIC state. Clearing stale
+  `ICH_LR_EOI` from pending-only timer LRs is necessary, but it was not
+  sufficient: Linux still did not reprogram the timer after seeing a pending
+  PPI27.
+- The next repair is to keep `CNTVCT_EL0` direct, preserving
+  `CNTVCT = CNTPCT - CNTVOFF_EL2`, while trapping guest CNTV control/compare
+  registers through `CNTHCTL_EL2.EL1TVT`. The trap path returns the guest
+  shadow `CNTV_CTL` with computed `ISTATUS`, hiding EL2's private live IMASK
+  from Linux.
+- Console backlog, Linux WDT code, broad scheduler starvation, generic HVC PC
+  advancement, and timer-offset sign are not the primary explanations supported
+  by these dumps.
 
 Reference-model findings to preserve:
 
@@ -1407,6 +1441,27 @@ Xen comparison and selected fix:
    through ordinary vGIC software level semantics. The code now removes the
    PPI27 hardware LR special case, removes timer LR/WFI rescue owner state, and
    lets normal LR sync/EOI/reprogram paths update the sampled level.
+5. A direct attempt to mark BEAU's pending-only software timer LR as
+   EOI-maintained made VM2 Linux fail earlier during boot. Treat that as
+   disproven for the current BEAU vGIC sync model, even though Xen's newer
+   vGIC can set EOI for software level IRQs.
+6. Xen's HVC paths are not proof that BEAU should generically advance ELR in
+   `handle_hvc64()`: Xen's SMCCC HVC C handler does not explicitly advance the
+   PC, and its Xen-hypercall path only rewinds PC for preempted calls. Xvisor's
+   PSCI HVC path does advance PC inside its PSCI emulation. BEAU must validate
+   its saved-ELR convention with a direct HVC-site dump before changing this
+   path again.
+7. Xvisor's GICv3 LR encoder writes `ICH_LR_EOI` only when the software LR
+   flags explicitly request `VGIC_LR_EOI_INT`; BEAU should therefore clear an
+   accidentally preserved EOI bit from software pending-only vtimer LRs instead
+   of treating it as guest EOI evidence.
+8. Xen also updates level-triggered emulated device lines on guest-exit
+   boundaries before syncing LR state. That remains useful reference material,
+   but the current VM2 dump first requires fixing the stale EOI-marked
+   pending-only timer LR.
+9. Xen can mask the hardware CNTV comparator in EL2 because its vtimer update
+   treats the mask as hypervisor-private. BEAU now follows the same principle by
+   trapping guest CNTV timer registers and leaving only `CNTVCT_EL0` direct.
 
 Validation direction:
 

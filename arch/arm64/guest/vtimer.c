@@ -40,9 +40,6 @@
 #include <asm/guest/vgicv3.h>
 
 /*
- * ARM generic timer virtualization in BEAU
- * ========================================
- *
  * BEAU deliberately keeps the two EL1 timer views separate:
  *
  *   CNTV_*  -> guest virtual timer, interrupt PPI27
