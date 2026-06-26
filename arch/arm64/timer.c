@@ -15,19 +15,19 @@
 
 #define ARM64_TIMER_MAX_DELTA	UINT32_MAX
 
-static void arm64_stop_physical_timer(void)
+static void arm64_stop_host_timer(void)
 {
 	/*
-	 * Disable the local CNTP comparator instead of programming a sentinel
-	 * deadline. CNTP_TVAL_EL0 is 32-bit, and an absolute sentinel can become
-	 * expired once the physical counter advances beyond it.
+	 * The scheduler owns the EL2 hypervisor timer. CNTP is left for guest
+	 * physical-timer emulation, so host ticks cannot be changed by EL1 CNTP
+	 * traps or guest-visible PPI30 state.
 	 */
-	write_cntp_ctl_el0(0U);
+	write_cnthp_ctl_el2(0U);
 }
 
 static void timer_irq_handler(__unused uint32_t irq, __unused void *data)
 {
-	arm64_stop_physical_timer();
+	arm64_stop_host_timer();
 	fire_softirq(SOFTIRQ_TIMER);
 }
 
@@ -36,26 +36,27 @@ void arch_init_timer(void)
 	uint32_t acrn_irq;
 
 	/*
-	 * The scheduler uses the ARM physical timer as a per-pCPU tick source.
-	 * Architecturally the timer interrupt is a PPI: the IRQ action is a single
-	 * global descriptor, but every pCPU has its own enable bit and comparator.
-	 * Install the common handler on the BSP once, then enable and stop the
-	 * local PPI on every pCPU as it initializes.
+	 * The scheduler uses the ARM EL2 hypervisor timer as a per-pCPU tick
+	 * source. Architecturally the timer interrupt is a PPI: the IRQ action is
+	 * a single global descriptor, but every pCPU has its own enable bit and
+	 * comparator. Install the common handler on the BSP once, then enable and
+	 * stop the local PPI on every pCPU as it initializes.
 	 *
 	 * Guest timer delivery is intentionally separate: VGICv3 uses the hardware
-	 * virtual timer/CNTV path and injects the guest-visible timer PPI. Do not
-	 * reuse CNTP for guest deadlines, or the host scheduler loses its tick
-	 * source.
+	 * virtual timer/CNTV path for PPI27 and software-emulates guest CNTP/PPI30.
+	 * Do not use CNTP for host deadlines, or guest physical-timer state can
+	 * race the host scheduler tick.
 	 */
-	acrn_irq = arm64_domain_get_acrn_irq(ARM64_IRQD_GIC, ARM64_GIC_PPI_PHYSICAL_TIMER);
+	acrn_irq = arm64_domain_get_acrn_irq(ARM64_IRQD_GIC, ARM64_GIC_PPI_HYPERVISOR_TIMER);
 	if (get_pcpu_id() == BSP_CPU_ID) {
 		if ((acrn_irq == IRQ_INVALID) || (request_irq(acrn_irq, timer_irq_handler, NULL, IRQF_NONE) < 0)) {
 			pr_err("timer irq setup failed");
 		}
 	}
 	if (acrn_irq != IRQ_INVALID) {
-		arm64_gicv3_enable_irq(ARM64_GIC_PPI_PHYSICAL_TIMER);
-		arm64_stop_physical_timer();
+		arm64_gicv3_enable_irq(ARM64_GIC_PPI_HYPERVISOR_TIMER);
+		write_cntp_ctl_el0(0U);
+		arm64_stop_host_timer();
 	}
 }
 
@@ -78,7 +79,7 @@ void arch_set_timer_count(uint64_t timeout)
 		delta = ARM64_TIMER_MAX_DELTA;
 	}
 
-	arm64_stop_physical_timer();
-	write_cntp_tval_el0((uint32_t)delta);
-	write_cntp_ctl_el0(CNTV_CTL_ENABLE);
+	arm64_stop_host_timer();
+	write_cnthp_cval_el2(now + delta);
+	write_cnthp_ctl_el2(CNTV_CTL_ENABLE);
 }

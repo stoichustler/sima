@@ -289,8 +289,8 @@ struct arm64_vcpu_guest_resume {
 	uint64_t tsc;
 	uint64_t elr;
 	uint64_t spsr;
-	uint64_t cntpct;
-	uint64_t cntp_cval;
+	uint64_t host_cntpct;
+	uint64_t host_timer_cval;
 	uint64_t cntvct;
 	uint64_t cntv_cval;
 	uint64_t hcr;
@@ -305,7 +305,7 @@ struct arm64_vcpu_guest_resume {
 	uint64_t live_lr0;
 	uint64_t live_lr1;
 	uint32_t cntv_ctl;
-	uint32_t cntp_ctl;
+	uint32_t host_timer_ctl;
 	uint32_t source;
 	uint32_t timer_virq;
 	uint8_t used_lrs;

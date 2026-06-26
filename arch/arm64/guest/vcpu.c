@@ -367,8 +367,9 @@ void load_vcpu(__unused struct acrn_vcpu *vcpu)
 	/*
 	 * VTTBR/VTCR select the VM's stage-2 table and VMPIDR gives the guest its
 	 * virtual CPU identity. CNTV is direct guest hardware state saved/restored
-	 * on vCPU switches, while CNTP stays trapped so EL2 keeps ownership of the
-	 * host physical timer.
+	 * on vCPU switches, while guest CNTP stays trapped and is emulated with
+	 * host software timers. The host scheduler tick uses CNTHP and is not part
+	 * of the EL1 timer image.
 	 *
 	 * The EL1 register image and vGIC state must be loaded before guest entry
 	 * so address translation, exception return state, and pending virtual

@@ -429,7 +429,10 @@ static void shell_dumpstat_guest_resume(const struct arm64_vcpu_guest_resume *la
 			shell_yes_no(last->timer_pending),
 			shell_yes_no(last->timer_active),
 			shell_yes_no(last->timer_level));
-		shell_item_line("            host27 valid:%s en:%s pend:%s act:%s",
+		shell_item_line("            htimer_ctl:0x%08x cval:0x%016lx delta:%ld",
+			last->host_timer_ctl, last->host_timer_cval,
+			(int64_t)(last->host_timer_cval - last->host_cntpct));
+		shell_item_line("            cntv_irq valid:%s en:%s pend:%s act:%s",
 			shell_yes_no(last->host_valid),
 			shell_yes_no(last->host_enabled),
 			shell_yes_no(last->host_pending),
@@ -1247,9 +1250,8 @@ static void shell_vmstat_vm_config(uint16_t vm_id, const struct acrn_vm_config *
 	shell_item_line("its:base:0x%016lx size:0x%lx enabled:%s typer:0x%016lx ctlr:0x%08x",
 		arch->guest_its_base, arch->guest_its_size,
 		shell_yes_no(vgic->its_enabled), vgic->its.typer, vgic->its.ctlr);
-	shell_item_line("timer:virt-ppi:%u maint-ppi:%u phys-ppi:%u time-delta:%ld",
-		ARM64_GIC_PPI_VIRTUAL_TIMER, ARM64_GIC_PPI_VGIC_MAINTENANCE,
-		ARM64_GIC_PPI_PHYSICAL_TIMER, vm->arch_vm.time_delta);
+	shell_item_line("timer:cntv:Y cnthp:Y cntp-emul:Y maintenance:Y time-delta:%ld",
+		vm->arch_vm.time_delta);
 	shell_item_line("console:uart:0x%016lx/0x%lx irq:%u selected:%s ring:%u/%u pending:%s",
 		arch->guest_uart_base, arch->guest_uart_size, arch->guest_uart_irq,
 		shell_yes_no(console_vmid == vm_id), ring.queued, ring.capacity,

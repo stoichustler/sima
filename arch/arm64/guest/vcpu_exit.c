@@ -289,10 +289,10 @@ static void record_vcpu_resume(struct acrn_vcpu *vcpu, uint32_t source)
 	struct arm64_gicv3_local_irq_state host_irq;
 	uint32_t virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 	uint64_t host_now = read_cntpct_el0();
-	uint64_t host_cval = read_cntp_cval_el0();
+	uint64_t host_cval = read_cnthp_cval_el2();
 	uint64_t now = read_cntvct_el0();
 	uint64_t cval = read_cntv_cval_el0();
-	uint32_t host_ctl = read_cntp_ctl_el0() &
+	uint32_t host_ctl = read_cnthp_ctl_el2() &
 		(CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
 	uint32_t ctl = read_cntv_ctl_el0() &
 		(CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
@@ -304,8 +304,8 @@ static void record_vcpu_resume(struct acrn_vcpu *vcpu, uint32_t source)
 		source, 0);
 	last->elr = vcpu->arch.regs.elr;
 	last->spsr = vcpu->arch.regs.spsr;
-	last->cntpct = host_now;
-	last->cntp_cval = host_cval;
+	last->host_cntpct = host_now;
+	last->host_timer_cval = host_cval;
 	last->cntvct = now;
 	last->cntv_cval = cval;
 	last->hcr = read_ich_hcr_el2();
@@ -319,7 +319,7 @@ static void record_vcpu_resume(struct acrn_vcpu *vcpu, uint32_t source)
 	last->sw_lr1 = (vcpu->arch.vgic.used_lrs > 1U) ? vcpu->arch.vgic.lr[1U] : 0UL;
 	last->live_lr0 = read_ich_lr_el2(0U);
 	last->live_lr1 = read_ich_lr_el2(1U);
-	last->cntp_ctl = host_ctl;
+	last->host_timer_ctl = host_ctl;
 	last->cntv_ctl = ctl;
 	last->source = source;
 	last->timer_virq = virq;

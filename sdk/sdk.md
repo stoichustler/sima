@@ -221,9 +221,9 @@ boot logs settle to show the `console:\>` prompt.
 - ARM64 vCPU switch-in/out now saves and restores guest EL1 translation,
   exception, timer, TPIDR, and vGIC state, so two VMs can time-share one pCPU
   without inheriting each other's EL1 address-space context.
-- ARM64 local physical timer setup enables the scheduler tick PPI on every pCPU.
-  Guest timer state is kept on the virtual timer path so guest timer activity
-  does not overwrite the host scheduler's physical timer deadline.
+- ARM64 local hypervisor timer setup enables CNTHP/PPI26 as the scheduler tick
+  source on every pCPU. Guest CNTV/PPI27 and emulated CNTP/PPI30 state stays out
+  of the host scheduler deadline path.
 - ARM64 WFI/WFE trapping is disabled in the default QEMU scenario. Guest WFI/WFE
   stays on the virtual CPU interface so idle/spin paths do not exit to EL2 on
   every instruction; the trapped handler remains only as non-default debug
@@ -753,10 +753,10 @@ guest-exit path.
   init, wire enable/disable, and level/edge programming helpers. IWB is still
   absent by default because the static platform API does not yet expose IWB
   base/size values.
-- Host physical timer layer:
-  `arch/arm64/timer.c` uses CNTP/physical timer PPI30 as the EL2 scheduler
-  tick. Guest timer work must not steal CNTP, because CNTP is the host
-  preemption and softirq source.
+- Host hypervisor timer layer:
+  `arch/arm64/timer.c` uses CNTHP/hypervisor timer PPI26 as the EL2 scheduler
+  tick. Guest CNTV/PPI27 and CNTP/PPI30 work must not steal CNTHP, because
+  CNTHP is the host preemption and softirq source.
 - Virtual interrupt API:
   `arch/arm64/guest/virq.c` is the small architecture-facing entry point used
   by common code and devices. For GIC INTIDs it delegates to VGICv3; the
@@ -783,14 +783,14 @@ guest-exit path.
 - Current important physical INTIDs:
   - SGI0: EL2 SMP/reschedule call.
   - PPI25: vGIC maintenance interrupt.
+  - PPI26: ARM hypervisor timer. Reserved for the EL2 scheduler tick.
   - PPI27: ARM virtual timer. Used as the hardware source for guest timer
     delivery while a vCPU is loaded.
-  - PPI30: ARM physical timer. Reserved for the EL2 scheduler tick.
+  - PPI30: ARM physical timer. Reserved for guest physical-timer emulation.
 - Current guest timer ABI:
   - Linux VM2 uses virtual timer PPI/INTID 27 from DTS `<1 13 4>`.
   - RTOS guests may expect physical-timer PPI30 as their guest-visible timer
-    PPI. BEAU still backs the loaded guest with hardware CNTV and translates
-    the event back to `timer_virq`.
+    PPI. BEAU emulates guest CNTP with a vCPU shadow and a host software timer.
 
 ### Physical GICv3 Flow
 
@@ -804,7 +804,7 @@ guest-exit path.
 3. The QEMU ITS is detected and quiesced, but physical ITS passthrough is not
    currently exposed. VM2 receives a software vITS model instead.
 4. Every pCPU initializes its Redistributor and CPU interface. Local host
-   enables include SGI0, PPI25, and PPI27. PPI30 is enabled by the host timer
+   enables include SGI0, PPI25, and PPI27. PPI26 is enabled by the host timer
    init path.
 5. Host priority masking is used for the virtual timer rescue path: while a
    virtual timer LR owns guest delivery, PPI27 stays enabled but priority is
@@ -875,16 +875,16 @@ Important rules:
 BEAU separates host timekeeping from guest timer ABI:
 
 1. Host scheduler tick:
-   CNTP/PPI30 drives `SOFTIRQ_TIMER` and the configured scheduler. It is local
+   CNTHP/PPI26 drives `SOFTIRQ_TIMER` and the configured scheduler. It is local
    to each pCPU and must remain owned by EL2.
 2. Loaded guest timer:
    Hardware CNTV is loaded with the guest vCPU timer state. When CNTV expires,
    physical PPI27 arrives at EL2 and `arm64_vgicv3_virtual_timer_irq_handler()`
    injects the guest-visible `timer_virq`.
 3. Guest-visible PPI:
-   `timer_virq` records the guest ABI. Linux currently sees INTID 27. Some RTOS
-   paths may use INTID 30 as the guest-visible timer even though BEAU still uses
-   hardware CNTV underneath while the vCPU is loaded.
+   `timer_virq` records the guest ABI. Linux currently sees INTID 27 through
+   the CNTV path. Guest CNTP/PPI30 is separate software emulation and must not
+   share the live CNTV/PPI27 delivery state.
 4. Host masking:
    After CNTV expires and a timer LR is in flight, BEAU masks the host PPI27 by
    priority only and keeps guest CNTV shadow state separate. Linux must still
@@ -1154,7 +1154,7 @@ Status as of 2026-06-18:
   LRs under the VM vGIC lock immediately before ERET. This is not a complete
   fix by itself, but it is a useful low-risk sync point because it removes the
   "software pending but not resident in an LR at return" failure class.
-- A dynamic tick-gating experiment reduced pCPU1 host physical timer callbacks
+- A dynamic tick-gating experiment reduced pCPU1 host timer callbacks
   but still failed the VM2 Linux stress path and changed timing rather than
   fixing the underlying vtimer/vGIC lifecycle.
 
@@ -1170,7 +1170,7 @@ The most likely stall chain is:
    Linux has returned from WFI, but it has not yet reached
    `local_irq_enable()`/`daifclr`, so the EL1 timer handler and timer softirq
    have not run.
-4. A host physical timer tick, shared-pCPU scheduling point, or VM console
+4. A host timer tick, shared-pCPU scheduling point, or VM console
    switch can take the vCPU away during this short masked-IRQ window.
 5. On a later sync, the live LR may be gone without EOI evidence while CNTV is
    still expired and `cntv_el2_masked` remains true. If EL2 does not rebuild a
@@ -1302,8 +1302,9 @@ guest IAR/EOIR/DIR and timer handler
 - VM2 Linux uses guest-visible virtual timer INTID/PPI27. Current evidence does
   not support changing the Linux DTS timer interrupt.
 - Zephyr should also be treated as a PPI27/CNTV guest in the current model.
-  The earlier PPI27/PPI30 confusion has been corrected conceptually: PPI30 is
-  the EL2 physical timer source and must remain host-owned.
+  The earlier PPI27/PPI30 confusion has been corrected conceptually: PPI26 is
+  the EL2 hypervisor timer source and must remain host-owned, while PPI30 is
+  guest physical-timer emulation.
 - Linux failing dumps place vCPUs around the instruction after `wfi` in
   `cpu_do_idle()`: Linux was woken from WFI, but it has not progressed far
   enough to run the timer handler/softirq path.
@@ -1332,8 +1333,8 @@ Current local-tree status:
 
 - The vGICv3 ITS code has been split out of the main vGICv3 file in the local
   tree. Treat that as organization, not as a WDT fix.
-- PPI27/CNTV is currently the only vtimer INTID recognized by the vtimer helper
-  path. CNTP/PPI30 remains reserved for the EL2 scheduler timer path.
+- The vtimer helper recognizes both loaded guest CNTV/PPI27 and emulated guest
+  CNTP/PPI30. CNTHP/PPI26 remains reserved for the EL2 scheduler timer path.
 - The local tree contains extra diagnostics around host PPI27 state, LR state,
   and vtimer/vGIC trace points. Keep these diagnostics until the WDT issue is
   understood.

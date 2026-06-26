@@ -28,9 +28,9 @@
  * HPFAR_EL2: stage-2 fault IPA fragment for guest memory abort handling.
  *
  * Timer registers:
- * CNTFRQ_EL0 reports counter frequency, CNTP* controls the physical timer, and
- * CNTV* controls the virtual timer. CNTHCTL_EL2 decides which EL1 timer/counter
- * accesses are allowed or trapped.
+ * CNTFRQ_EL0 reports counter frequency, CNTP* is the EL1 physical timer,
+ * CNTV* is the EL1 virtual timer, and CNTHP* is the EL2 host timer.
+ * CNTHCTL_EL2 decides which EL1 timer/counter accesses are allowed or trapped.
  *
  * GIC system registers:
  * ICC_* registers are the EL1 CPU-interface view. ICH_* registers are the EL2
@@ -214,6 +214,32 @@ static inline uint64_t read_cnthctl_el2(void)
 	return val;
 }
 
+static inline uint64_t read_cnthp_cval_el2(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, cnthp_cval_el2" : "=r" (val));
+	return val;
+}
+
+static inline void write_cnthp_cval_el2(uint64_t val)
+{
+	asm volatile ("msr cnthp_cval_el2, %0" : : "r" (val) : "memory");
+}
+
+static inline uint32_t read_cnthp_ctl_el2(void)
+{
+	uint64_t val;
+
+	asm volatile ("mrs %0, cnthp_ctl_el2" : "=r" (val));
+	return (uint32_t)val;
+}
+
+static inline void write_cnthp_ctl_el2(uint32_t val)
+{
+	asm volatile ("msr cnthp_ctl_el2, %0; isb" : : "r" (val) : "memory");
+}
+
 static inline void write_cntp_tval_el0(uint32_t val)
 {
 	asm volatile ("msr cntp_tval_el0, %0" : : "r" (val));
@@ -242,7 +268,7 @@ static inline uint32_t read_cntp_ctl_el0(void)
 
 static inline void write_cntp_ctl_el0(uint32_t val)
 {
-	asm volatile ("msr cntp_ctl_el0, %0" : : "r" (val));
+	asm volatile ("msr cntp_ctl_el0, %0; isb" : : "r" (val) : "memory");
 }
 
 static inline void write_icc_sgi1r_el1(uint64_t val)

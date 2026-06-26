@@ -183,6 +183,9 @@ static const char *gic_irq_name(uint32_t intid)
 	case ARM64_GIC_PPI_VGIC_MAINTENANCE:
 		name = "gic:vgic-mirq";
 		break;
+	case ARM64_GIC_PPI_HYPERVISOR_TIMER:
+		name = "gic:htimer";
+		break;
 	case ARM64_GIC_PPI_VIRTUAL_TIMER:
 		name = "gic:vtimer";
 		break;

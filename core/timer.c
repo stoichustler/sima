@@ -34,7 +34,7 @@
  *       v
  *   arch_set_timer_count(100)
  *
- * When the physical timer IRQ fires, architecture code raises SOFTIRQ_TIMER.
+ * When the architecture timer IRQ fires, architecture code raises SOFTIRQ_TIMER.
  * The softirq runs callbacks for expired timers, advances periodic timers past
  * missed periods, reinserts active periodic timers, and finally reprograms the
  * hardware timer to the new list head.
@@ -102,7 +102,7 @@ static void advance_periodic_timer(struct hv_timer *timer, uint64_t now)
 	timer->timeout = next;
 }
 
-static inline void update_physical_timer(struct per_cpu_timers *cpu_timer)
+static inline void update_architecture_timer(struct per_cpu_timers *cpu_timer)
 {
 	struct hv_timer *timer = NULL;
 
@@ -162,9 +162,9 @@ int32_t add_timer(struct hv_timer *timer)
 		cpu_timer = &per_cpu(cpu_timers, pcpu_id);
 
 		local_irq_save(&rflags);
-		/* update the physical timer if we're on the timer_list head */
+		/* update the architecture timer if we're on the timer_list head */
 		if (local_add_timer(cpu_timer, timer)) {
-			update_physical_timer(cpu_timer);
+			update_architecture_timer(cpu_timer);
 		}
 		local_irq_restore(rflags);
 
@@ -257,8 +257,8 @@ static void timer_softirq(uint16_t pcpu_id)
 				/*
 				 * Periodic timers are wall-clock ticks, not a backlog queue.
 				 * If softirq handling was delayed across multiple periods,
-				 * skip missed periods instead of programming CNTP to an
-				 * already-expired deadline and taking immediate IRQs again.
+				 * skip missed periods instead of programming an expired
+				 * architecture-timer deadline and taking immediate IRQs again.
 				 */
 				current_tsc = cpu_ticks();
 				advance_periodic_timer(timer, current_tsc);
@@ -272,7 +272,7 @@ static void timer_softirq(uint16_t pcpu_id)
 	}
 
 	/* update nearest timer */
-	update_physical_timer(cpu_timer);
+	update_architecture_timer(cpu_timer);
 }
 
 void timer_init(void)
