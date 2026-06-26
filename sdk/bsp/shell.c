@@ -26,6 +26,7 @@
 #define SHELL_ASCII_BS		'\b'
 #define SHELL_ASCII_TAB		'\t'
 #define SHELL_ASCII_DEL		0x7fU
+#define SHELL_VT100_CLEAR_LINE	"\033[2K"
 
 char shell_log_buf[SHELL_LOG_BUF_SIZE];
 
@@ -127,8 +128,10 @@ static struct shell hv_shell;
 static struct shell *p_shell = &hv_shell;
 static struct thread_object shell_thread;
 static uint8_t shell_stack[CONFIG_STACK_SIZE] __aligned(16);
+static spinlock_t shell_tx_lock = {0U};
 static bool shell_started;
 static bool shell_prompt_enabled;
+static bool shell_input_active;
 
 static void shell_thread_main(__unused struct thread_object *obj);
 
@@ -232,11 +235,52 @@ static char shell_getc(void)
 	return console_getc();
 }
 
-void shell_puts(const char *string_ptr)
+static void shell_puts_unlocked(const char *string_ptr)
 {
 	/* Output the string */
 	(void)console_write(string_ptr, strnlen_s(string_ptr,
 				SHELL_STRING_MAX_LEN));
+}
+
+void shell_puts(const char *string_ptr)
+{
+	uint64_t rflags;
+
+	spinlock_irqsave_obtain(&shell_tx_lock, &rflags);
+	shell_puts_unlocked(string_ptr);
+	spinlock_irqrestore_release(&shell_tx_lock, rflags);
+}
+
+static void shell_show_prompt(bool leading_newline)
+{
+	uint64_t rflags;
+
+	spinlock_irqsave_obtain(&shell_tx_lock, &rflags);
+	if (leading_newline) {
+		shell_puts_unlocked("\r\n");
+	}
+	shell_puts_unlocked(SHELL_PROMPT_STR);
+	shell_input_active = true;
+	spinlock_irqrestore_release(&shell_tx_lock, rflags);
+}
+
+static void shell_finish_input_line(void)
+{
+	uint64_t rflags;
+
+	spinlock_irqsave_obtain(&shell_tx_lock, &rflags);
+	shell_input_active = false;
+	shell_puts_unlocked("\r\n");
+	spinlock_irqrestore_release(&shell_tx_lock, rflags);
+}
+
+static void shell_set_input_active(bool active)
+{
+	uint64_t rflags;
+
+	spinlock_irqsave_obtain(&shell_tx_lock, &rflags);
+	shell_input_active = active;
+	spinlock_irqrestore_release(&shell_tx_lock, rflags);
 }
 
 static void shell_item_vprint(const char *prefix, const char *fmt, va_list args)
@@ -298,13 +342,39 @@ static void set_cursor_pos(uint32_t left_offset)
 	}
 }
 
+static void set_cursor_pos_unlocked(uint32_t left_offset)
+{
+	while (left_offset > 0) {
+		left_offset--;
+		shell_puts_unlocked("\b");
+	}
+}
+
+static void shell_clear_current_line_unlocked(void)
+{
+	/*
+	 * Async output borrows the active terminal row. Clear the prompt/input
+	 * first, then redraw it after the background line.
+	 */
+	shell_puts_unlocked("\r" SHELL_VT100_CLEAR_LINE);
+}
+
+static void shell_restore_input_line_unlocked(void)
+{
+	shell_puts_unlocked(SHELL_PROMPT_STR);
+	if (p_shell->input_line_len > 0U) {
+		shell_puts_unlocked(p_shell->buffered_line[p_shell->input_line_active]);
+		set_cursor_pos_unlocked(p_shell->input_line_len - p_shell->cursor_offset);
+	}
+}
+
 static void shell_restore_input_line(void)
 {
-	shell_puts(SHELL_PROMPT_STR);
-	if (p_shell->input_line_len > 0U) {
-		shell_puts(p_shell->buffered_line[p_shell->input_line_active]);
-		set_cursor_pos(p_shell->input_line_len - p_shell->cursor_offset);
-	}
+	uint64_t rflags;
+
+	spinlock_irqsave_obtain(&shell_tx_lock, &rflags);
+	shell_restore_input_line_unlocked();
+	spinlock_irqrestore_release(&shell_tx_lock, rflags);
 }
 
 static bool shell_cmd_matches_prefix(const struct shell_cmd *p_cmd, const char *prefix, uint32_t prefix_len)
@@ -659,8 +729,7 @@ static bool shell_input_line(void)
 
 	/* Carriage-return */
 	case '\r':
-		/* Echo carriage return / line feed */
-		shell_puts("\r\n");
+		shell_finish_input_line();
 
 		/* Set flag showing line input done */
 		done = true;
@@ -687,8 +756,7 @@ static bool shell_input_line(void)
 				shell_handle_special_char(ch);
 			}
 		} else {
-			/* Echo carriage return / line feed */
-			shell_puts("\r\n");
+			shell_finish_input_line();
 
 			/* Set flag showing line input done */
 			done = true;
@@ -799,8 +867,8 @@ void shell_kick(void)
 		 */
 		if ((ch == '\r') || (ch == '\n')) {
 			shell_prompt_enabled = true;
-			shell_puts("\r\n");
-			shell_puts(SHELL_PROMPT_STR);
+			shell_puts("\r\n[Enter BEAU OS console]\r\n");
+			shell_show_prompt(true);
 			is_cmd_cmplt = false;
 		}
 		return;
@@ -813,7 +881,7 @@ void shell_kick(void)
 	 */
 	/* Prompt the user for a selection. */
 	if (is_cmd_cmplt) {
-		shell_puts(SHELL_PROMPT_STR);
+		shell_show_prompt(false);
 	}
 
 	/* Get user's input */
@@ -835,13 +903,22 @@ bool shell_is_open(void)
 
 bool shell_async_puts(const char *string_ptr)
 {
+	uint64_t rflags;
+
 	if (!shell_is_open()) {
 		return false;
 	}
 
-	shell_puts("\r\n");
-	shell_puts(string_ptr);
-	shell_restore_input_line();
+	spinlock_irqsave_obtain(&shell_tx_lock, &rflags);
+	if (shell_input_active) {
+		shell_clear_current_line_unlocked();
+		shell_puts_unlocked(string_ptr);
+		shell_restore_input_line_unlocked();
+	} else {
+		shell_puts_unlocked("\r\n");
+		shell_puts_unlocked(string_ptr);
+	}
+	spinlock_irqrestore_release(&shell_tx_lock, rflags);
 
 	return true;
 }
@@ -1523,6 +1600,7 @@ static int32_t shell_to_vm_console(int32_t argc, char **argv)
 	 */
 	snprintf(temp_str, TEMP_STR_SIZE, "\r\n──────── [switch to vm-%d shell] ────────\r\n", vm_id);
 	shell_puts(temp_str);
+	shell_set_input_active(false);
 	console_vmid = vm_id;
 	console_vm_ring_drain(vm_id);
 

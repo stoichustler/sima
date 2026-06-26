@@ -71,6 +71,31 @@ static const char *vm_wdt_status_str(enum vm_wdt_status status)
 	return str;
 }
 
+static const char *vm_wdt_status_color(enum vm_wdt_status status)
+{
+	const char *color;
+
+	switch (status) {
+	case VM_WDT_STATUS_ALIVE:
+		color = SHELL_COLOR_GREEN;
+		break;
+	case VM_WDT_STATUS_STUCK:
+		color = SHELL_COLOR_RED;
+		break;
+	case VM_WDT_STATUS_UNKNOWN:
+		color = SHELL_COLOR_YELLOW;
+		break;
+	case VM_WDT_STATUS_OFFLINE:
+		color = SHELL_COLOR_GREY;
+		break;
+	default:
+		color = "";
+		break;
+	}
+
+	return color;
+}
+
 static const char *vm_wdt_name(uint16_t vm_id)
 {
 	const struct acrn_vm_config *vm_config = get_vm_config(vm_id);
@@ -128,7 +153,11 @@ static void vm_wdt_mark_reported(uint16_t vm_id, enum vm_wdt_status status)
 static void vm_wdt_print_one(uint16_t vm_id, const struct vm_wdt_snapshot *snapshot,
 	const char *event)
 {
-	char line[96];
+	uint64_t timestamp;
+	uint64_t sec;
+	uint64_t frac;
+	const char *color;
+	char line[144];
 
 	if ((snapshot == NULL) || !vm_wdt_is_monitored(vm_id) || !shell_is_open() ||
 		(snapshot->status == VM_WDT_STATUS_UNUSED)) {
@@ -141,9 +170,14 @@ static void vm_wdt_print_one(uint16_t vm_id, const struct vm_wdt_snapshot *snaps
 	 * used as a visible console gate so the background WDT line does not pollute
 	 * boot logs or a selected guest console.
 	 */
-	(void)snprintf(line, sizeof(line), "[κ] event:%7s vm%hu:%7s status:%7s kick:%8lu\r\n",
-		event, vm_id, vm_wdt_name(vm_id), vm_wdt_status_str(snapshot->status),
-		snapshot->kick_count);
+	timestamp = ticks_to_us(cpu_ticks());
+	sec = timestamp / 1000000UL;
+	frac = (timestamp % 1000000UL) / 1000UL;
+	color = vm_wdt_status_color(snapshot->status);
+	(void)snprintf(line, sizeof(line),
+		"%s[κ][%05lu.%03lu] event:%7s vm%hu:%7s status:%7s kick:%8lu" SHELL_COLOR_RESET "\r\n",
+		color, sec, frac, event, vm_id, vm_wdt_name(vm_id),
+		vm_wdt_status_str(snapshot->status), snapshot->kick_count);
 	if (shell_async_puts(line)) {
 		vm_wdt_mark_reported(vm_id, snapshot->status);
 	}
