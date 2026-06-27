@@ -55,16 +55,18 @@
  * ---------
  * The pCPU has one live CNTV register bank. On vCPU load BEAU restores the
  * vCPU's saved CNTV_CTL/CVAL into the hardware CNTV registers. When hardware
- * PPI27 fires, EL2 snapshots CNTV state, masks the live CNTV comparator with
- * CNTV_CTL.IMASK while the vGIC owns the level line, and injects guest PPI27.
- * On vCPU unload, BEAU saves the live CNTV registers back into the vCPU shadow
- * and disables live CNTV so the next vCPU cannot inherit this deadline.
+ * PPI27 fires, EL2 snapshots CNTV state, priority-masks the host PPI27 while
+ * the vGIC owns the level line, and injects guest PPI27. On vCPU unload, BEAU
+ * saves the live CNTV registers back into the vCPU shadow and disables live
+ * CNTV so the next vCPU cannot inherit this deadline.
  *
- * If a vCPU is not loaded, cntv_timer is armed at
+ * cntv_timer is armed at
  *
  *     host CNTPCT deadline = guest CNTV_CVAL + CNTVOFF_EL2
  *
- * because CNTVCT_EL0 is architecturally CNTPCT_EL0 - CNTVOFF_EL2.
+ * because CNTVCT_EL0 is architecturally CNTPCT_EL0 - CNTVOFF_EL2. It covers
+ * both offline vCPUs and a loaded vCPU whose live CNTV PPI does not cause a
+ * fresh EL2 exit. The callback re-samples live CNTV when the vCPU is current.
  *
  * CNTP path
  * ---------
@@ -79,6 +81,47 @@
  *
  * The field gctx->timer_virq is kept only as a debug/compatibility hint for
  * older dump paths. The timer delivery model itself does not depend on it.
+ *
+ * 2026-06-27, Linux watchdog one-kick timeout closure:
+ *
+ * The guest watchdog kick is a Linux timer-driven HVC. If the guest virtual
+ * timer stops making EL1 forward progress, the first boot-time kick may be the
+ * only one seen by EL2 and the host watchdog eventually reports a timeout.
+ *
+ *   CNTV deadline
+ *        |
+ *        v
+ *   EL2 samples live/saved CNTV and asserts vGIC PPI27
+ *        |
+ *        v
+ *   Linux arch_timer IRQ handler
+ *        |
+ *        v
+ *   TIMER/SCHED/RCU softirq work
+ *        |
+ *        v
+ *   beau_wdt_timerfn() -> HC_VM_WDT_KICK
+ *
+ * The important failure mode is not only "no PPI27". Linux may show some
+ * arch_timer interrupt counts while TIMER/SCHED softirq counters remain stuck
+ * if the virtual timer line is delivered at the wrong time, dropped without EOI
+ * evidence, or never refreshed after the guest programs a new CNTV deadline.
+ *
+ * The BEAU closure keeps every ownership boundary explicit:
+ *
+ *   guest CNTV write
+ *        -> save CNTV shadow and arm cntv_timer backup
+ *   live host PPI27 or backup expiry
+ *        -> sample CNTV, mask host PPI27 while EL2 owns the source
+ *        -> assert software PPI27 in vGIC
+ *   before every ERET/WFI/schedule return
+ *        -> poll/update CNTV and flush deliverable PPI27 into an LR
+ *   guest EOI or timer reprogram
+ *        -> resample CNTV level, then preserve or lower the vGIC line
+ *
+ * cntv_timer is therefore not a second virtual timer. It is a host-side sync
+ * point for the guest CNTV deadline, used to prevent a loaded or unloaded vCPU
+ * from running past the next Linux tick without an EL2 chance to rebuild PPI27.
  */
 #define SYSREG_ENC(op0, op1, crn, crm, op2) \
 	(((op0) << 20U) | ((op2) << 17U) | ((op1) << 14U) | ((crn) << 10U) | ((crm) << 1U))
@@ -130,8 +173,14 @@ static uint32_t vtimer_ctl_value(uint32_t ctl, uint64_t cval, uint64_t now)
 	uint32_t value = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
 
 	if (((value & CNTV_CTL_ENABLE) != 0U) &&
-		((value & CNTV_CTL_IMASK) == 0U) &&
 		((int64_t)(cval - now) <= 0L)) {
+		/*
+		 * ISTATUS reports the timer condition, not whether the interrupt output
+		 * is currently unmasked. IMASK only gates assertion of the interrupt
+		 * line. Keep this helper architectural so emulated CNT{P,V}_CTL reads
+		 * and diagnostics do not hide an expired timer behind EL2's private
+		 * source masking.
+		 */
 		value |= CNTV_CTL_ISTATUS;
 	}
 
@@ -172,6 +221,7 @@ static void cntp_timer_disarm(struct acrn_vcpu *vcpu)
 static int32_t vtimer_inject_current(struct acrn_vcpu *vcpu, uint32_t virq,
 	uint32_t guest_ctl, uint64_t guest_cval);
 
+static void cntv_timer_arm(struct acrn_vcpu *vcpu);
 static void cntp_timer_arm(struct acrn_vcpu *vcpu);
 static void cntp_timer_sync_line(struct acrn_vcpu *vcpu);
 
@@ -246,12 +296,33 @@ static void cntp_timer_sync_line(struct acrn_vcpu *vcpu)
 	cntp_timer_update(vcpu, true);
 }
 
-/*
- * Keep EL2's live CNTV mask separate from the guest-visible CNTV_CTL value.
- * When EL2 owns an expired CNTV line, BEAU masks only the live comparator with
- * CNTV_CTL.IMASK. The guest shadow keeps the guest's original IMASK bit, so a
- * guest CNTV read/write still observes its own timer state.
- */
+static void vtimer_refresh_live_condition(void)
+{
+	uint32_t ctl = read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+	uint64_t cval = read_cntv_cval_el0();
+	uint64_t now = read_cntvct_el0();
+
+	if (((ctl & CNTV_CTL_ENABLE) != 0U) &&
+		((ctl & CNTV_CTL_IMASK) == 0U) &&
+		((int64_t)(cval - now) <= 0L)) {
+		/*
+		 * Some compatible CPU models do not report CNTV_CTL.ISTATUS again after
+		 * EL2 has taken and priority-masked the host PPI27. Linux's arch timer
+		 * handler is stricter than the GIC path: it calls the clockevent
+		 * handler only if CNTV_CTL.ISTATUS is visible.
+		 *
+		 *   expired CVAL -> TVAL=0 -> immediate live timer condition
+		 *
+		 * Rewriting the same past CVAL is not enough on that path. TVAL=0 keeps
+		 * the one-shot timer expired until the guest handler programs the next
+		 * deadline.
+		 */
+		write_cntv_ctl_el0(0U);
+		write_cntv_tval_el0(0U);
+		write_cntv_ctl_el0(ctl);
+	}
+}
+
 static void vtimer_set_host_mask(struct acrn_vcpu *vcpu, bool masked)
 {
 	struct arm64_vcpu_guest_ctx *gctx;
@@ -267,21 +338,25 @@ static void vtimer_set_host_mask(struct acrn_vcpu *vcpu, bool masked)
 	now = cpu_ticks();
 	if (masked && !gctx->cntv_el2_masked) {
 		/*
-		 * The live CNTV comparator is masked only while vGIC state owns an
-		 * expired guest timer. Counting transitions and max age shows whether
-		 * EL2 kept CNTV hidden for too long without matching LR/EOI progress.
+		 * Keep the guest CNTV register bank architectural while vGIC owns the
+		 * expired PPI27 level. A73-class CPUs may let Linux read CNTV_CTL_EL0
+		 * directly; writing IMASK here can make arch_timer_handler_virt() see
+		 * no ISTATUS and skip its clockevent path. Suppress only host PPI27
+		 * re-entry by lowering the host GIC priority of that PPI.
 		 */
 		gctx->cntv_el2_masked = true;
 		diag->el2_mask_set++;
 		diag->el2_mask_since_ticks = now;
-		write_cntv_ctl_el0((read_cntv_ctl_el0() | CNTV_CTL_IMASK) &
-			(CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_MASKED);
+		vtimer_refresh_live_condition();
 		arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_MASK,
 			ARM64_GIC_PPI_VIRTUAL_TIMER, UINT32_MAX, UINT64_MAX, false, true);
 	} else if (masked) {
 		gctx->cntv_el2_masked = true;
-		write_cntv_ctl_el0((read_cntv_ctl_el0() | CNTV_CTL_IMASK) &
-			(CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_MASKED);
+		vtimer_refresh_live_condition();
 	} else if (gctx->cntv_el2_masked) {
 		uint64_t mask_ticks = (diag->el2_mask_since_ticks != 0UL) ?
 			(now - diag->el2_mask_since_ticks) : 0UL;
@@ -292,32 +367,22 @@ static void vtimer_set_host_mask(struct acrn_vcpu *vcpu, bool masked)
 			diag->max_el2_mask_ticks = mask_ticks;
 		}
 		diag->el2_mask_since_ticks = 0UL;
-		write_cntv_ctl_el0(gctx->cntv_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
+		arm64_gicv3_clear_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_DEFAULT);
+		arm64_gicv3_enable_irq(ARM64_GIC_PPI_VIRTUAL_TIMER);
 		arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_MASK,
 			ARM64_GIC_PPI_VIRTUAL_TIMER, UINT32_MAX, UINT64_MAX, false, false);
 	}
 }
 
-static uint32_t vtimer_live_ctl(struct acrn_vcpu *vcpu)
+static uint32_t vtimer_live_ctl(__unused struct acrn_vcpu *vcpu)
 {
-	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
-	uint32_t ctl = read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
-
-	if (gctx->cntv_el2_masked) {
-		ctl = (ctl & ~CNTV_CTL_IMASK) | (gctx->cntv_ctl_el0 & CNTV_CTL_IMASK);
-	}
-
-	return ctl;
+	return read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
 }
 
-static uint32_t vtimer_guest_visible_cntv_ctl(struct acrn_vcpu *vcpu)
+static uint32_t vtimer_guest_visible_cntv_ctl(__unused struct acrn_vcpu *vcpu)
 {
-	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
-
-	if (gctx->cntv_el2_masked) {
-		return gctx->cntv_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
-	}
-
 	return read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
 }
 
@@ -368,7 +433,7 @@ void arm64_vtimer_load_current(struct acrn_vcpu *vcpu)
 	 * Load path:
 	 *
 	 *   saved CNTV shadow   -> live CNTV registers
-	 *   saved EL2 host mask -> live CNTV_CTL.IMASK
+	 *   saved EL2 host mask -> host PPI27 priority
 	 *
 	 * CNTP is not loaded into hardware here. It is emulated by cntp_timer_arm()
 	 * using the vCPU's saved CNTP shadow.
@@ -379,10 +444,13 @@ void arm64_vtimer_load_current(struct acrn_vcpu *vcpu)
 	arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
 		ARM64_GIC_PRIORITY_DEFAULT);
 	write_cntv_cval_el0(gctx->cntv_cval_el0);
-	write_cntv_ctl_el0((gctx->cntv_ctl_el0 |
-		(gctx->cntv_el2_masked ? CNTV_CTL_IMASK : 0U)) &
-		(CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
+	write_cntv_ctl_el0(gctx->cntv_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
+	if (gctx->cntv_el2_masked) {
+		arm64_gicv3_set_irq_priority(ARM64_GIC_PPI_VIRTUAL_TIMER,
+			ARM64_GIC_PRIORITY_MASKED);
+	}
 	cntp_timer_arm(vcpu);
+	cntv_timer_arm(vcpu);
 }
 
 void arm64_vtimer_save_current(struct acrn_vcpu *vcpu)
@@ -400,7 +468,7 @@ void arm64_vtimer_save_current(struct acrn_vcpu *vcpu)
 	 * Save path:
 	 *
 	 *   live CNTV registers -> saved CNTV shadow
-	 *   live CNTV_CTL.IMASK -> EL2-only ownership state
+	 *   host PPI27 priority -> EL2-only ownership state
 	 *
 	 * The CNTP shadow is already updated by trapped CNTP accesses and by its
 	 * own host software timer. Saving live CNTV must never overwrite it.
@@ -409,11 +477,10 @@ void arm64_vtimer_save_current(struct acrn_vcpu *vcpu)
 	cval = read_cntv_cval_el0();
 	ctl = read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
 	if (gctx->cntv_el2_masked) {
-		ctl = (ctl & ~CNTV_CTL_IMASK) | (gctx->cntv_ctl_el0 & CNTV_CTL_IMASK);
 		now = read_cntvct_el0();
 		if (((ctl & CNTV_CTL_ENABLE) == 0U) || ((ctl & CNTV_CTL_IMASK) != 0U) ||
 			((int64_t)(cval - now) > 0L)) {
-			gctx->cntv_el2_masked = false;
+			vtimer_set_host_mask(vcpu, false);
 		}
 	}
 	gctx->cntv_cval_el0 = cval;
@@ -503,11 +570,11 @@ static void vtimer_load_live_cntv(struct acrn_vcpu *vcpu)
 
 	write_cntv_ctl_el0(0U);
 	write_cntv_cval_el0(gctx->cntv_cval_el0);
+	write_cntv_ctl_el0(gctx->cntv_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
 	if (was_masked) {
 		vtimer_set_host_mask(vcpu, false);
-	} else {
-		write_cntv_ctl_el0(gctx->cntv_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK));
 	}
+	cntv_timer_arm(vcpu);
 }
 
 int32_t arm64_vtimer_handle_sysreg(struct acrn_vcpu *vcpu, uint64_t sysreg,
@@ -665,9 +732,14 @@ static void cntv_timer_arm(struct acrn_vcpu *vcpu)
 	}
 
 	/*
-	 * Backup timer covers the offline case: the vCPU is not running on this
-	 * pCPU, so EL2 arms a host timer for the saved CNTV deadline and later
-	 * rebuilds a normal PPI27 injection if the deadline expires.
+	 * Backup timer mirrors the guest CNTV deadline in the host timer domain:
+	 *
+	 *   CNTV_CVAL + CNTVOFF -> CNTHP software timer -> PPI27 line sync
+	 *
+	 * It is intentionally armed for both offline and loaded vCPUs. On some
+	 * compatible cores or emulators the live CNTV PPI can be lost after a
+	 * guest reprograms a future deadline; the backup makes the next deadline
+	 * create an EL2 sync point anyway.
 	 */
 	gctx = &vcpu->arch.gctx;
 	deadline = vtimer_virtual_deadline(gctx, gctx->cntv_cval_el0);
@@ -747,27 +819,48 @@ static void cntv_timer_handler(void *data)
 {
 	struct acrn_vcpu *vcpu = (struct acrn_vcpu *)data;
 	struct arm64_vcpu_guest_ctx *gctx;
+	bool is_current;
 	uint32_t ctl;
 	uint64_t cval;
+	uint64_t now;
 
 	if ((vcpu == NULL) || (vcpu->vm == NULL) || (vcpu->state != VCPU_RUNNING)) {
 		return;
 	}
-	if (get_running_vcpu(get_pcpu_id()) == vcpu) {
-		return;
-	}
 
 	gctx = &vcpu->arch.gctx;
-	if (!vtimer_guest_ctx_expired(gctx)) {
-		return;
+	is_current = (get_running_vcpu(get_pcpu_id()) == vcpu);
+	if (is_current) {
+		/*
+		 * Loaded-vCPU fallback:
+		 *
+		 *   host backup tick -> live CNTV sample -> vGIC PPI27 line
+		 *
+		 * The guest may have programmed CNTV directly since the last EL2 exit,
+		 * so the live registers are the authoritative source here.
+		 */
+		ctl = vtimer_live_ctl(vcpu);
+		cval = read_cntv_cval_el0();
+		now = read_cntvct_el0();
+		gctx->cntv_ctl_el0 = ctl;
+		gctx->cntv_cval_el0 = cval;
+		if (!vtimer_source_expired(ctl, cval, now)) {
+			return;
+		}
+		ctl = vtimer_ctl_value(ctl, cval, now);
+	} else {
+		if (!vtimer_guest_ctx_expired(gctx)) {
+			return;
+		}
+		ctl = vtimer_ctl_value(gctx->cntv_ctl_el0, gctx->cntv_cval_el0,
+			vtimer_virtual_now(gctx));
+		cval = gctx->cntv_cval_el0;
 	}
-	ctl = vtimer_ctl_value(gctx->cntv_ctl_el0, gctx->cntv_cval_el0,
-		vtimer_virtual_now(gctx));
-	cval = gctx->cntv_cval_el0;
 
 	/*
-	 * Offline backup has no live LR to inspect. If the saved guest deadline is
-	 * still expired, inject through the same vGIC path as a host PPI27 hit.
+	 * Backup expiry has no physical CNTV IRQ to attribute. If the sampled
+	 * guest deadline is still expired, inject through the same vGIC path as a
+	 * host PPI27 hit.
 	 */
 	arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_BACKUP,
 		ARM64_GIC_PPI_VIRTUAL_TIMER, ctl, cval, false, false);
@@ -839,9 +932,9 @@ void arm64_vgicv3_virtual_timer_irq_handler(__unused uint32_t irq, __unused void
 		vcpu->arch.gctx.timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 		vcpu->arch.debug.vtimer_diag.cntv_ppi++;
 		/*
-		 * Host PPI27 means the loaded guest timer fired. EL2 snapshots
-		 * live CNTV, masks the live comparator with CNTV_CTL.IMASK, and
-		 * asks vGIC to present guest PPI27.
+		 * Host PPI27 means the loaded guest timer fired. EL2 snapshots live
+		 * CNTV, masks host PPI27 priority to avoid immediate re-entry, and asks
+		 * vGIC to present guest PPI27.
 		 */
 		vcpu->arch.gctx.cntv_cval_el0 = read_cntv_cval_el0();
 		vcpu->arch.gctx.cntv_ctl_el0 = vtimer_live_ctl(vcpu);

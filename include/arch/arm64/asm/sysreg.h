@@ -115,6 +115,10 @@
 #define ICH_LR_STATE_ACTIVE	2UL
 #define ICH_LR_STATE_ACTIVE_PENDING 3UL
 
+/* PAR_EL1 result fields used after an EL2 AT S1E1R guest-VA translation. */
+#define PAR_EL1_F		(1UL << 0U)
+#define PAR_EL1_PA_MASK		0x000ffffffffff000UL
+
 /* ICC_SRE enables system-register access to the GIC CPU interface. */
 #define ICC_CTLR_EL1_EOIMODE	(1UL << 1U)
 #define ICC_SRE_SRE		(1UL << 0U)
@@ -166,7 +170,7 @@ static inline uint64_t read_cntvct_el0(void)
 
 static inline void write_cntv_tval_el0(uint32_t val)
 {
-	asm volatile ("msr cntv_tval_el0, %0" : : "r" (val));
+	asm volatile ("msr cntv_tval_el0, %0; isb" : : "r" (val) : "memory");
 }
 
 static inline uint64_t read_cntv_cval_el0(void)
@@ -179,7 +183,7 @@ static inline uint64_t read_cntv_cval_el0(void)
 
 static inline void write_cntv_cval_el0(uint64_t val)
 {
-	asm volatile ("msr cntv_cval_el0, %0" : : "r" (val));
+	asm volatile ("msr cntv_cval_el0, %0; isb" : : "r" (val) : "memory");
 }
 
 static inline uint32_t read_cntv_ctl_el0(void)
@@ -192,7 +196,7 @@ static inline uint32_t read_cntv_ctl_el0(void)
 
 static inline void write_cntv_ctl_el0(uint32_t val)
 {
-	asm volatile ("msr cntv_ctl_el0, %0" : : "r" (val));
+	asm volatile ("msr cntv_ctl_el0, %0; isb" : : "r" (val) : "memory");
 }
 
 static inline void write_cnthctl_el2(uint64_t val)
@@ -789,13 +793,18 @@ static inline uint64_t read_par_el1(void)
 {
 	uint64_t val;
 
-	asm volatile ("mrs %0, par_el1" : "=r" (val));
+	asm volatile ("dmb sy; mrs %0, par_el1; dmb sy" : "=r" (val) : : "memory");
 	return val;
 }
 
 static inline void write_par_el1(uint64_t val)
 {
 	asm volatile ("msr par_el1, %0; isb" : : "r" (val) : "memory");
+}
+
+static inline void arm64_at_s1e1r(uint64_t va)
+{
+	asm volatile ("at s1e1r, %0; isb" : : "r" (va) : "memory");
 }
 
 static inline void write_vbar_el2(uint64_t val)

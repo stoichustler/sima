@@ -87,8 +87,15 @@ enum os_kernel_type {
 	KERNEL_UNKNOWN,
 };
 
+enum vm_os_family {
+	VM_OS_BAREMETAL = 0,
+	VM_OS_RTOS,
+	VM_OS_LINUX,
+};
+
 struct acrn_vm_os_config {
 	char name[MAX_VM_OS_NAME_LEN];			/* OS name, useful for debug */
+	enum vm_os_family os_family;			/* guest OS family for arch policy */
 	enum os_kernel_type kernel_type;		/* used for kernel specifc loading method */
 	char kernel_mod_tag[MAX_MOD_TAG_LEN];		/* multiboot module tag for kernel */
 	char ramdisk_mod_tag[MAX_MOD_TAG_LEN];		/* multiboot module tag for ramdisk */

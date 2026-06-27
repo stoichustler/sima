@@ -18,9 +18,11 @@
 #include <softirq.h>
 #include <ticks.h>
 #include <vm_wdt.h>
+#include <vm_config.h>
 #include <asm/platform.h>
 #include <asm/cpu.h>
 #include <asm/irq.h>
+#include <asm/page.h>
 #include <asm/sysreg.h>
 #include <asm/trap.h>
 #include <asm/guest/vcpu_priv.h>
@@ -65,6 +67,8 @@
 #define PSCI_RET_DENIED			(-3L)
 #define PSCI_AFFINITY_LEVEL_ON		0UL
 #define PSCI_AFFINITY_LEVEL_OFF		1UL
+#define SPSR_MODE_MASK			0xfUL
+#define SPSR_MODE_EL1H			0x5UL
 
 #define ESR_SYSREG_DIR_READ		1UL
 #define ESR_SYSREG_OP0_SHIFT		20U
@@ -99,6 +103,25 @@
 #define SYSREG_CNTV_CVAL_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 3UL, 2UL)
 #define SYSREG_CNTV_TVAL_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 3UL, 0UL)
 #define SYSREG_CNTVCT_EL0		SYSREG_ENC(3UL, 3UL, 14UL, 0UL, 2UL)
+
+/*
+ * Linux scheduling hint:
+ *
+ *   SP_EL0(current task) -> task.thread_info.preempt_count
+ *      SOFTIRQ/HARDIRQ/NMI set -> EL1 still owns IRQ bottom-half progress
+ *
+ * The local Linux image has CONFIG_THREAD_INFO_IN_TASK=y and no SW_TTBR0_PAN,
+ * so thread_info is the first task_struct field and preempt_count sits after
+ * flags. This is a best-effort hint: failed translation/read falls back to the
+ * vGIC-only policy used for RTOS guests.
+ */
+#define LINUX_TI_PREEMPT_COUNT_OFFSET	8UL
+#define LINUX_PREEMPT_MASK		0x000000ffU
+#define LINUX_SOFTIRQ_MASK		0x0000ff00U
+#define LINUX_HARDIRQ_MASK		0x000f0000U
+#define LINUX_NMI_MASK			0x00f00000U
+#define LINUX_IRQ_CONTEXT_MASK \
+	(LINUX_SOFTIRQ_MASK | LINUX_HARDIRQ_MASK | LINUX_NMI_MASK)
 
 struct arm64_guest_stack_frame {
 	uint64_t fp;
@@ -209,6 +232,113 @@ static bool vcpu_has_pending_guest_irq(struct acrn_vcpu *vcpu)
 	return arm64_vgicv3_pending_irq_blocks_reschedule(vcpu);
 }
 
+static int32_t arm64_translate_live_guest_va(struct acrn_vcpu *vcpu, uint64_t gva,
+	uint64_t *gpa)
+{
+	uint64_t old_par;
+	uint64_t par;
+	uint64_t page;
+	int32_t ret = -EINVAL;
+
+	if ((vcpu == NULL) || (gpa == NULL) ||
+		(get_running_vcpu(get_pcpu_id()) != vcpu)) {
+		return ret;
+	}
+
+	/*
+	 * AT S1E1R consumes the live guest EL1 translation registers and stage-2
+	 * context already installed for this vCPU:
+	 *
+	 *   guest VA --S1+S2--> IPA/GPA page -> copy_from_gpa()
+	 *
+	 * PAR_EL1 is guest-visible state, so preserve it around the diagnostic
+	 * translation.
+	 */
+	old_par = read_par_el1();
+	arm64_at_s1e1r(gva);
+	par = read_par_el1();
+	write_par_el1(old_par);
+	if ((par & PAR_EL1_F) == 0UL) {
+		page = par & PAR_EL1_PA_MASK;
+		*gpa = page | (gva & (PAGE_SIZE - 1UL));
+		ret = 0;
+	}
+
+	return ret;
+}
+
+static bool vcpu_guest_is_linux(const struct acrn_vcpu *vcpu)
+{
+	const struct acrn_vm_config *vm_config;
+
+	if ((vcpu == NULL) || (vcpu->vm == NULL)) {
+		return false;
+	}
+
+	vm_config = get_vm_config(vcpu->vm->vm_id);
+	return vm_config->os_config.os_family == VM_OS_LINUX;
+}
+
+static bool sample_guest_linux_preempt_count(struct acrn_vcpu *vcpu,
+	uint32_t *preempt_count)
+{
+	uint64_t current;
+	uint64_t gpa;
+	bool ret = false;
+
+	if ((vcpu == NULL) || (vcpu->vm == NULL) || (preempt_count == NULL)) {
+		return false;
+	}
+	if (!vcpu_guest_is_linux(vcpu)) {
+		return false;
+	}
+	if ((vcpu->arch.regs.spsr & SPSR_MODE_MASK) != SPSR_MODE_EL1H) {
+		return false;
+	}
+
+	current = read_sp_el0();
+	if (current == 0UL) {
+		return false;
+	}
+
+	if ((arm64_translate_live_guest_va(vcpu,
+			current + LINUX_TI_PREEMPT_COUNT_OFFSET, &gpa) == 0) &&
+		(copy_from_gpa(vcpu->vm, preempt_count, gpa, sizeof(*preempt_count)) == 0)) {
+		ret = true;
+	}
+
+	return ret;
+}
+
+static bool vcpu_guest_irq_context_blocks_reschedule(struct acrn_vcpu *vcpu)
+{
+	uint32_t preempt_count = 0U;
+	bool blocks = false;
+
+	if (sample_guest_linux_preempt_count(vcpu, &preempt_count)) {
+		/*
+		 * Hardirq/softirq/NMI contexts are forward-progress critical because
+		 * Linux raises TIMER/SCHED work from the timer IRQ and runs it after
+		 * irq_exit. Plain PREEMPT_MASK is observed for diagnosis but is not a
+		 * standalone block; idle and scheduler sections can keep it set long
+		 * enough to hurt shared-pCPU fairness.
+		 */
+		if ((preempt_count & LINUX_IRQ_CONTEXT_MASK) != 0U) {
+			blocks = true;
+		} else if ((preempt_count & LINUX_PREEMPT_MASK) != 0U) {
+			blocks = arm64_vgicv3_pending_irq_blocks_reschedule(vcpu);
+		}
+	}
+
+	return blocks;
+}
+
+static bool vcpu_forward_progress_blocks_reschedule(struct acrn_vcpu *vcpu)
+{
+	return vcpu_has_pending_guest_irq(vcpu) ||
+		vcpu_guest_irq_context_blocks_reschedule(vcpu);
+}
+
 static void prepare_current_guest_resume(struct acrn_vcpu *vcpu)
 {
 	bool expired;
@@ -237,7 +367,7 @@ static struct acrn_vcpu *schedule_without_guest_resume(uint16_t pcpu_id,
 		 * On a shared pCPU, a deliverable virtual IRQ gets a bounded
 		 * guest-forward-progress window before scheduler fairness resumes.
 		 */
-		if (!vcpu_has_pending_guest_irq(vcpu)) {
+		if (!vcpu_forward_progress_blocks_reschedule(vcpu)) {
 			schedule();
 			vcpu = get_exit_vcpu(pcpu_id);
 			refresh_current_vtimer(vcpu);

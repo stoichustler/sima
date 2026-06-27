@@ -417,12 +417,15 @@ static uint64_t make_lr_state(const struct arm64_vgic_irq *desc, bool pending, b
 	if (desc->hw) {
 		lr |= ((uint64_t)desc->pirq << ICH_LR_PINTID_SHIFT);
 		lr |= ICH_LR_HW;
-	} else if (active || !desc->level) {
+	} else if (active || !desc->level || (desc->virq == ARM64_GIC_PPI_VIRTUAL_TIMER)) {
 		/*
-		 * Software edge IRQs must report completion even when they start as
-		 * pending-only LRs. Linux can wake from WFI with PSTATE.I still set;
-		 * the SGI must remain pending until EL1 actually acknowledges and EOIs
-		 * it after local_irq_enable().
+		 * Software edge IRQs and the virtual timer must report completion even
+		 * when they start as pending-only LRs:
+		 *
+		 *   pending PPI27 LR -> guest EOI -> maintenance -> resample CNTV
+		 *
+		 * Without EOI maintenance, EL2 can keep host PPI27 masked until an
+		 * unrelated exit, starving the next Linux clockevent tick.
 		 */
 		lr |= ICH_LR_EOI;
 	}
@@ -1295,18 +1298,20 @@ static void vgicv3_sync_timer_line_locked(struct acrn_vcpu *vcpu, bool is_curren
 		}
 	}
 	/*
-	 * CNTV_CTL.IMASK suppresses the hardware comparator itself. Keep it tied
-	 * only to the sampled CNTV level: after the guest programs a future
-	 * deadline the line is low, and the next PPI27 must be allowed to fire
-	 * even if the previous virtual interrupt is still active until EOI/DIR.
+	 * CNTV line ownership:
+	 *
+	 *   line high -> vGIC owns PPI27, suppress host re-entry
+	 *   line low  -> guest owns the next deadline, keep a backup tick armed
+	 *
+	 * The live CNTV PPI is the fast path, but the saved CNTV deadline is also
+	 * mirrored into a host timer. This matches the vCPU-resume model where
+	 * every return to EL1 first checks whether the saved timer is already due;
+	 * it also prevents a loaded vCPU from running forever if the physical CNTV
+	 * PPI does not produce another EL2 exit after a future deadline is set.
 	 */
 	arm64_vtimer_set_host_mask(vcpu, line_asserted);
 	if (!line_asserted) {
-		if (is_current || vgicv3_vcpu_is_loaded(vcpu)) {
-			arm64_vgicv3_cancel_cntv_timer(vcpu);
-		} else {
-			arm64_vgicv3_arm_cntv_timer(vcpu);
-		}
+		arm64_vgicv3_arm_cntv_timer(vcpu);
 	} else {
 		arm64_vgicv3_cancel_cntv_timer(vcpu);
 	}
@@ -1486,14 +1491,11 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 				/*
 				 * 2026-06-26, vtimer/vGIC sync:
 				 *
-				 *   CNTV level high
-				 *          |
-				 *          v
-				 *   pending-only PPI27 LR -> keep pending, clear LR.EOI
+				 *   CNTV level high -> pending-only PPI27 LR -> wait for EOI
 				 *
-				 * PPI27 is a software level IRQ sourced by CNTV. A pending-only
-				 * LR has not been acknowledged by EL1; preserving ICH_LR_EOI can
-				 * report fake EOI maintenance around the same masked source.
+				 * PPI27 is a software level IRQ sourced by CNTV. Keep EOI
+				 * maintenance armed so EL2 can unmask/re-sample the host source
+				 * when Linux completes arch_timer_handler().
 				 */
 				vcpu->arch.debug.vtimer_diag.pending_only_lr_seen++;
 				vgic_set_pending(&vcpu->vm->arch_vm.vgic, vcpu->vcpu_id,
@@ -1504,14 +1506,6 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_drop++;
 					remove_lr(vcpu, idx);
 				} else {
-					uint64_t clean_lr = lr & ~ICH_LR_EOI;
-
-					if (clean_lr != lr) {
-						ctx->lr[idx] = clean_lr;
-						if (loaded) {
-							write_ich_lr_el2((uint8_t)idx, clean_lr);
-						}
-					}
 					arm64_vtimer_set_host_mask(vcpu, true);
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_preserve++;
 					idx++;
@@ -1716,11 +1710,31 @@ bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu)
 	return pending;
 }
 
-static bool vgicv3_pending_lr_blocks_reschedule(__unused struct acrn_vcpu *vcpu, uint64_t lr)
+static bool vgicv3_pending_lr_blocks_reschedule(struct acrn_vcpu *vcpu, uint64_t lr)
 {
 	uint32_t state = lr_state(lr);
 
-	return (state & ICH_LR_STATE_PENDING) != 0U;
+	/*
+	 * IRQ-routing progress window:
+	 *
+	 *   Pending LR -> guest has not acknowledged the IRQ yet
+	 *   Active LR  -> guest handler/irq_exit path may still be running
+	 *
+	 * The reference scheduler model uses guest IRQ/preempt state when the guest
+	 * exports it. BEAU does not have that ABI, so live active-priority state is
+	 * the local approximation: avoid an immediate host reschedule while EL1 is
+	 * likely between hardirq entry and bottom-half processing. A stale saved
+	 * Active LR alone is not enough evidence, because that could unfairly pin a
+	 * shared pCPU.
+	 */
+	if ((state & ICH_LR_STATE_PENDING) != 0U) {
+		return true;
+	}
+	if (((state & ICH_LR_STATE_ACTIVE) != 0U) && vgicv3_vcpu_is_loaded(vcpu)) {
+		return !vgicv3_active_priority_empty();
+	}
+
+	return false;
 }
 
 bool arm64_vgicv3_pending_irq_blocks_reschedule(struct acrn_vcpu *vcpu)
@@ -1747,6 +1761,15 @@ bool arm64_vgicv3_pending_irq_blocks_reschedule(struct acrn_vcpu *vcpu)
 			blocks = true;
 			break;
 		}
+	}
+	if (!blocks && vgicv3_vcpu_is_loaded(vcpu) && !vgicv3_active_priority_empty()) {
+		/*
+		 * The live virtual CPU interface can still show an active guest IRQ
+		 * even when LR sync no longer gives a clean per-INTID explanation. Treat
+		 * that as the same IRQ-forward-progress window: return to EL1 so the
+		 * guest can finish EOI/irq_exit and run any bottom halves it raised.
+		 */
+		blocks = true;
 	}
 
 	for (word = 0U; !blocks && (word < ARM64_VGIC_WORDS); word++) {

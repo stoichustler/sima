@@ -381,13 +381,15 @@ void load_vcpu(__unused struct acrn_vcpu *vcpu)
 	 * 2026-06-26, vCPU/vtimer principle:
 	 *
 	 *   CNTVCT_EL0 read  -> hardware CNTVCT = CNTPCT - CNTVOFF_EL2
-	 *   CNTV timer regs  -> EL2 trap -> guest shadow -> live CNTV
+	 *   CNTV timer regs  -> live CNTV saved/restored on vCPU switch
+	 *   CNTP timer regs  -> EL2 trap -> guest shadow -> host timer
 	 *
-	 * EL2 may mask the live CNTV comparator while vGIC owns PPI27. Trap the
-	 * guest CNTV control path so Linux reads the guest-visible timer status
-	 * from the shadow state, not from EL2's private live IMASK bit.
+	 * A57/A73-class CPUs cannot rely on virtual timer traps for CNTV_CTL_EL0.
+	 * Keep the virtual timer architectural and avoid hiding ISTATUS from
+	 * Linux; leave EL1PCEN clear so physical timer accesses still trap for
+	 * CNTP emulation.
 	 */
-	write_cnthctl_el2(CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1TVT);
+	write_cnthctl_el2(CNTHCTL_EL2_EL1PCTEN);
 	asm volatile ("msr cntvoff_el2, %0; isb" : : "r" (gctx->cntvoff_el2) : "memory");
 	restore_el1_sysregs(gctx);
 	arm64_vtimer_load_current(vcpu);

@@ -64,6 +64,7 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 		},
 		.os_config = {
 			.name = "zephyr",
+			.os_family = VM_OS_RTOS,
 			.kernel_type = KERNEL_RAWIMAGE,
 			.kernel_mod_tag = "zephyr",
 			.kernel_load_addr = RK356X_ZEPHYR_RAM_START,
@@ -98,6 +99,7 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 		},
 		.os_config = {
 			.name = "lk",
+			.os_family = VM_OS_RTOS,
 			.kernel_type = KERNEL_RAWIMAGE,
 			.kernel_mod_tag = "lk",
 			.kernel_load_addr = RK356X_LK_RAM_START + 0x100000UL,
@@ -132,6 +134,7 @@ struct acrn_vm_config vm_configs[CONFIG_MAX_VM_NUM] = {
 		},
 		.os_config = {
 			.name = "linux",
+			.os_family = VM_OS_LINUX,
 			.kernel_type = KERNEL_RAWIMAGE,
 			.kernel_mod_tag = "linux",
 			.ramdisk_mod_tag = "Initramfs.cpio.gz",
