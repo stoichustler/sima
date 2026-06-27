@@ -395,6 +395,13 @@ struct arm64_vcpu_vtimer_diag {
 	 */
 	uint64_t cntv_ppi;
 	/*
+	 * backup/poll are non-IRQ CNTV sync points. They explain progress when
+	 * Linux timer softirq recovery came from EL2 refresh rather than a fresh
+	 * host PPI27.
+	 */
+	uint64_t cntv_backup;
+	uint64_t cntv_poll;
+	/*
 	 * pending-only LR flow tracks the QEMU-sensitive path where a timer LR can
 	 * wake WFI but disappear before Linux acknowledges PPI27. preserve means
 	 * CNTV was still due and EL2 kept the virtual line asserted; drop means CNTV

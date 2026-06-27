@@ -862,6 +862,7 @@ static void cntv_timer_handler(void *data)
 	 * guest deadline is still expired, inject through the same vGIC path as a
 	 * host PPI27 hit.
 	 */
+	vcpu->arch.debug.vtimer_diag.cntv_backup++;
 	arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_BACKUP,
 		ARM64_GIC_PPI_VIRTUAL_TIMER, ctl, cval, false, false);
 	(void)vtimer_inject_current(vcpu, ARM64_GIC_PPI_VIRTUAL_TIMER, ctl, cval);
@@ -980,6 +981,7 @@ void arm64_vgicv3_poll_current_vtimer(struct acrn_vcpu *vcpu)
 	vcpu->arch.gctx.timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 	vcpu->arch.gctx.cntv_cval_el0 = cval;
 	vcpu->arch.gctx.cntv_ctl_el0 = ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+	vcpu->arch.debug.vtimer_diag.cntv_poll++;
 	vtimer_set_host_mask(vcpu, true);
 	arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_POLL,
 		ARM64_GIC_PPI_VIRTUAL_TIMER, ctl, cval, false, false);

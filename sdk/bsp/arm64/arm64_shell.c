@@ -16,6 +16,7 @@
 #include <reloc.h>
 #include <vm.h>
 #include <vcpu.h>
+#include <vm_wdt.h>
 #include <host_pm.h>
 #include <schedule.h>
 #include <ticks.h>
@@ -927,30 +928,88 @@ static uint32_t shell_cpu_bitmap_weight(uint64_t bitmap)
 	return weight;
 }
 
-static uint64_t shell_vmstat_cntv_ppi_count(const struct acrn_vm *vm)
-{
-	uint64_t count = 0UL;
-	uint16_t vcpu_id;
+struct shell_vmstat_timer_summary {
+	uint64_t cntv_ppi;
+	uint64_t cntv_backup;
+	uint64_t cntv_poll;
+	uint64_t pre_eret_flush;
+	uint64_t pre_eret_flush_expired;
+	uint64_t lost_pending_lr;
+};
 
-	if (vm == NULL) {
-		return 0UL;
+static const char *shell_vmstat_wdt_status_to_str(enum vm_wdt_status status)
+{
+	const char *str;
+
+	switch (status) {
+	case VM_WDT_STATUS_OFFLINE:
+		str = "offline";
+		break;
+	case VM_WDT_STATUS_UNKNOWN:
+		str = "none";
+		break;
+	case VM_WDT_STATUS_ALIVE:
+		str = "alive";
+		break;
+	case VM_WDT_STATUS_STUCK:
+		str = "stuck";
+		break;
+	default:
+		str = "unused";
+		break;
 	}
 
+	return str;
+}
+
+static int64_t shell_vmstat_ticks_delta_us(int64_t delta)
+{
+	if (delta < 0L) {
+		uint64_t magnitude = (uint64_t)(-(delta + 1L)) + 1UL;
+
+		return -(int64_t)ticks_to_us(magnitude);
+	}
+
+	return (int64_t)ticks_to_us((uint64_t)delta);
+}
+
+static void shell_vmstat_collect_timer_summary(const struct acrn_vm *vm,
+	struct shell_vmstat_timer_summary *summary)
+{
+	uint16_t vcpu_id;
+
+	if ((vm == NULL) || (summary == NULL)) {
+		return;
+	}
+
+	summary->cntv_ppi = 0UL;
+	summary->cntv_backup = 0UL;
+	summary->cntv_poll = 0UL;
+	summary->pre_eret_flush = 0UL;
+	summary->pre_eret_flush_expired = 0UL;
+	summary->lost_pending_lr = 0UL;
 	for (vcpu_id = 0U; vcpu_id < vm->hw.created_vcpus; vcpu_id++) {
 		const struct acrn_vcpu *vcpu = vcpu_from_vid((struct acrn_vm *)vm, vcpu_id);
 
 		if (vcpu != NULL) {
-			count += vcpu->arch.debug.vtimer_diag.cntv_ppi;
+			const struct arm64_vcpu_vtimer_diag *diag = &vcpu->arch.debug.vtimer_diag;
+
+			summary->cntv_ppi += diag->cntv_ppi;
+			summary->cntv_backup += diag->cntv_backup;
+			summary->cntv_poll += diag->cntv_poll;
+			summary->pre_eret_flush += diag->pre_eret_flush;
+			summary->pre_eret_flush_expired += diag->pre_eret_flush_expired;
+			summary->lost_pending_lr += diag->lost_pending_lr;
 		}
 	}
-
-	return count;
 }
 
 static void shell_vmstat_vm_config(uint16_t vm_id, const struct acrn_vm_config *vm_config,
 	const struct acrn_vm *vm)
 {
 	const struct arm64_vgicv3 *vgic = &vm->arch_vm.vgic;
+	struct shell_vmstat_timer_summary timer = { 0U };
+	struct vm_wdt_snapshot wdt = { 0U };
 	struct console_vm_ring_stats ring = { 0U };
 	struct acrn_vuart *vu = NULL;
 	char temp_str[MAX_STR_SIZE];
@@ -978,8 +1037,16 @@ static void shell_vmstat_vm_config(uint16_t vm_id, const struct acrn_vm_config *
 		vgic->rdist_count, vgic->lr_count, vgic->vmcr, vgic->gicd_ctlr);
 	shell_item_line("its:enabled:%s typer:0x%08lx ctlr:0x%08x",
 		shell_yes_no(vgic->its_enabled), vgic->its.typer, vgic->its.ctlr);
-	shell_item_line("timer:cntv:Y gic:cntv-ppi:%lu cnthp:Y cntp-emul:Y maintenance:Y time-delta:%ld",
-		shell_vmstat_cntv_ppi_count(vm), vm->arch_vm.time_delta);
+	shell_vmstat_collect_timer_summary(vm, &timer);
+	shell_item_line("timer:cntv:Y ppi:%lu backup:%lu poll:%lu pre-eret:%lu/%lu lr-miss:%lu cnthp:Y cntp-emul:Y maintenance:Y time-delta:%ld",
+		timer.cntv_ppi, timer.cntv_backup, timer.cntv_poll,
+		timer.pre_eret_flush_expired, timer.pre_eret_flush,
+		timer.lost_pending_lr, vm->arch_vm.time_delta);
+	if (vm_wdt_get_snapshot(vm_id, &wdt) == 0) {
+		shell_item_line("wdt:status:%s kick:%lu age.ms:%lu token:0x%016lx",
+			shell_vmstat_wdt_status_to_str(wdt.status),
+			wdt.kick_count, wdt.age_ms, wdt.last_token);
+	}
 	shell_item_line("console:selected:%s ring:%u/%u pending:%s",
 		shell_yes_no(console_vmid == vm_id), ring.queued,
 		ring.capacity, shell_yes_no(ring.pending));
@@ -1061,6 +1128,61 @@ static void shell_vmstat_vcpu_diag(const struct acrn_vcpu *vcpu,
 	}
 }
 
+static void shell_vmstat_vcpu_timer(const struct acrn_vcpu *vcpu)
+{
+	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
+	const struct arm64_vcpu_vtimer_diag *diag = &vcpu->arch.debug.vtimer_diag;
+	const struct arm64_vgicv3 *vgic = &vcpu->vm->arch_vm.vgic;
+	const struct arm64_vgic_irq *timer_irq = NULL;
+	uint64_t now = cpu_ticks() - gctx->cntvoff_el2;
+	int64_t delta = (int64_t)(gctx->cntv_cval_el0 - now);
+	int64_t delta_us = shell_vmstat_ticks_delta_us(delta);
+	bool expired = ((gctx->cntv_ctl_el0 & CNTV_CTL_ENABLE) != 0U) &&
+		((gctx->cntv_ctl_el0 & CNTV_CTL_IMASK) == 0U) && (delta <= 0L);
+	bool bitmap = false;
+	bool deliverable = false;
+
+	if (vgic->initialized && (vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
+		uint32_t virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+		uint32_t word = virq / 32U;
+		uint32_t bit = 1U << (virq % 32U);
+
+		timer_irq = &vgic->irq[vcpu->vcpu_id][virq];
+		bitmap = ((vgic->pending_bitmap[vcpu->vcpu_id][word] & bit) != 0U);
+		deliverable = ((vgic->gicd_ctlr & (1U << 1U)) != 0U) &&
+			((vcpu->arch.vgic.vmcr & ICH_VMCR_VENG1) != 0UL) &&
+			timer_irq->enabled;
+	}
+
+	if (timer_irq != NULL) {
+		shell_item_line("      timer:PPI%u ctl:0x%08x cval:0x%016lx delta.us:%ld exp:%s mask:%s ppi:%lu backup:%lu poll:%lu pre-eret:%lu/%lu",
+			ARM64_GIC_PPI_VIRTUAL_TIMER, gctx->cntv_ctl_el0,
+			gctx->cntv_cval_el0, delta_us, shell_yes_no(expired),
+			shell_yes_no(gctx->cntv_el2_masked), diag->cntv_ppi,
+			diag->cntv_backup, diag->cntv_poll,
+			diag->pre_eret_flush_expired, diag->pre_eret_flush);
+		shell_item_line("      vgic:PPI%u en:%s pend:%s act:%s level:%s bitmap:%s deliverable:%s lr:%u hcr:0x%016lx vmcr:0x%016lx",
+			ARM64_GIC_PPI_VIRTUAL_TIMER,
+			shell_yes_no(timer_irq->enabled),
+			shell_yes_no(timer_irq->pending),
+			shell_yes_no(timer_irq->active),
+			shell_yes_no(timer_irq->level),
+			shell_yes_no(bitmap), shell_yes_no(deliverable),
+			vcpu->arch.vgic.used_lrs, vcpu->arch.vgic.hcr,
+			vcpu->arch.vgic.vmcr);
+	} else {
+		shell_item_line("      timer:PPI%u ctl:0x%08x cval:0x%016lx delta.us:%ld exp:%s mask:%s ppi:%lu backup:%lu poll:%lu pre-eret:%lu/%lu",
+			ARM64_GIC_PPI_VIRTUAL_TIMER, gctx->cntv_ctl_el0,
+			gctx->cntv_cval_el0, delta_us, shell_yes_no(expired),
+			shell_yes_no(gctx->cntv_el2_masked), diag->cntv_ppi,
+			diag->cntv_backup, diag->cntv_poll,
+			diag->pre_eret_flush_expired, diag->pre_eret_flush);
+		shell_item_line("      vgic:PPI%u desc:none lr:%u hcr:0x%016lx vmcr:0x%016lx",
+			ARM64_GIC_PPI_VIRTUAL_TIMER, vcpu->arch.vgic.used_lrs,
+			vcpu->arch.vgic.hcr, vcpu->arch.vgic.vmcr);
+	}
+}
+
 static void shell_vmstat_vcpus(const struct acrn_vm *vm)
 {
 	uint16_t vcpu_id;
@@ -1115,14 +1237,7 @@ static void shell_vmstat_vcpus(const struct acrn_vm *vm)
 				(rtds.deadline_ticks > now) ?
 					ticks_to_us(rtds.deadline_ticks - now) : 0UL);
 		}
-		shell_item_line("      timer:virq:%u gic:cntv-ppi:%lu cntv_ctl:0x%08x cntv_cval:0x%016lx",
-			vcpu->arch.gctx.timer_virq,
-			vcpu->arch.debug.vtimer_diag.cntv_ppi,
-			vcpu->arch.gctx.cntv_ctl_el0,
-			vcpu->arch.gctx.cntv_cval_el0);
-		shell_item_line("      cpuif:used-lrs:%u hcr:0x%016lx vmcr:0x%016lx pmr:0x%016lx",
-			vcpu->arch.vgic.used_lrs, vcpu->arch.vgic.hcr,
-			vcpu->arch.vgic.vmcr, vcpu->arch.vgic.pmr);
+		shell_vmstat_vcpu_timer(vcpu);
 	}
 }
 
