@@ -285,7 +285,6 @@ static void record_vcpu_resume(struct acrn_vcpu *vcpu, uint32_t source)
 {
 	struct arm64_vcpu_guest_resume *last = &vcpu->arch.debug.last_resume;
 	const struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
-	struct arm64_gicv3_local_irq_state host_irq;
 	uint32_t virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
 	uint64_t host_now = read_cntpct_el0();
 	uint64_t host_cval = read_cnthp_cval_el2();
@@ -295,9 +294,6 @@ static void record_vcpu_resume(struct acrn_vcpu *vcpu, uint32_t source)
 		(CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
 	uint32_t ctl = read_cntv_ctl_el0() &
 		(CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS);
-
-	(void)memset(&host_irq, 0U, sizeof(host_irq));
-	arm64_gicv3_get_local_irq_state(get_pcpu_id(), ARM64_GIC_PPI_VIRTUAL_TIMER, &host_irq);
 
 	last->tsc = arm64_vcpu_trace_guest_boundary(vcpu, ARM64_VCPU_GUEST_TRACE_RESUME,
 		source, 0);
@@ -326,24 +322,6 @@ static void record_vcpu_resume(struct acrn_vcpu *vcpu, uint32_t source)
 	last->cntv_expired = ((ctl & CNTV_CTL_ENABLE) != 0U) &&
 		((ctl & CNTV_CTL_IMASK) == 0U) && ((int64_t)(cval - now) <= 0L);
 	last->cntv_el2_masked = gctx->cntv_el2_masked;
-	last->timer_enabled = false;
-	last->timer_pending = false;
-	last->timer_active = false;
-	last->timer_level = false;
-	if ((vcpu->vm != NULL) && (vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS) &&
-		(virq < ARM64_VGIC_IRQ_NUM)) {
-		const struct arm64_vgic_irq *desc =
-			&vcpu->vm->arch_vm.vgic.irq[vcpu->vcpu_id][virq];
-
-		last->timer_enabled = desc->enabled;
-		last->timer_pending = desc->pending;
-		last->timer_active = desc->active;
-		last->timer_level = desc->level;
-	}
-	last->host_valid = host_irq.valid;
-	last->host_enabled = host_irq.enabled != 0U;
-	last->host_pending = host_irq.pending != 0U;
-	last->host_active = host_irq.active != 0U;
 }
 
 static uint64_t *arm64_gpr(struct cpu_regs *regs, uint32_t idx)
@@ -695,6 +673,18 @@ static int32_t handle_sysreg(struct acrn_vcpu *vcpu)
 				arm64_vgicv3_update_current_vtimer(vcpu);
 			}
 		}
+	}
+
+	if (ret != 0) {
+		uint32_t op0 = (uint32_t)((iss >> ESR_SYSREG_OP0_SHIFT) & ESR_SYSREG_OP0_MASK);
+		uint32_t op1 = (uint32_t)((iss >> ESR_SYSREG_OP1_SHIFT) & ESR_SYSREG_OP1_MASK);
+		uint32_t crn = (uint32_t)((iss >> ESR_SYSREG_CRN_SHIFT) & ESR_SYSREG_CRN_MASK);
+		uint32_t crm = (uint32_t)((iss >> ESR_SYSREG_CRM_SHIFT) & ESR_SYSREG_CRM_MASK);
+		uint32_t op2 = (uint32_t)((iss >> ESR_SYSREG_OP2_SHIFT) & ESR_SYSREG_OP2_MASK);
+
+		pr_err("unsupported arm64 sysreg trap vm%u:vcpu%u %s rt=%u op=%u:%u:c%u:c%u:%u esr=0x%lx elr=0x%lx",
+			vcpu->vm->vm_id, vcpu->vcpu_id, read ? "read" : "write",
+			rt, op0, op1, crn, crm, op2, esr, regs->elr);
 	}
 
 	return ret;

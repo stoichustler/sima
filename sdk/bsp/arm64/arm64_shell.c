@@ -45,7 +45,6 @@
 #define DUMPSTAT_STACK_DEPTH		16U
 #define DUMPSTAT_REG_KEY_FMT		"%5s:0x%016lx"
 #define DUMPSTAT_REGS_PER_LINE_MAX	4U
-#define DUMPSTAT_VTIMER_VIRQ		ARM64_GIC_PPI_VIRTUAL_TIMER
 #define VMSTAT_CPU_WAIT_WARN_US		20000UL
 
 static int32_t shell_list_mem(__unused int32_t argc, __unused char **argv);
@@ -261,6 +260,11 @@ static void shell_dumpstat_regs(const struct cpu_regs *regs)
 static const char *shell_yes_no(bool value)
 {
 	return value ? "Y" : "N";
+}
+
+static uint32_t shell_lr_state(uint64_t lr)
+{
+	return (uint32_t)((lr >> ICH_LR_STATE_SHIFT) & 0x3UL);
 }
 
 static const char *shell_vtimer_trace_event_to_str(uint32_t event)
@@ -552,11 +556,7 @@ struct dumpstat_snapshot {
 	struct arm64_vcpu_guest_ctx gctx;
 	struct arm64_vgicv3_vcpu_ctx vgic_ctx;
 	struct arm64_vgic_irq timer_irq;
-	struct arm64_gicv3_local_irq_state host_timer_irq;
-	uint64_t live_cnthctl_el2;
 	uint64_t live_cntvct_el0;
-	uint64_t live_cntpct_el0;
-	uint64_t live_cntvoff_el2;
 	uint64_t live_cntv_cval_el0;
 	uint64_t live_ich_hcr_el2;
 	uint64_t live_ich_vmcr_el2;
@@ -564,11 +564,28 @@ struct dumpstat_snapshot {
 	uint64_t pending_req;
 	uint64_t irqs_pending;
 	uint64_t irqs_pending_mask;
+	uint32_t timer_pending_word;
 	uint32_t live_cntv_ctl_el0;
 	bool has_timer_irq;
 	bool has_live_timer;
 	bool captured;
 };
+
+static void shell_dumpstat_snapshot_timer_irq(struct dumpstat_snapshot *snapshot)
+{
+	const struct acrn_vcpu *vcpu = snapshot->vcpu;
+	uint32_t virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+
+	if ((vcpu != NULL) && (vcpu->vm != NULL) && vcpu->vm->arch_vm.vgic.initialized &&
+		(vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS) && (virq < ARM64_VGIC_IRQ_NUM)) {
+		const struct arm64_vgicv3 *vgic = &vcpu->vm->arch_vm.vgic;
+		uint32_t word = virq / 32U;
+
+		snapshot->timer_irq = vgic->irq[vcpu->vcpu_id][virq];
+		snapshot->timer_pending_word = vgic->pending_bitmap[vcpu->vcpu_id][word];
+		snapshot->has_timer_irq = true;
+	}
+}
 
 static void shell_dumpstat_capture(void *data)
 {
@@ -586,10 +603,8 @@ static void shell_dumpstat_capture(void *data)
 		snapshot->pending_req = snapshot->vcpu->pending_req;
 		snapshot->irqs_pending = snapshot->vcpu->arch.irqs_pending;
 		snapshot->irqs_pending_mask = snapshot->vcpu->arch.irqs_pending_mask;
-		snapshot->live_cnthctl_el2 = read_cnthctl_el2();
+		shell_dumpstat_snapshot_timer_irq(snapshot);
 		snapshot->live_cntvct_el0 = read_cntvct_el0();
-		snapshot->live_cntpct_el0 = read_cntpct_el0();
-		snapshot->live_cntvoff_el2 = read_cntvoff_el2();
 		snapshot->live_cntv_cval_el0 = read_cntv_cval_el0();
 		snapshot->live_cntv_ctl_el0 = read_cntv_ctl_el0();
 		snapshot->live_ich_hcr_el2 = read_ich_hcr_el2();
@@ -603,8 +618,6 @@ static void shell_dumpstat_capture(void *data)
 		snapshot->live_ich_lr[1U] = read_ich_lr_el2(1U);
 		snapshot->live_ich_lr[2U] = read_ich_lr_el2(2U);
 		snapshot->live_ich_lr[3U] = read_ich_lr_el2(3U);
-		arm64_gicv3_get_local_irq_state(get_pcpu_id(), DUMPSTAT_VTIMER_VIRQ,
-			&snapshot->host_timer_irq);
 		snapshot->has_live_timer = true;
 		snapshot->captured = true;
 	}
@@ -624,13 +637,7 @@ static const struct cpu_regs *shell_dumpstat_get_regs(struct acrn_vcpu *vcpu,
 	snapshot->pending_req = vcpu->pending_req;
 	snapshot->irqs_pending = vcpu->arch.irqs_pending;
 	snapshot->irqs_pending_mask = vcpu->arch.irqs_pending_mask;
-	snapshot->has_timer_irq = false;
-	if ((vcpu->vm != NULL) && (vcpu->vcpu_id < ARM64_VGIC_MAX_VCPUS)) {
-		(void)memcpy_s(&snapshot->timer_irq, sizeof(snapshot->timer_irq),
-			&vcpu->vm->arch_vm.vgic.irq[vcpu->vcpu_id][DUMPSTAT_VTIMER_VIRQ],
-			sizeof(snapshot->timer_irq));
-		snapshot->has_timer_irq = true;
-	}
+	shell_dumpstat_snapshot_timer_irq(snapshot);
 	snapshot->has_live_timer = false;
 	snapshot->captured = false;
 
@@ -644,71 +651,71 @@ static const struct cpu_regs *shell_dumpstat_get_regs(struct acrn_vcpu *vcpu,
 	return snapshot->captured ? &snapshot->regs : &vcpu->arch.regs;
 }
 
+static int32_t shell_find_valid_lr_for_virq(const uint64_t *lrs, uint32_t count, uint32_t virq)
+{
+	uint32_t idx;
+
+	for (idx = 0U; idx < count; idx++) {
+		uint64_t lr = lrs[idx];
+
+		if ((shell_lr_state(lr) != ICH_LR_STATE_INVALID) &&
+			((uint32_t)(lr & ICH_LR_VINTID_MASK) == virq)) {
+			return (int32_t)idx;
+		}
+	}
+
+	return -1;
+}
+
+static void shell_dumpstat_timer_irq_state(const struct dumpstat_snapshot *snapshot)
+{
+	uint32_t virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+	uint32_t bit = 1U << (virq % 32U);
+	uint64_t vmcr = snapshot->has_live_timer ?
+		snapshot->live_ich_vmcr_el2 : snapshot->vgic_ctx.vmcr;
+	int32_t saved_lr = shell_find_valid_lr_for_virq(snapshot->vgic_ctx.lr,
+		snapshot->vgic_ctx.used_lrs, virq);
+	int32_t live_lr = snapshot->has_live_timer ?
+		shell_find_valid_lr_for_virq(snapshot->live_ich_lr,
+			ARRAY_SIZE(snapshot->live_ich_lr), virq) : -1;
+	bool gicd_g1 = ((snapshot->vcpu->vm->arch_vm.vgic.gicd_ctlr & (1U << 1U)) != 0U);
+	bool vmcr_g1 = ((vmcr & ICH_VMCR_VENG1) != 0UL);
+	bool bitmap = ((snapshot->timer_pending_word & bit) != 0U);
+
+	if (!snapshot->has_timer_irq) {
+		shell_item_line("      vgic:desc:none");
+		return;
+	}
+
+	shell_item_line("      vgic:en:%s pend:%s act:%s level:%s bitmap:%s deliverable:%s",
+		shell_yes_no(snapshot->timer_irq.enabled),
+		shell_yes_no(snapshot->timer_irq.pending),
+		shell_yes_no(snapshot->timer_irq.active),
+		shell_yes_no(snapshot->timer_irq.level),
+		shell_yes_no(bitmap),
+		shell_yes_no(gicd_g1 && vmcr_g1 && snapshot->timer_irq.enabled));
+	shell_item_line("      route:saved-lr:%d live-lr:%d hcr:0x%016lx live-hcr:0x%016lx",
+		saved_lr, live_lr, snapshot->vgic_ctx.hcr, snapshot->live_ich_hcr_el2);
+}
+
 static void shell_dumpstat_timer_state(const struct dumpstat_snapshot *snapshot)
 {
 	const struct arm64_vcpu_guest_ctx *gctx = &snapshot->gctx;
-	const struct arm64_gicv3_local_irq_state *host_irq = &snapshot->host_timer_irq;
-	const struct arm64_vgic_irq *timer_irq = snapshot->has_timer_irq ?
-		&snapshot->timer_irq : NULL;
 
 	if (snapshot->has_live_timer) {
 		uint64_t guest_now = snapshot->live_cntvct_el0;
 
-		shell_item_line("PPI%u cntv_ctl:0x%08x cntv_cval:0x%016lx cntvct:0x%016lx delta:%ld el2_mask:%s",
+		shell_item_line("PPI%u cntv_ctl:0x%08x guest_ctl:0x%08x cntv_cval:0x%08lx cntvct:0x%08lx delta:%ld el2_mask:%s",
 			gctx->timer_virq, snapshot->live_cntv_ctl_el0,
-			snapshot->live_cntv_cval_el0, snapshot->live_cntvct_el0,
+			gctx->cntv_ctl_el0, snapshot->live_cntv_cval_el0,
+			snapshot->live_cntvct_el0,
 			(int64_t)(snapshot->live_cntv_cval_el0 - guest_now),
 			shell_yes_no(gctx->cntv_el2_masked));
-		shell_item_line("      cntpct:0x%016lx cntvoff:0x%016lx cnthctl:0x%016lx",
-			snapshot->live_cntpct_el0, snapshot->live_cntvoff_el2,
-			snapshot->live_cnthctl_el2);
 	} else {
 		shell_item_line("PPI%u live:none el2_mask:%s",
 			gctx->timer_virq, shell_yes_no(gctx->cntv_el2_masked));
 	}
-
-	if (host_irq->valid && (timer_irq != NULL)) {
-		shell_item_line("      irq host en:%s pend:%s act:%s group:%s prio:0x%02x | vm en:%s pend:%s act:%s level:%s",
-			shell_yes_no(host_irq->enabled != 0U),
-			shell_yes_no(host_irq->pending != 0U),
-			shell_yes_no(host_irq->active != 0U),
-			shell_yes_no(host_irq->group != 0U),
-			host_irq->priority,
-			shell_yes_no(timer_irq->enabled), shell_yes_no(timer_irq->pending),
-			shell_yes_no(timer_irq->active), shell_yes_no(timer_irq->level));
-	} else if (host_irq->valid) {
-		shell_item_line("      irq host en:%s pend:%s act:%s group:%s prio:0x%02x | vm:none",
-			shell_yes_no(host_irq->enabled != 0U),
-			shell_yes_no(host_irq->pending != 0U),
-			shell_yes_no(host_irq->active != 0U),
-			shell_yes_no(host_irq->group != 0U),
-			host_irq->priority);
-	} else if (timer_irq != NULL) {
-		shell_item_line("      irq host:none | vm en:%s pend:%s act:%s level:%s",
-			shell_yes_no(timer_irq->enabled), shell_yes_no(timer_irq->pending),
-			shell_yes_no(timer_irq->active), shell_yes_no(timer_irq->level));
-	} else {
-		shell_item_line("      irq host:none | vm:none");
-	}
-	shell_item_line("hyp:hcr:0x%016lx vtcr:0x%016lx vttbr:0x%016lx vmpidr:0x%016lx",
-		gctx->hcr_el2, gctx->vtcr_el2, gctx->vttbr_el2,
-		vcpu_get_vmpidr(snapshot->vcpu));
-	shell_item_line("cpuif:vmcr:0x%016lx hcr:0x%016lx used_lrs:%u pmr:0x%016lx",
-		snapshot->vgic_ctx.vmcr, snapshot->vgic_ctx.hcr,
-		snapshot->vgic_ctx.used_lrs, snapshot->vgic_ctx.pmr);
-	if (snapshot->has_live_timer) {
-		shell_item_line("      live_cpuif:hcr:0x%016lx vmcr:0x%016lx",
-			snapshot->live_ich_hcr_el2, snapshot->live_ich_vmcr_el2);
-		shell_item_line("      live_lr0:0x%016lx   live_lr1:0x%016lx",
-			snapshot->live_ich_lr[0U], snapshot->live_ich_lr[1U]);
-	} else {
-		uint64_t lr0 = (snapshot->vgic_ctx.used_lrs > 0U) ?
-			snapshot->vgic_ctx.lr[0U] : 0UL;
-		uint64_t lr1 = (snapshot->vgic_ctx.used_lrs > 1U) ?
-			snapshot->vgic_ctx.lr[1U] : 0UL;
-
-		shell_item_line("      saved_lr0:0x%016lx saved_lr1:0x%016lx", lr0, lr1);
-	}
+	shell_dumpstat_timer_irq_state(snapshot);
 }
 
 static void shell_dumpstat_vtimer_diag(const struct arm64_vcpu_vtimer_diag *diag)
@@ -920,17 +927,29 @@ static uint32_t shell_cpu_bitmap_weight(uint64_t bitmap)
 	return weight;
 }
 
-static void shell_vmstat_sched_config(const struct sched_params *params)
+static uint64_t shell_vmstat_cntv_ppi_count(const struct acrn_vm *vm)
 {
-	shell_item_line("sched-config:prio:%u bvt-weight:%u warp-value:%d warp-limit:%u unwarp:%u",
-		params->prio, params->bvt_weight, params->bvt_warp_value,
-		params->bvt_warp_limit, params->bvt_unwarp_period);
+	uint64_t count = 0UL;
+	uint16_t vcpu_id;
+
+	if (vm == NULL) {
+		return 0UL;
+	}
+
+	for (vcpu_id = 0U; vcpu_id < vm->hw.created_vcpus; vcpu_id++) {
+		const struct acrn_vcpu *vcpu = vcpu_from_vid((struct acrn_vm *)vm, vcpu_id);
+
+		if (vcpu != NULL) {
+			count += vcpu->arch.debug.vtimer_diag.cntv_ppi;
+		}
+	}
+
+	return count;
 }
 
 static void shell_vmstat_vm_config(uint16_t vm_id, const struct acrn_vm_config *vm_config,
 	const struct acrn_vm *vm)
 {
-	const struct arch_vm_config *arch = &vm_config->arch;
 	const struct arm64_vgicv3 *vgic = &vm->arch_vm.vgic;
 	struct console_vm_ring_stats ring = { 0U };
 	struct acrn_vuart *vu = NULL;
@@ -946,40 +965,25 @@ static void shell_vmstat_vm_config(uint16_t vm_id, const struct acrn_vm_config *
 	 * vCPU count, affinity, scheduler policy, guest memory, interrupt
 	 * topology, console backlog, and boot image placement.
 	 */
-	shell_item_line("vcpus:configured:%u created:%hu state:%s flags:0x%016lx load:%u",
+	shell_item_line("vcpus:configured:%u created:%hu state:%s flags:0x%08lx load:%u",
 		shell_cpu_bitmap_weight(vm_config->cpu_affinity), vm->hw.created_vcpus,
 		shell_vm_state_to_str(vm->state), vm_config->guest_flags,
 		(uint32_t)vm_config->load_order);
-	shell_puts("│   affinity-config:");
+	shell_puts("│   affinity:");
 	shell_print_cpu_bitmap(vm_config->cpu_affinity);
-	shell_puts(" runtime:");
-	shell_print_cpu_bitmap(vm->hw.cpu_affinity);
 	shell_puts("\r\n");
 
-	shell_vmstat_sched_config(&vm_config->sched_params);
-
-	shell_item_line("guest-ram:ipa:0x%016lx hpa:0x%016lx size:0x%016lx regions:%lu root-s2:%s",
-		arch->guest_ram_start, arch->guest_ram_hpa, arch->guest_ram_size,
-		vm_config->memory.region_num, shell_yes_no(vm->root_stg2ptp != NULL));
-	shell_item_line("gic:gicd:0x%016lx/0x%lx gicr:0x%016lx/0x%lx stride:0x%lx",
-		arch->guest_gicd_base, arch->guest_gicd_size,
-		arch->guest_gicr_base, arch->guest_gicr_size,
-		arch->guest_gicr_stride);
-	shell_item_line("    initialized:%s vcpus:%hu rdist:%hu lr-count:%u vmcr:0x%08x ctlr:0x%08x",
+	shell_item_line("gic:initialized:%s vcpus:%hu rdist:%hu lr-count:%u vmcr:0x%08x ctlr:0x%08x",
 		shell_yes_no(vgic->initialized), vgic->vcpu_count,
 		vgic->rdist_count, vgic->lr_count, vgic->vmcr, vgic->gicd_ctlr);
-	shell_item_line("its:base:0x%016lx size:0x%lx enabled:%s typer:0x%016lx ctlr:0x%08x",
-		arch->guest_its_base, arch->guest_its_size,
+	shell_item_line("its:enabled:%s typer:0x%08lx ctlr:0x%08x",
 		shell_yes_no(vgic->its_enabled), vgic->its.typer, vgic->its.ctlr);
-	shell_item_line("timer:cntv:Y cnthp:Y cntp-emul:Y maintenance:Y time-delta:%ld",
-		vm->arch_vm.time_delta);
-	shell_item_line("console:uart:0x%016lx/0x%lx irq:%u selected:%s ring:%u/%u pending:%s",
-		arch->guest_uart_base, arch->guest_uart_size, arch->guest_uart_irq,
-		shell_yes_no(console_vmid == vm_id), ring.queued, ring.capacity,
-		shell_yes_no(ring.pending));
-	if (ring.pending) {
-		shell_item_line("console-diag:vm-console-backlog");
-	}
+	shell_item_line("timer:cntv:Y gic:cntv-ppi:%lu cnthp:Y cntp-emul:Y maintenance:Y time-delta:%ld",
+		shell_vmstat_cntv_ppi_count(vm), vm->arch_vm.time_delta);
+	shell_item_line("console:selected:%s ring:%u/%u pending:%s",
+		shell_yes_no(console_vmid == vm_id), ring.queued,
+		ring.capacity, shell_yes_no(ring.pending));
+
 	if (vu != NULL) {
 		shell_item_line("        vuart:active:%s irq:%u rx:%u tx:%u ier:0x%02x lsr:0x%02x",
 			shell_yes_no(vu->active), vu->irq, vuart_rx_numchars(vu),
@@ -1111,8 +1115,10 @@ static void shell_vmstat_vcpus(const struct acrn_vm *vm)
 				(rtds.deadline_ticks > now) ?
 					ticks_to_us(rtds.deadline_ticks - now) : 0UL);
 		}
-		shell_item_line("      timer:virq:%u cntv_ctl:0x%08x cntv_cval:0x%016lx",
-			vcpu->arch.gctx.timer_virq, vcpu->arch.gctx.cntv_ctl_el0,
+		shell_item_line("      timer:virq:%u gic:cntv-ppi:%lu cntv_ctl:0x%08x cntv_cval:0x%016lx",
+			vcpu->arch.gctx.timer_virq,
+			vcpu->arch.debug.vtimer_diag.cntv_ppi,
+			vcpu->arch.gctx.cntv_ctl_el0,
 			vcpu->arch.gctx.cntv_cval_el0);
 		shell_item_line("      cpuif:used-lrs:%u hcr:0x%016lx vmcr:0x%016lx pmr:0x%016lx",
 			vcpu->arch.vgic.used_lrs, vcpu->arch.vgic.hcr,

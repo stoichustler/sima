@@ -359,6 +359,24 @@ static bool vgic_is_vtimer_irq(__unused const struct acrn_vcpu *vcpu, uint32_t v
 	return virq == ARM64_GIC_PPI_VIRTUAL_TIMER;
 }
 
+static bool vgic_irq_configurable(uint32_t virq)
+{
+	/*
+	 * 2026-06-27, vGIC/vtimer invariant:
+	 *
+	 *   guest GICR_ICFGR write
+	 *          |
+	 *          +--> PPI27: keep CNTV line-level semantics
+	 *          |
+	 *          +--> other non-SGI IRQs: use guest configuration
+	 *
+	 * The virtual timer interrupt is not an ordinary guest-selected PPI. Its
+	 * source is the CNTV comparator level sampled by EL2; allowing ICFGR to
+	 * make PPI27 edge-triggered breaks requeue/EOI handling for Linux timers.
+	 */
+	return (virq >= ARM64_VGIC_SGI_NUM) && (virq != ARM64_GIC_PPI_VIRTUAL_TIMER);
+}
+
 static struct acrn_vcpu *vgic_irq_target_vcpu(struct acrn_vcpu *vcpu,
 	const struct arm64_vgicv3 *vgic, uint32_t virq)
 {
@@ -392,8 +410,7 @@ static uint64_t make_lr_state(const struct arm64_vgic_irq *desc, bool pending, b
 		state = pending ? ICH_LR_STATE_PENDING : ICH_LR_STATE_INVALID;
 	}
 
-	lr |= ((uint64_t)((desc->virq < ARM64_VGIC_LOCAL_IRQ_NUM) ?
-		GIC_PRIORITY_LOCAL : desc->priority) << ICH_LR_PRIORITY_SHIFT);
+	lr |= ((uint64_t)desc->priority << ICH_LR_PRIORITY_SHIFT);
 	lr |= state << ICH_LR_STATE_SHIFT;
 	lr |= ICH_LR_GROUP1;
 
@@ -563,12 +580,18 @@ static void vgicv3_write_lrs(const struct arm64_vgicv3_vcpu_ctx *ctx)
 static uint64_t vgicv3_control_hcr(uint64_t hcr)
 {
 	/*
-	 * ICH_HCR.EOIcount is a hardware-reported completion count. Replaying it
-	 * as saved control state can preserve stale EOI evidence across flushes, so
-	 * only the actual control bits are written back to the virtual CPU
-	 * interface.
+	 * 2026-06-27, vGICv3 CPU-interface boundary:
+	 *
+	 *   EL1 IAR/EOIR/PMR/IGRPEN -> hardware virtual CPU interface
+	 *   EL1 SGI sysreg          -> HCR_EL2.IMO/FMO trap -> software SGI inject
+	 *
+	 * ICH_HCR.TC traps common ICC registers, but BEAU does not need that for
+	 * Linux timer delivery leaves it clear. Keep common ICC accesses on
+	 * the hardware virtual interface and sync the live VMCR back instead.
+	 * EOIcount is a hardware-reported completion count, not persistent control
+	 * state, so it must not be replayed either.
 	 */
-	return (hcr & ~ICH_HCR_EOICOUNT_MASK) | ICH_HCR_EN;
+	return (hcr & ~(ICH_HCR_EOICOUNT_MASK | ICH_HCR_TC)) | ICH_HCR_EN;
 }
 
 static void vgicv3_write_cpuif(const struct arm64_vgicv3_vcpu_ctx *ctx)
@@ -590,6 +613,47 @@ static void vgicv3_write_lrs_hcr(const struct arm64_vgicv3_vcpu_ctx *ctx)
 	 */
 	vgicv3_write_lrs(ctx);
 	write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
+}
+
+static void vgicv3_requeue_lr(struct acrn_vcpu *vcpu, const struct arm64_vgic_irq *desc,
+	bool loaded)
+{
+	struct arm64_vgicv3 *vgic = &vcpu->vm->arch_vm.vgic;
+	struct arm64_vgicv3_vcpu_ctx *ctx = &vcpu->arch.vgic;
+	uint8_t lr_idx;
+
+	if (!desc->pending || !vgic_irq_deliverable(vgic, vcpu, desc) ||
+		(find_lr_for_virq(vcpu, desc->virq) >= 0)) {
+		return;
+	}
+
+	if (ctx->used_lrs >= vgic->lr_count) {
+		ctx->hcr |= ICH_HCR_UIE;
+		if (loaded) {
+			write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
+		}
+		return;
+	}
+
+	/*
+	 * 2026-06-27, pending restore:
+	 *
+	 *   LR disappeared without EOI
+	 *          |
+	 *          v
+	 *   descriptor.pending still high -> rebuild one LR now
+	 *
+	 * This is intentionally narrower than vgicv3_flush_vcpu(). During sync we
+	 * are still reconciling old hardware LR evidence; scanning every pending
+	 * IRQ here could consume freshly queued edge IRQs before EL1 sees them.
+	 */
+	lr_idx = ctx->used_lrs;
+	ctx->lr[lr_idx] = make_lr(desc);
+	ctx->used_lrs++;
+	if (loaded) {
+		write_ich_lr_el2(lr_idx, ctx->lr[lr_idx]);
+		write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
+	}
 }
 
 static void vgicv3_write_cpuif_control(const struct arm64_vgicv3_vcpu_ctx *ctx)
@@ -621,6 +685,27 @@ static void vgicv3_read_lrs(struct arm64_vgicv3_vcpu_ctx *ctx)
 			ctx->used_lrs = (uint8_t)(idx + 1U);
 		}
 	}
+}
+
+static void vgicv3_sync_live_cpuif(struct acrn_vcpu *vcpu)
+{
+	struct arm64_vgicv3_vcpu_ctx *ctx = &vcpu->arch.vgic;
+	uint64_t vmcr;
+
+	/*
+	 * With ICH_HCR.TC clear, Linux can update ICC_PMR/IGRPEN/CTL without an
+	 * EL2 sysreg trap. The live virtual CPU interface is authoritative until
+	 * the vCPU is switched out, so sync the pieces BEAU uses for delivery
+	 * decisions before evaluating pending IRQs.
+	 *
+	 *   guest ICC_* write -> live ICH_VMCR_EL2
+	 *             -> sync point -> ctx shadow -> vGIC deliverability checks
+	 */
+	vmcr = read_ich_vmcr_el2();
+	ctx->vmcr = vmcr;
+	ctx->pmr = (vmcr & ICH_VMCR_PRIORITY_MASK) >> ICH_VMCR_PRIORITY_SHIFT;
+	ctx->ctlr = ((vmcr & ICH_VMCR_EOIM) != 0UL) ? ICC_CTLR_EL1_EOIMODE : 0UL;
+	ctx->sre = read_icc_sre_el1();
 }
 
 static bool vgicv3_vcpu_is_loaded(const struct acrn_vcpu *vcpu)
@@ -912,12 +997,11 @@ void arm64_vgicv3_init_vcpu(struct acrn_vcpu *vcpu)
 
 	(void)memset(ctx, 0U, sizeof(*ctx));
 	/*
-	 * TC traps common ICC registers, including SGI generation and EOImode
-	 * control, so the software vGIC owns the interrupt lifecycle. Leaving these
-	 * accesses virtual in hardware would let Linux enable split deactivate
-	 * semantics that this vGIC does not yet model.
+	 * vGICv3 model: keep common ICC registers on the hardware virtual CPU
+	 * interface and let EL2 sync VMCR/LRs at trap boundaries. SGI
+	 * generation still traps through HCR_EL2.IMO/FMO and is handled in software.
 	 */
-	ctx->hcr = ICH_HCR_EN | ICH_HCR_TC;
+	ctx->hcr = ICH_HCR_EN;
 	ctx->vmcr = VGIC_VMCR_GROUP_ENABLES | ICH_VMCR_DEFAULT_MASK;
 	ctx->sre = ICC_SRE_SRE;
 	ctx->pmr = GIC_PRIORITY_LOWEST;
@@ -1121,13 +1205,10 @@ void arm64_vgicv3_save_vcpu(struct acrn_vcpu *vcpu)
 	 * into the vCPU context would make later loads replay an old completion
 	 * count as if it were a persistent HCR control bit.
 	 */
-	ctx->hcr = read_ich_hcr_el2() & ~ICH_HCR_EOICOUNT_MASK;
-	ctx->vmcr = read_ich_vmcr_el2();
+	ctx->hcr = read_ich_hcr_el2() & ~(ICH_HCR_EOICOUNT_MASK | ICH_HCR_TC);
+	vgicv3_sync_live_cpuif(vcpu);
 	ctx->ap0r0 = read_ich_ap0r0_el2();
 	ctx->ap1r0 = read_ich_ap1r0_el2();
-	ctx->sre = read_icc_sre_el1();
-	ctx->pmr = read_icc_pmr_el1();
-	ctx->ctlr = read_icc_ctlr_el1();
 	vgicv3_read_lrs(ctx);
 	write_ich_hcr_el2(0UL);
 }
@@ -1280,16 +1361,17 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 		eoi_lrs = read_ich_eisr_el2();
 		vgicv3_record_cpuif_snapshot(vcpu, &vcpu->arch.debug.last_vgic_sync,
 			ARM64_VCPU_DEBUG_VGIC_SYNC);
+		vgicv3_sync_live_cpuif(vcpu);
 		if ((live_hcr & ICH_HCR_EOICOUNT_MASK) != 0UL) {
 			/*
 			 * EOIcount reports guest EOIs that did not surface through EISR.
 			 * Consume the count after recording it so later HCR writes do not
 			 * keep rediscovering the same completed interrupt.
 			 */
-			ctx->hcr = live_hcr & ~ICH_HCR_EOICOUNT_MASK;
+			ctx->hcr = live_hcr & ~(ICH_HCR_EOICOUNT_MASK | ICH_HCR_TC);
 			write_ich_hcr_el2(vgicv3_control_hcr(ctx->hcr));
 		} else {
-			ctx->hcr &= ~ICH_HCR_EOICOUNT_MASK;
+			ctx->hcr &= ~(ICH_HCR_EOICOUNT_MASK | ICH_HCR_TC);
 		}
 	}
 	if (((ctx->vmcr & ICH_VMCR_EOIM) == 0UL) && (eoi_lrs != 0UL)) {
@@ -1334,6 +1416,7 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 					desc, timer_line_asserted);
 				if (timer_line_asserted) {
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_preserve++;
+					vgicv3_requeue_lr(vcpu, desc, loaded);
 				} else {
 					vcpu->arch.debug.vtimer_diag.pending_only_lr_drop++;
 				}
@@ -1457,6 +1540,15 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 			idx++;
 		}
 	}
+
+	if (loaded) {
+		struct arm64_vgic_irq *timer_desc =
+			vgic_irq_desc(vcpu, ARM64_GIC_PPI_VIRTUAL_TIMER);
+
+		if ((timer_desc != NULL) && timer_desc->level && timer_desc->pending) {
+			vgicv3_requeue_lr(vcpu, timer_desc, true);
+		}
+	}
 }
 
 void arm64_vgicv3_sync_vcpu(struct acrn_vcpu *vcpu)
@@ -1567,6 +1659,9 @@ bool arm64_vgicv3_has_pending_irq(struct acrn_vcpu *vcpu)
 	vgic = &vcpu->vm->arch_vm.vgic;
 	ctx = &vcpu->arch.vgic;
 	spinlock_irqsave_obtain(&vgic->lock, &flags);
+	if (vgicv3_vcpu_is_loaded(vcpu)) {
+		vgicv3_sync_live_cpuif(vcpu);
+	}
 	/*
 	 * WFI must not sleep when a virtual interrupt is already visible through
 	 * a list register. Active+Pending carries a redelivery after guest EOI, so
@@ -1644,6 +1739,9 @@ bool arm64_vgicv3_pending_irq_blocks_reschedule(struct acrn_vcpu *vcpu)
 	vgic = &vcpu->vm->arch_vm.vgic;
 	ctx = &vcpu->arch.vgic;
 	spinlock_irqsave_obtain(&vgic->lock, &flags);
+	if (vgicv3_vcpu_is_loaded(vcpu)) {
+		vgicv3_sync_live_cpuif(vcpu);
+	}
 	for (idx = 0U; idx < ctx->used_lrs; idx++) {
 		if (vgicv3_pending_lr_blocks_reschedule(vcpu, ctx->lr[idx])) {
 			blocks = true;
@@ -1695,6 +1793,9 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 
 	if (!is_current && vgicv3_vcpu_is_running_remote(vcpu)) {
 		return;
+	}
+	if (is_current || vgicv3_vcpu_is_loaded(vcpu)) {
+		vgicv3_sync_live_cpuif(vcpu);
 	}
 
 	/*
@@ -2642,7 +2743,14 @@ static void vgic_write_irq_config(struct acrn_vcpu *vcpu, uint32_t irq_base, uin
 			continue;
 		}
 
-		if (virq < ARM64_VGIC_SGI_NUM) {
+		if (!vgic_irq_configurable(virq)) {
+			if (virq == ARM64_GIC_PPI_VIRTUAL_TIMER) {
+				desc = vgic_irq_desc(vcpu, virq);
+				if (desc != NULL) {
+					desc->level = true;
+					vgic_update_irq_lr(vcpu, desc);
+				}
+			}
 			continue;
 		}
 

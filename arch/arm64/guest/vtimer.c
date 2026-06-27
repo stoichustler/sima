@@ -193,7 +193,7 @@ static void cntp_timer_handler(void *data)
 
 	ctl = vtimer_ctl_value(gctx->cntp_ctl_el0, gctx->cntp_cval_el0, cpu_ticks());
 	cval = gctx->cntp_cval_el0;
-	gctx->timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+	gctx->timer_virq = ARM64_GIC_PPI_PHYSICAL_TIMER;
 	arm64_vcpu_trace_vtimer(vcpu, ARM64_VTIMER_TRACE_BACKUP,
 		ARM64_GIC_PPI_PHYSICAL_TIMER, ctl, cval, false, false);
 	(void)vtimer_inject_current(vcpu, ARM64_GIC_PPI_PHYSICAL_TIMER, ctl, cval);
@@ -310,13 +310,34 @@ static uint32_t vtimer_live_ctl(struct acrn_vcpu *vcpu)
 	return ctl;
 }
 
+static uint32_t vtimer_guest_visible_cntv_ctl(struct acrn_vcpu *vcpu)
+{
+	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
+
+	if (gctx->cntv_el2_masked) {
+		return gctx->cntv_ctl_el0 & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+	}
+
+	return read_cntv_ctl_el0() & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK);
+}
+
 bool arm64_vtimer_sample_current(struct acrn_vcpu *vcpu)
 {
 	struct arm64_vcpu_guest_ctx *gctx = &vcpu->arch.gctx;
-	uint32_t ctl = vtimer_live_ctl(vcpu);
+	uint32_t ctl = vtimer_guest_visible_cntv_ctl(vcpu);
 	uint64_t cval = read_cntv_cval_el0();
 	uint64_t now = read_cntvct_el0();
 
+	/*
+	 * 2026-06-27, timer level:
+	 *
+	 *   guest CNTV_CTL/CVAL + CNTVCT -> PPI27 level
+	 *   EL2 private live IMASK       -> host comparator suppression only
+	 *
+	 * Recomputes timer line level from the guest-visible timer state after
+	 * each guest run. BEAU must not let the live CNTV_CTL.IMASK bit, set only
+	 * while vGIC owns PPI27, lower the guest-visible level line.
+	 */
 	gctx->cntv_ctl_el0 = ctl;
 	gctx->cntv_cval_el0 = cval;
 
@@ -637,6 +658,7 @@ static void cntv_timer_arm(struct acrn_vcpu *vcpu)
 {
 	struct arm64_vcpu_guest_ctx *gctx;
 	uint64_t deadline;
+	uint64_t now;
 
 	if ((vcpu == NULL) || !vcpu->arch.cntv_timer_initialized) {
 		return;
@@ -649,10 +671,24 @@ static void cntv_timer_arm(struct acrn_vcpu *vcpu)
 	 */
 	gctx = &vcpu->arch.gctx;
 	deadline = vtimer_virtual_deadline(gctx, gctx->cntv_cval_el0);
-	if (!vtimer_ctl_enabled(gctx->cntv_ctl_el0) ||
-		((int64_t)(deadline - cpu_ticks()) <= 0L)) {
+	if (!vtimer_ctl_enabled(gctx->cntv_ctl_el0)) {
 		cntv_timer_disarm(vcpu);
 		return;
+	}
+	now = cpu_ticks();
+	if ((int64_t)(deadline - now) <= 0L) {
+		/*
+		 * 2026-06-27, offline CNTV catch-up:
+		 *
+		 *   vCPU unload -> saved CNTV deadline is already due
+		 *        -> arm local backup timer for the next tick
+		 *        -> backup callback injects guest PPI27
+		 *
+		 * Dropping an expired saved deadline loses the level transition while
+		 * the vCPU is not loaded. The common timer API uses timeout 0 as
+		 * disabled, so schedule the backup callback one tick in the future.
+		 */
+		deadline = now + 1UL;
 	}
 
 	if (timer_is_started(&vcpu->arch.cntv_timer)) {
@@ -667,7 +703,7 @@ static void cntv_timer_arm(struct acrn_vcpu *vcpu)
 static int32_t vtimer_inject_current(struct acrn_vcpu *vcpu, uint32_t virq,
 	uint32_t guest_ctl, uint64_t guest_cval)
 {
-	int32_t ret;
+	int32_t ret = 0;
 
 	/*
 	 * Injection is the single boundary between timer expiry and guest-visible
@@ -676,10 +712,28 @@ static int32_t vtimer_inject_current(struct acrn_vcpu *vcpu, uint32_t virq,
 	 */
 	if (virq == ARM64_GIC_PPI_VIRTUAL_TIMER) {
 		cntv_timer_disarm(vcpu);
+		/*
+		 * 2026-06-27, vtimer/vGIC level-line model:
+		 *
+		 *   live CNTV high     -> sync current PPI27 line
+		 *   offline deadline   -> queue PPI27 pending/event request
+		 *
+		 * CNTV/PPI27 is a level source. When this vCPU is current, use the
+		 * line-sync path that also lowers PPI27 after guest reprogramming. A
+		 * backup timer callback runs while the vCPU is offline, so it cannot
+		 * sample live LRs and must use the normal vGIC wakeup path.
+		 */
+		if (get_running_vcpu(get_pcpu_id()) == vcpu) {
+			arm64_vgicv3_sync_current_timer_line(vcpu, true);
+		} else {
+			ret = arm64_vgicv3_inject_irq(vcpu, virq, true);
+		}
 	} else if (virq == ARM64_GIC_PPI_PHYSICAL_TIMER) {
 		cntp_timer_disarm(vcpu);
+		ret = arm64_vgicv3_inject_irq(vcpu, virq, true);
+	} else {
+		ret = -EINVAL;
 	}
-	ret = arm64_vgicv3_inject_irq(vcpu, virq, true);
 	vtimer_record_last(vcpu, virq,
 		(guest_ctl & (CNTV_CTL_ENABLE | CNTV_CTL_IMASK)) | CNTV_CTL_ISTATUS,
 		guest_cval, 0U, ret, false, true);
@@ -783,6 +837,7 @@ void arm64_vgicv3_virtual_timer_irq_handler(__unused uint32_t irq, __unused void
 		uint64_t guest_cval;
 
 		vcpu->arch.gctx.timer_virq = ARM64_GIC_PPI_VIRTUAL_TIMER;
+		vcpu->arch.debug.vtimer_diag.cntv_ppi++;
 		/*
 		 * Host PPI27 means the loaded guest timer fired. EL2 snapshots
 		 * live CNTV, masks the live comparator with CNTV_CTL.IMASK, and

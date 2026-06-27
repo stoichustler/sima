@@ -867,7 +867,9 @@ void shell_kick(void)
 		 */
 		if ((ch == '\r') || (ch == '\n')) {
 			shell_prompt_enabled = true;
-			shell_puts("\r\n[κ][<BEAU OS>]\r\n");
+			shell_puts("\r\n"SHELL_COLOR_MAGENTA
+						"[κ][<BEAU OS>][2026]"
+						SHELL_COLOR_RESET"\r\n");
 			shell_show_prompt(true);
 			is_cmd_cmplt = false;
 		}

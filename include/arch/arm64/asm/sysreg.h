@@ -98,6 +98,8 @@
 /* ICH_VMCR_EL2 mirrors guest-visible GIC CPU-interface control state. */
 #define ICH_VMCR_VENG1		(1UL << 1U)
 #define ICH_VMCR_EOIM		(1UL << 9U)
+#define ICH_VMCR_PRIORITY_SHIFT 24U
+#define ICH_VMCR_PRIORITY_MASK	(0xffUL << ICH_VMCR_PRIORITY_SHIFT)
 #define ICH_VMCR_DEFAULT_MASK	(0xf8UL << 24U)
 
 /* ICH_LR<n> encodes one virtual interrupt presented through a list register. */

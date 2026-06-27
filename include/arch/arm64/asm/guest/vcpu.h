@@ -310,14 +310,6 @@ struct arm64_vcpu_guest_resume {
 	uint8_t used_lrs;
 	bool cntv_expired;
 	bool cntv_el2_masked;
-	bool timer_enabled;
-	bool timer_pending;
-	bool timer_active;
-	bool timer_level;
-	bool host_valid;
-	bool host_enabled;
-	bool host_pending;
-	bool host_active;
 };
 
 struct arm64_vcpu_guest_trace_entry {
@@ -392,6 +384,16 @@ struct arm64_vcpu_vtimer_diag {
 	uint64_t wfi_trap;
 	uint64_t wfi_irq_masked;
 	uint64_t wfi_pending_irq;
+	/*
+	 * 2026-06-27, vtimer attribution:
+	 *
+	 *   host CNTV PPI27 -> running vCPU -> VM/vCPU vmstat counter
+	 *
+	 * irqstat counts pCPU handler entries. This counter is bumped while EL2
+	 * still knows the owning vCPU, so vmstat can report guest ownership without
+	 * guessing from CPU affinity.
+	 */
+	uint64_t cntv_ppi;
 	/*
 	 * pending-only LR flow tracks the QEMU-sensitive path where a timer LR can
 	 * wake WFI but disappear before Linux acknowledges PPI27. preserve means
