@@ -262,7 +262,7 @@ void destroy_vcpu(struct acrn_vcpu *vcpu)
 {
 	arch_deinit_vcpu(vcpu);
 
-	/* TODO: Move ever_run_vcpu to x86 specific */
+	/* TODO: Move ever_run_vcpu to arm64 specific */
 	per_cpu(ever_run_vcpu, pcpuid_from_vcpu(vcpu)) = NULL;
 
 	/* This operation must be atomic to avoid contention with posted interrupt handler */

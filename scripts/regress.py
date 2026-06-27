@@ -318,7 +318,7 @@ class QemuSession:
         try:
             self.send(CTRL_D)
             self.expect(PROMPT, f"return to BEAU shell for {label}", timeout=5.0, keepalive=ENTER)
-            for line in ("vcpus", "schedstat", "vmstat", "irqstat", f"constat {vmid}", f"dumpstat {vmid}"):
+            for line in ("vcpus", "schedstat", "vmstat", "irqstat", f"dumpstat {vmid}"):
                 self.send(line + ENTER)
                 self.expect(PROMPT, f"{line} diagnostics", timeout=15.0, keepalive=ENTER)
         except Exception as err:

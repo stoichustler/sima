@@ -26,7 +26,6 @@
 #include <asm/platform.h>
 #include <asm/guest/vcpu.h>
 #include <asm/guest/vgicv3.h>
-#include <asm/guest/vpl011.h>
 #include <asm/sysreg.h>
 #include "../shell_priv.h"
 
@@ -36,9 +35,6 @@
 #define SHELL_CMD_DUMPSTAT		"dumpstat"
 #define SHELL_CMD_DUMPSTAT_PARAM	"[vm id]"
 #define SHELL_CMD_DUMPSTAT_HELP		"dump arm64 vcpu stats and vgic/vtimer diagnostics"
-#define SHELL_CMD_CONSTAT		"constat"
-#define SHELL_CMD_CONSTAT_PARAM		"[vm id]"
-#define SHELL_CMD_CONSTAT_HELP		"dump vm console and vpl011 state"
 #define SHELL_CMD_VMSTAT		"vmstat"
 #define SHELL_CMD_VMSTAT_PARAM		NULL
 #define SHELL_CMD_VMSTAT_HELP		"list arm64 vm state"
@@ -54,7 +50,6 @@
 
 static int32_t shell_list_mem(__unused int32_t argc, __unused char **argv);
 static int32_t shell_dumpstat(int32_t argc, char **argv);
-static int32_t shell_constat(int32_t argc, char **argv);
 static int32_t shell_vmstat(int32_t argc, __unused char **argv);
 static int32_t shell_reboot(__unused int32_t argc, __unused char **argv);
 
@@ -70,12 +65,6 @@ struct shell_cmd arch_shell_cmds[] = {
 		.cmd_param	= SHELL_CMD_DUMPSTAT_PARAM,
 		.help_str	= SHELL_CMD_DUMPSTAT_HELP,
 		.fcn		= shell_dumpstat,
-	},
-	{
-		.str		= SHELL_CMD_CONSTAT,
-		.cmd_param	= SHELL_CMD_CONSTAT_PARAM,
-		.help_str	= SHELL_CMD_CONSTAT_HELP,
-		.fcn		= shell_constat,
 	},
 	{
 		.str		= SHELL_CMD_VMSTAT,
@@ -710,7 +699,7 @@ static void shell_dumpstat_timer_state(const struct dumpstat_snapshot *snapshot)
 	if (snapshot->has_live_timer) {
 		shell_item_line("      live_cpuif:hcr:0x%016lx vmcr:0x%016lx",
 			snapshot->live_ich_hcr_el2, snapshot->live_ich_vmcr_el2);
-		shell_item_line("      live_lr0:0x%016lx live_lr1:0x%016lx",
+		shell_item_line("      live_lr0:0x%016lx   live_lr1:0x%016lx",
 			snapshot->live_ich_lr[0U], snapshot->live_ich_lr[1U]);
 	} else {
 		uint64_t lr0 = (snapshot->vgic_ctx.used_lrs > 0U) ?
@@ -798,7 +787,6 @@ static int32_t shell_dumpstat_vcpu(struct acrn_vcpu *vcpu)
 	shell_item_section("vgic/vtimer");
 	shell_dumpstat_timer_state(&snapshot);
 	shell_dumpstat_vtimer_diag(&vcpu->arch.debug.vtimer_diag);
-	shell_item_line("vtimer trace:");
 	shell_dumpstat_vtimer_trace(&debug->vtimer_trace);
 	shell_item_end();
 
@@ -838,101 +826,6 @@ static int32_t shell_dumpstat(int32_t argc, char **argv)
 	}
 
 	return 0;
-}
-
-static uint32_t shell_lr_state(uint64_t lr)
-{
-	return (uint32_t)((lr >> ICH_LR_STATE_SHIFT) & 0x3UL);
-}
-
-static uint32_t shell_lr_vintid(uint64_t lr)
-{
-	return (uint32_t)(lr & ICH_LR_VINTID_MASK);
-}
-
-static const char *shell_lr_state_to_str(uint32_t state)
-{
-	const char *str;
-
-	switch (state) {
-	case ICH_LR_STATE_PENDING:
-		str = "pending";
-		break;
-	case ICH_LR_STATE_ACTIVE:
-		str = "active";
-		break;
-	case ICH_LR_STATE_ACTIVE_PENDING:
-		str = "active+pending";
-		break;
-	default:
-		str = "invalid";
-		break;
-	}
-
-	return str;
-}
-
-static uint32_t shell_constat_lr_count(const struct acrn_vcpu *vcpu, uint32_t virq,
-	char *buf, size_t size)
-{
-	uint32_t count = 0U;
-	uint32_t len = 0U;
-	uint32_t idx;
-
-	if ((buf != NULL) && (size != 0UL)) {
-		buf[0U] = '\0';
-	}
-	for (idx = 0U; idx < vcpu->arch.vgic.used_lrs; idx++) {
-		uint64_t lr = vcpu->arch.vgic.lr[idx];
-		uint32_t state = shell_lr_state(lr);
-
-		if ((state != ICH_LR_STATE_INVALID) && (shell_lr_vintid(lr) == virq)) {
-			count++;
-			if ((buf != NULL) && (len < size)) {
-				int32_t ret = snprintf(&buf[len], size - len, "%slr%u:%s",
-					(len == 0U) ? "" : ",", idx, shell_lr_state_to_str(state));
-
-				if (ret > 0) {
-					len += (uint32_t)ret;
-					if (len >= size) {
-						len = (uint32_t)size;
-					}
-				}
-			}
-		}
-	}
-	if ((buf != NULL) && (size != 0UL) && (count == 0U)) {
-		(void)snprintf(buf, size, "-");
-	}
-
-	return count;
-}
-
-static void shell_constat_vgic_uart(const struct acrn_vm *vm, uint32_t irq)
-{
-	const struct arm64_vgicv3 *vgic = &vm->arch_vm.vgic;
-	uint16_t vcpu_id;
-
-	if (!vgic->initialized || (irq >= ARM64_VGIC_IRQ_NUM)) {
-		shell_item_line("uart-spi:unavailable");
-		return;
-	}
-
-	for (vcpu_id = 0U; vcpu_id < vm->hw.created_vcpus; vcpu_id++) {
-		const struct acrn_vcpu *vcpu = vcpu_from_vid((struct acrn_vm *)vm, vcpu_id);
-		const struct arm64_vgic_irq *desc = &vgic->irq[vcpu_id][irq];
-		char lrs[64U];
-
-		if (vcpu == NULL) {
-			continue;
-		}
-		(void)shell_constat_lr_count(vcpu, irq, lrs, sizeof(lrs));
-		shell_item_line("spi%u/vcpu%hu target:%u en:%s pend:%s act:%s level:%s used_lrs:%u lrs:%s",
-			irq, vcpu_id, desc->target_vcpu,
-			shell_yes_no(desc->enabled), shell_yes_no(desc->pending),
-			shell_yes_no(desc->active), shell_yes_no(desc->level),
-			vcpu->arch.vgic.used_lrs, lrs);
-	}
 }
 
 static const char *shell_vm_state_to_str(enum vm_state state)
@@ -1250,67 +1143,6 @@ static int32_t shell_vmstat(int32_t argc, __unused char **argv)
 		shell_vmstat_vcpus(vm);
 		shell_item_end();
 	}
-
-	return 0;
-}
-
-static int32_t shell_constat(int32_t argc, char **argv)
-{
-	struct acrn_vm *vm;
-	struct acrn_vuart *vu;
-	struct console_vm_input_stats input;
-	struct console_vm_ring_stats ring;
-	struct arm64_vpl011_debug vpl011;
-	int64_t param;
-	uint16_t vm_id = 0U;
-	uint32_t irq;
-
-	if (argc > 2) {
-		return -EINVAL;
-	}
-
-	if (argc == 2) {
-		param = strtol_deci(argv[1]);
-		if ((param < 0) || (param >= CONFIG_MAX_VM_NUM)) {
-			return -EINVAL;
-		}
-		vm_id = (uint16_t)param;
-	}
-
-	vm = get_vm_from_vmid(vm_id);
-	if (is_poweroff_vm(vm)) {
-		return -EINVAL;
-	}
-
-	(void)memset(&input, 0U, sizeof(input));
-	(void)memset(&ring, 0U, sizeof(ring));
-	(void)memset(&vpl011, 0U, sizeof(vpl011));
-	(void)console_vm_input_get_stats(&input);
-	(void)console_vm_ring_get_stats(vm_id, &ring);
-	arm64_vpl011_get_debug(vm_id, &vpl011);
-	vu = vm_console_vuart(vm);
-	irq = arm64_platform_guest_uart_irq(vm_id);
-
-	shell_item_begin("constat vm%hu:%s", vm_id, vm->name);
-	shell_item_line("selected-vmid:%hu input-vmid:%hu backlog:%u/%u budget:%u last-enter:%s non-enter:%s",
-		input.selected_vmid, input.input_vmid, input.queued, input.capacity,
-		input.guest_budget, shell_yes_no(input.last_enter),
-		shell_yes_no(input.has_non_enter));
-	shell_item_line("ring:queued:%u/%u high:%u pending:%s draining:%s in:%lu stored:%lu drained:%lu dropped:%lu overflow:%lu",
-		ring.queued, ring.capacity, ring.high_water,
-		shell_yes_no(ring.pending), shell_yes_no(ring.draining),
-		ring.input_bytes, ring.stored_bytes, ring.drained_bytes,
-		ring.dropped_bytes, ring.overflow_events);
-	shell_item_line("vuart:rx:%u tx:%u irq:%u ier:0x%02x lsr:0x%02x active:%s",
-		vuart_rx_numchars(vu), vu->txfifo.num, vu->irq, vu->ier,
-		vu->lsr, shell_yes_no(vu->active));
-	shell_item_line("vpl011:asserted:%s pending:0x%08x imsc:0x%08x ris:0x%08x cr:0x%08x tx:%lu txirq:%lu assert:%lu deassert:%lu last-tx:0x%02x",
-		shell_yes_no(vpl011.irq_asserted), vpl011.pending,
-		vpl011.imsc, vpl011.ris, vpl011.cr, vpl011.tx_count,
-		vpl011.tx_irq_count, vpl011.irq_assert_count,
-		vpl011.irq_deassert_count, vpl011.last_tx);
-	shell_constat_vgic_uart(vm, irq);
-	shell_item_end();
 
 	return 0;
 }

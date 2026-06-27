@@ -239,7 +239,6 @@ boot logs settle to show the `console:\>` prompt.
   - `mmap`
   - `xmem <addr, length>`
   - `irqstat`
-  - `constat [vm id]`
   - `dumpstat [vm id]`
   - `vsh <vm id>`
 - Press Tab in the BEAU shell to display `registered commands`; `help` is not
@@ -279,7 +278,7 @@ Current BVT status:
   thread's BVT weight is the narrowest way to test host-console responsiveness.
 - If Linux still reports internal stalls while VM2 vCPUs continue to advance,
   keep debugging VM2 vtimer/vGIC forward progress with `dumpstat 2`, `irqstat`,
-  `constat 2`, and consecutive `schedstat` captures.
+  `vmstat`, and consecutive `schedstat` captures.
 - Earlier samples showed pCPU4 contention when VM0 also used pCPU4. The current
   QEMU static layout keeps VM2's pCPU1 and pCPU4 private while preserving four
   VM0 vCPUs; shared-core latency should now be checked on pCPU6 and pCPU7.
@@ -352,16 +351,15 @@ init_thread_data(&vcpu->thread_obj, &params);
   This is a core scheduling behavior change and should be reviewed before it is
   kept. For a persistent per-vCPU policy, add an explicit per-vCPU scheduler
   configuration instead of hiding one-off overrides in the common vCPU path.
-- `irqstat` prints a short IRQ name/purpose column when the architecture can
-  decode it. ARM64 maps ACRN IRQ numbers back to GIC SGI/PPI/SPI sources and
-  names the EL2-owned SMP-call, physical-timer, virtual-timer, and
-  vGIC-maintenance interrupts. It suppresses IRQs that have neither an active
-  handler nor any recorded count, so unused INTIDs do not fill the table.
-  Per-pCPU counts include every pCPU in aligned `cpuN:count` fields, and
-  `active` shows whether the IRQ is allocated in the common IRQ table. IRQ
-  counters saturate at `UINT64_MAX` instead of wrapping; saturated per-pCPU
-  fields print as `cpuN:sat`, total prints `sat`, and `overflow` reports whether
-  any per-pCPU counter or total sum has saturated.
+- `irqstat` prints host IRQ handler entry counts, not guest-visible interrupt
+  injection or EOI counts. ARM64 maps ACRN IRQ numbers back to GIC SGI/PPI/SPI
+  sources and names the EL2-owned SMP-call, CNTHP scheduler-timer PPI, CNTV
+  guest-timer host PPI, and vGIC-maintenance interrupts. It suppresses IRQs
+  that have neither an active handler nor any recorded count, so unused INTIDs
+  do not fill the table. The compact table is `irq name active cpu0 ... cpuN`;
+  `active` shows whether the IRQ is allocated in the common IRQ table. Per-pCPU
+  counters saturate at `UINT64_MAX` instead of wrapping; saturated fields print
+  as `sat`.
 - `dumpstat [vm id]` prints all created vCPUs in the VM, including the saved
   ARM64 register image, scheduler state, current-thread status, recent vCPU
   exit reason, recent virtual IRQ injection, recent guest timer programming or
@@ -451,11 +449,6 @@ captures during boot, reboot, or VM2 latency work:
   - `delta.us`: time since the previous printed guest-boundary row.
   - `tsc`: raw host tick timestamp.
   - `elr/esr/far/hpfar`: saved guest exception frame values.
-- `constat [vm id]` prints focused VM console state for live diagnostics:
-  selected/input VM IDs, host input backlog, async TX ring usage and drops,
-  vUART RX/TX state, vPL011 pending/assert/deassert counters, and the guest UART
-  SPI state in the vGIC. Use it with `dumpstat`, `vcpus`, `schedstat`, and
-  `irqstat` when debugging `vsh` responsiveness.
 - ARM64 host exception call traces resolve return addresses through the
   embedded BEAU symbol table and print `function+offset` beside the raw LR.
 - VM vPL011 TX output from the currently selected `vsh` VM is written into a
@@ -593,8 +586,8 @@ being treated as verified results:
 - `mmap` shows VM0/VM1/VM2 stage-2 RAM identity mappings plus vGICD, vGICR,
   and vPL011 vio windows.
 - Boot logs show each VM image copied to 1:1 RAM.
-- `irqstat` uses a narrow-screen-friendly format and shows the virtual timer
-  PPI handler receiving counts on Zephyr AP pCPUs.
+- `irqstat` uses a narrow-screen-friendly format and shows host CNTV PPI handler
+  entries on Zephyr AP pCPUs.
 - Zephyr no longer traps on `GICD_IPRIORITYR` byte writes.
 - Zephyr AP virtual timer interrupts no longer hit the host unexpected IRQ path.
 - LK still boots with 4 CPUs after Zephyr became the service VM.
@@ -701,15 +694,15 @@ inside the selected guest shell, waits for the guest prompt to return, and then
 uses Ctrl-D to return to the BEAU shell before switching to the next VM.
 
 If a regression fails, the harness tries to return to the BEAU shell and capture
-`vcpus`, `schedstat`, `irqstat`, `constat <vmid>`, and `dumpstat <vmid>` into
+`vcpus`, `schedstat`, `vmstat`, `irqstat`, and `dumpstat <vmid>` into
 `out/qemu_out/regress.log`. If reproducing manually through `./scripts/kick.py`,
 run the same commands immediately after Ctrl-D:
 
 ```text
 vcpus
 schedstat
+vmstat
 irqstat
-constat 2
 dumpstat 2
 ```
 
@@ -928,7 +921,6 @@ When a guest appears stuck around timer or interrupt delivery, capture:
 vcpus
 schedstat
 irqstat
-constat 2
 dumpstat 2
 ```
 
@@ -946,9 +938,8 @@ Read the dump in this order:
 6. For SGI/SMP stalls, compare source and target SGI debug fields. A delivered
    SGI with no EOI evidence and Linux stuck in a CSD wait usually points to an
    edge lifecycle issue, not a timer issue.
-7. If `constat 2` shows empty host input backlog, empty vUART RX, and no PL011
-   SPI33 pending, do not chase console input first; continue with vtimer/vGIC
-   state.
+7. If `vmstat` console/ring fields do not show host-to-guest input backlog,
+   do not chase console input first; continue with vtimer/vGIC state.
 
 ### Safe Change Process
 
@@ -1049,7 +1040,7 @@ Status as of 2026-06-18:
   virtual INTID 27. The remaining stall is therefore no longer primarily "timer
   LR disappeared"; it is a forward-progress window after WFI wakeup and before
   Linux handles the pending timer interrupt.
-- `constat 2` from failing stress runs shows the VM console input path is not
+- Older console diagnostics from failing stress runs show the VM console input path is not
   the immediate stuck point after Ctrl-D diagnostics: host input backlog is
   empty, vUART RX is empty, vPL011 RX IRQ is not asserted, SPI33 is not pending,
   and the async TX ring may have drops only from the heavy Linux log stream.
@@ -1321,14 +1312,14 @@ CNTHP/hypervisor timer:
   blocked waiting for CPU time. VM2 vCPU0 and vCPU1 stayed on exclusive pCPUs,
   and vCPU2/vCPU3 stayed current on their shared pCPUs. This rules out "Linux
   did not get scheduled" as the first explanation for the missing second kick.
-- `schedstat` and `irqstat` showed an htimer ownership problem on VM2 pCPUs:
-  the htimer IRQ count stayed at 1 on pCPU1 and pCPU4, and stayed at 29/17 on
-  pCPU6/pCPU7 across later samples. In the same interval, htimer counts on
-  pCPU0/pCPU3/pCPU5 kept increasing by tens of thousands. The scheduler timer
-  counters for pCPU6/pCPU7 also stayed flat at 24/13 while their RTDS deadlines
-  were already overdue.
-- `irqstat` showed CNTV local IRQ delivery did not progress for VM2: total CNTV
-  IRQ count stayed at 4, with zero counts on VM2's pCPU1/pCPU4/pCPU6/pCPU7.
+- `schedstat` and `irqstat` showed a CNTHP host scheduler-timer ownership
+  problem on VM2 pCPUs: the CNTHP PPI entry count stayed at 1 on pCPU1 and
+  pCPU4, and stayed at 29/17 on pCPU6/pCPU7 across later samples. In the same
+  interval, CNTHP counts on pCPU0/pCPU3/pCPU5 kept increasing by tens of
+  thousands. The scheduler timer counters for pCPU6/pCPU7 also stayed flat at
+  24/13 while their RTDS deadlines were already overdue.
+- `irqstat` showed host CNTV PPI delivery did not progress for VM2: total CNTV
+  PPI entry count stayed at 4, with zero counts on VM2's pCPU1/pCPU4/pCPU6/pCPU7.
 - `dumpstat 2` showed each VM2 vCPU had an expired guest CNTV deadline, live
   `CNTV_CTL` with enable+mask, `el2_masked:Y`, a vGIC timer line still
   pending/level, and a timer LR present. Representative vCPU0 values:
@@ -1339,7 +1330,7 @@ CNTHP/hypervisor timer:
   on VM2 vCPUs, for example vCPU0 showed about 187.5s. That means EL1 was
   running for a long time without another useful timer exit/EOI/reprogram
   boundary, even though EL2 kept seeing the vGIC timer line as pending/level.
-- `constat 2` showed no input backlog and a full VM2 console ring. The VM2
+- Older console diagnostics showed no input backlog and a full VM2 console ring. The VM2
   console path was congested because Linux kept printing or had printed enough
   to fill the ring, but there was no shell-input blockage causing the WDT miss.
 - A later per-vCPU dump initially looked like a repeated HVC because older
@@ -1469,8 +1460,8 @@ Validation direction:
 2. Boot VM0/VM1/VM2 and confirm Linux WDT continues beyond the previous single
    kick. Manual acceptance target: LK, Zephyr, and Linux all continue beyond at
    least 20 watchdog kicks without Linux RCU/timer-softirq warnings.
-3. On failure, capture `vmstat`, `vcpus`, `schedstat`, `irqstat`, `dumpstat 2`,
-   and `constat 2`. Expected post-fix dumps should show no hardware-backed PPI27
+3. On failure, capture `vmstat`, `vcpus`, `schedstat`, `irqstat`, and
+   `dumpstat 2`. Expected post-fix dumps should show no hardware-backed PPI27
    LR and no timer rescue state; guest PPI27 state should be readable from the
    software descriptor and LR state.
 
@@ -1619,10 +1610,10 @@ ACRN-DM Android launch model.
    stable for the Android phase. The current local tree still shows VM2 Linux
    usually kicking WDT only once, and VM0 Zephyr can also stop after a few
    kicks.
-2. On the next failure, keep using `constat 2`, `dumpstat 2`, `vcpus`,
-   `schedstat`, and `irqstat`. If `constat 2` still shows empty input backlog,
-   empty vUART RX, and SPI33 not pending, continue focusing on VM2/VM0
-   timer-vGIC state rather than host-to-guest console input.
+2. On the next failure, keep using `vmstat`, `dumpstat 2`, `vcpus`,
+   `schedstat`, and `irqstat`. If `vmstat` shows no host-to-guest input
+   backlog, continue focusing on VM2/VM0 timer-vGIC state rather than console
+   input.
 3. Reconcile BEAU's CNTV/PPI27 handling with the selected software level model.
    Avoid more isolated TWI/rescue knobs; live LR, AP, EOI/DIR, host PPI27, and
    software descriptor ownership must stay consistent.

@@ -184,10 +184,11 @@ static const char *gic_irq_name(uint32_t intid)
 		name = "gic:vgic-mirq";
 		break;
 	case ARM64_GIC_PPI_HYPERVISOR_TIMER:
-		name = "gic:htimer";
+		name = "gic:cnthp-ppi";
 		break;
 	case ARM64_GIC_PPI_VIRTUAL_TIMER:
-		name = "gic:vtimer";
+		/* This is the host CNTV PPI entry count, not the guest tick count. */
+		name = "gic:cntv-ppi";
 		break;
 	case ARM64_GIC_PPI_PHYSICAL_TIMER:
 		name = "gic:ptimer";

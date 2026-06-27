@@ -173,8 +173,5 @@ void cpu_dead(void)
  */
 void print_hv_banner(void)
 {
-	/*
-	 * This can not be modified.
-     */
-	pr_info("──────────── [BEAU OS 2026] ────────────");
+	/* Unimplemented. */
 }
