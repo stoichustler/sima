@@ -5,6 +5,7 @@
  */
 
 #include <vm.h>
+#include <vm_config.h>
 #include <vboot.h>
 #include <guest_memory.h>
 #include <pgtable.h>
@@ -13,7 +14,6 @@
 #include <util.h>
 #if defined(CONFIG_ARM64)
 #include <mmu.h>
-#include <asm/platform.h>
 #endif
 
 static bool range_overlaps(uint64_t start_a, uint64_t size_a, uint64_t start_b, uint64_t size_b)
@@ -37,8 +37,9 @@ static bool range_fits(uint64_t addr, uint64_t size, uint64_t window_start, uint
 static uint64_t arm64_rawimage_fdt_load_gpa(struct acrn_vm *vm, uint64_t kernel_load_gpa,
 	uint32_t kernel_size, uint64_t ramdisk_load_gpa, uint32_t ramdisk_size)
 {
-	uint64_t ram_start = arm64_platform_guest_ram_start(vm->vm_id);
-	uint64_t ram_size = arm64_platform_guest_ram_size(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t ram_start = arch_config->guest_ram_start;
+	uint64_t ram_size = arch_config->guest_ram_size;
 	uint64_t fdt_size = roundup((uint64_t)vm->sw.fdt_info.size, MEM_4K);
 	uint64_t fdt_load_gpa = ram_start;
 
@@ -103,8 +104,8 @@ static int32_t load_rawimage(struct acrn_vm *vm)
 	/* TODO: GPA 0 load support */
 	kernel_load_gpa = vm_config->os_config.kernel_load_addr;
 #if defined(CONFIG_ARM64)
-	ram_start = arm64_platform_guest_ram_start(vm->vm_id);
-	ram_size = arm64_platform_guest_ram_size(vm->vm_id);
+	ram_start = vm_config->arch.guest_ram_start;
+	ram_size = vm_config->arch.guest_ram_size;
 #else
 	ram_start = 0UL;
 	ram_size = UINT64_MAX;

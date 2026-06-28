@@ -8,11 +8,11 @@
 #include <errno.h>
 #include <vm.h>
 #include <vcpu.h>
+#include <vm_config.h>
 #include <io_req.h>
 #include <console.h>
 #include <vuart.h>
 #include <debug/serial.h>
-#include <asm/platform.h>
 #include <asm/guest/vgicv3.h>
 #include <asm/guest/vpl011.h>
 
@@ -74,7 +74,7 @@ static void vpl011_update_irq(struct acrn_vm *vm, struct arm64_vpl011 *vu, bool 
 {
 	uint32_t pending = vpl011_pending_state(vm, vu);
 	bool assert = ((pending & vu->imsc) != 0U);
-	uint32_t irq = arm64_platform_guest_uart_irq(vm->vm_id);
+	uint32_t irq = get_vm_config(vm->vm_id)->arch.guest_uart_irq;
 
 	vu->pending = pending;
 	/*
@@ -162,11 +162,12 @@ void arm64_vpl011_init_vm(struct acrn_vm *vm)
 {
 	struct arm64_vpl011 *vu = &vpl011_devs[vm->vm_id];
 	struct acrn_vuart *console;
+	uint32_t irq = get_vm_config(vm->vm_id)->arch.guest_uart_irq;
 
 	(void)memset(vu, 0U, sizeof(*vu));
 	vu->ifls = 0x12U;
 	vu->cr = (1U << 0U) | (1U << 8U) | (1U << 9U);
-	init_console_vuart(vm, arm64_platform_guest_uart_irq(vm->vm_id));
+	init_console_vuart(vm, irq);
 	console = vm_console_vuart(vm);
 	vuart_set_backend(console, &vpl011_backend_ops);
 }
@@ -311,7 +312,7 @@ int32_t arm64_vpl011_mmio_handler(struct io_request *io_req, void *handler_priva
 
 	if ((vm != NULL) && (vm->vm_id < CONFIG_MAX_VM_NUM) &&
 		((mmio->size == 1UL) || (mmio->size == 2UL) || (mmio->size == 4UL))) {
-		base = arm64_platform_guest_uart_base(vm->vm_id);
+		base = get_vm_config(vm->vm_id)->arch.guest_uart_base;
 		offset = (uint32_t)(mmio->address - base);
 		vu = &vpl011_devs[vm->vm_id];
 

@@ -7,6 +7,7 @@
 #include <types.h>
 #include <vm.h>
 #include <vcpu.h>
+#include <vm_config.h>
 #include <cpu.h>
 #include <mmu.h>
 #include <pgtable.h>
@@ -14,7 +15,6 @@
 #include <vfdt.h>
 #include <logmsg.h>
 #include <io_req.h>
-#include <asm/platform.h>
 #include <asm/sysreg.h>
 #include <asm/guest/vcpu_priv.h>
 #include <asm/guest/vgicv3.h>
@@ -133,9 +133,10 @@ static void validate_stage2_ram_identity(const struct acrn_vm *vm, uint64_t mem_
 
 static void init_stage2_identity_map(struct acrn_vm *vm)
 {
-	uint64_t mem_start = arm64_platform_guest_ram_start(vm->vm_id);
-	uint64_t mem_size = arm64_platform_guest_ram_size(vm->vm_id);
-	uint64_t mem_hpa = arm64_platform_guest_ram_hpa(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t mem_start = arch_config->guest_ram_start;
+	uint64_t mem_size = arch_config->guest_ram_size;
+	uint64_t mem_hpa = arch_config->guest_ram_hpa;
 
 	static const struct pgtable stage2_pgtable_template = {
 		.pool = &stage2_page_pool,
@@ -184,25 +185,26 @@ static void init_stage2_identity_map(struct acrn_vm *vm)
 	 * absence of a stage-2 leaf mapping is what makes EL1 device accesses exit
 	 * to EL2 for emulation.
 	 */
-	log_stage2_vio(vm, "vgicd", arm64_platform_guest_gicd_base(vm->vm_id),
-		arm64_platform_guest_gicd_size(vm->vm_id));
-	log_stage2_vio(vm, "vgicr", arm64_platform_guest_gicr_base(vm->vm_id),
-		arm64_platform_guest_gicr_size(vm->vm_id));
-	if (arm64_platform_guest_its_size(vm->vm_id) != 0UL) {
-		log_stage2_vio(vm, "vits", arm64_platform_guest_its_base(vm->vm_id),
-			arm64_platform_guest_its_size(vm->vm_id));
+	log_stage2_vio(vm, "vgicd", arch_config->guest_gicd_base,
+		arch_config->guest_gicd_size);
+	log_stage2_vio(vm, "vgicr", arch_config->guest_gicr_base,
+		arch_config->guest_gicr_size);
+	if (arch_config->guest_its_size != 0UL) {
+		log_stage2_vio(vm, "vits", arch_config->guest_its_base,
+			arch_config->guest_its_size);
 	}
-	log_stage2_vio(vm, "vpl011", arm64_platform_guest_uart_base(vm->vm_id),
-		arm64_platform_guest_uart_size(vm->vm_id));
+	log_stage2_vio(vm, "vpl011", arch_config->guest_uart_base,
+		arch_config->guest_uart_size);
 }
 
 static void register_arm64_vio_mmio(struct acrn_vm *vm)
 {
-	uint64_t gicd_base = arm64_platform_guest_gicd_base(vm->vm_id);
-	uint64_t gicr_base = arm64_platform_guest_gicr_base(vm->vm_id);
-	uint64_t its_base = arm64_platform_guest_its_base(vm->vm_id);
-	uint64_t its_size = arm64_platform_guest_its_size(vm->vm_id);
-	uint64_t uart_base = arm64_platform_guest_uart_base(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t gicd_base = arch_config->guest_gicd_base;
+	uint64_t gicr_base = arch_config->guest_gicr_base;
+	uint64_t its_base = arch_config->guest_its_base;
+	uint64_t its_size = arch_config->guest_its_size;
+	uint64_t uart_base = arch_config->guest_uart_base;
 
 	/*
 	 * The common IO request layer owns dispatch by GPA range. ARM64 registers
@@ -210,17 +212,17 @@ static void register_arm64_vio_mmio(struct acrn_vm *vm)
 	 * can be converted into device-specific emulation callbacks.
 	 */
 	register_mmio_emulation_handler(vm, arm64_vgicv3_mmio_handler,
-		gicd_base, gicd_base + arm64_platform_guest_gicd_size(vm->vm_id),
+		gicd_base, gicd_base + arch_config->guest_gicd_size,
 		&vm->arch_vm.vgic, false);
 	register_mmio_emulation_handler(vm, arm64_vgicv3_mmio_handler,
-		gicr_base, gicr_base + arm64_platform_guest_gicr_size(vm->vm_id),
+		gicr_base, gicr_base + arch_config->guest_gicr_size,
 		&vm->arch_vm.vgic, false);
 	if (its_size != 0UL) {
 		register_mmio_emulation_handler(vm, arm64_vgicv3_mmio_handler,
 			its_base, its_base + its_size, &vm->arch_vm.vgic, false);
 	}
 	register_mmio_emulation_handler(vm, arm64_vpl011_mmio_handler,
-		uart_base, uart_base + arm64_platform_guest_uart_size(vm->vm_id),
+		uart_base, uart_base + arch_config->guest_uart_size,
 		vm, false);
 }
 

@@ -10,6 +10,7 @@
 #include <cpu.h>
 #include <vm.h>
 #include <vcpu.h>
+#include <vm_config.h>
 #include <guest_memory.h>
 #include <rtl.h>
 #include <asm/page.h>
@@ -666,7 +667,8 @@ static bool vits_mmio_write(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 int32_t arm64_vgicv3_its_mmio_access(struct acrn_vcpu *vcpu,
 	struct arm64_vgicv3 *vgic, struct acrn_mmio_request *mmio)
 {
-	uint32_t offset = (uint32_t)(mmio->address - arm64_platform_guest_its_base(vcpu->vm->vm_id));
+	uint32_t offset = (uint32_t)(mmio->address -
+		get_vm_config(vcpu->vm->vm_id)->arch.guest_its_base);
 	int32_t ret = 0;
 
 	if (!vits_word_access(offset, mmio->size)) {
@@ -696,7 +698,8 @@ bool arm64_vgicv3_its_mmio_access64(struct acrn_vcpu *vcpu,
 	struct arm64_vgicv3 *vgic, struct acrn_mmio_request *mmio, int32_t *status)
 {
 	struct arm64_vits *its = &vgic->its;
-	uint32_t offset = (uint32_t)(mmio->address - arm64_platform_guest_its_base(vcpu->vm->vm_id));
+	uint32_t offset = (uint32_t)(mmio->address -
+		get_vm_config(vcpu->vm->vm_id)->arch.guest_its_base);
 	bool handled = false;
 
 	if (status != NULL) {

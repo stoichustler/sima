@@ -37,22 +37,6 @@ static const struct arm64_mem_region platform_mmio_regions[] = {
 	},
 };
 
-static const struct arch_vm_config *rk356x_guest_config(uint16_t vm_id)
-{
-	const struct acrn_vm_config *vm_config;
-
-	if (vm_id >= CONFIG_MAX_VM_NUM) {
-		panic("rk356x vm%hu is out of range", vm_id);
-	}
-
-	vm_config = get_vm_config(vm_id);
-	if ((vm_config->cpu_affinity == 0UL) || (vm_config->arch.guest_ram_size == 0UL)) {
-		panic("rk356x vm%hu has no guest platform config", vm_id);
-	}
-
-	return &vm_config->arch;
-}
-
 const struct arm64_mem_region *arm64_get_platform_mmio_regions(uint32_t *count)
 {
 	*count = ARRAY_SIZE(platform_mmio_regions);
@@ -72,71 +56,6 @@ uint64_t arm64_platform_ram_size(void)
 uint64_t arm64_platform_console_mmio_base(void)
 {
 	return RK356X_UART0_BASE;
-}
-
-uint64_t arm64_platform_guest_ram_start(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_ram_start;
-}
-
-uint64_t arm64_platform_guest_ram_size(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_ram_size;
-}
-
-uint64_t arm64_platform_guest_ram_hpa(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_ram_hpa;
-}
-
-uint64_t arm64_platform_guest_gicd_base(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_gicd_base;
-}
-
-uint64_t arm64_platform_guest_gicd_size(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_gicd_size;
-}
-
-uint64_t arm64_platform_guest_gicr_base(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_gicr_base;
-}
-
-uint64_t arm64_platform_guest_gicr_stride(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_gicr_stride;
-}
-
-uint64_t arm64_platform_guest_gicr_size(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_gicr_size;
-}
-
-uint64_t arm64_platform_guest_its_base(__unused uint16_t vm_id)
-{
-	return 0UL;
-}
-
-uint64_t arm64_platform_guest_its_size(__unused uint16_t vm_id)
-{
-	return 0UL;
-}
-
-uint64_t arm64_platform_guest_uart_base(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_uart_base;
-}
-
-uint64_t arm64_platform_guest_uart_size(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_uart_size;
-}
-
-uint32_t arm64_platform_guest_uart_irq(uint16_t vm_id)
-{
-	return rk356x_guest_config(vm_id)->guest_uart_irq;
 }
 
 uint64_t arm64_platform_gicd_base(void)
@@ -210,10 +129,11 @@ static void fdt_property_reg64(void *fdt, const char *name, uint64_t addr, uint6
 static void fdt_property_gic_reg(void *fdt, struct acrn_vm *vm)
 {
 	fdt32_t reg[8];
-	uint64_t gicd_base = arm64_platform_guest_gicd_base(vm->vm_id);
-	uint64_t gicd_size = arm64_platform_guest_gicd_size(vm->vm_id);
-	uint64_t gicr_base = arm64_platform_guest_gicr_base(vm->vm_id);
-	uint64_t gicr_size = arm64_platform_guest_gicr_size(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t gicd_base = arch_config->guest_gicd_base;
+	uint64_t gicd_size = arch_config->guest_gicd_size;
+	uint64_t gicr_base = arch_config->guest_gicr_base;
+	uint64_t gicr_size = arch_config->guest_gicr_size;
 
 	reg[0] = cpu_to_fdt32((uint32_t)(gicd_base >> 32U));
 	reg[1] = cpu_to_fdt32((uint32_t)gicd_base);
@@ -256,12 +176,12 @@ static void fdt_begin_cpu_node(void *fdt, uint32_t vcpu_id)
 static void fdt_add_chosen(void *fdt, struct acrn_vm *vm)
 {
 	const struct acrn_vm_config *vm_config = get_vm_config(vm->vm_id);
+	const struct arch_vm_config *arch_config = &vm_config->arch;
 	uint64_t initrd_start = vm_config->os_config.kernel_ramdisk_addr;
 	uint64_t initrd_size = vm_config->os_config.kernel_ramdisk_size;
 	char stdout_path[32];
 
-	snprintf(stdout_path, sizeof(stdout_path), "/serial@%lx",
-		arm64_platform_guest_uart_base(vm->vm_id));
+	snprintf(stdout_path, sizeof(stdout_path), "/serial@%lx", arch_config->guest_uart_base);
 	fdt_check_ret(fdt_begin_node(fdt, "chosen"), "chosen");
 	fdt_check_ret(fdt_property_string(fdt, "stdout-path", stdout_path), "stdout-path");
 	if ((initrd_start != 0UL) && (initrd_size != 0UL)) {
@@ -295,8 +215,9 @@ static void fdt_add_cpus(void *fdt, const struct acrn_vm *vm)
 
 static void fdt_add_memory(void *fdt, struct acrn_vm *vm)
 {
-	uint64_t ram_start = arm64_platform_guest_ram_start(vm->vm_id);
-	uint64_t ram_size = arm64_platform_guest_ram_size(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t ram_start = arch_config->guest_ram_start;
+	uint64_t ram_size = arch_config->guest_ram_size;
 
 	fdt_check_ret(fdt_begin_node(fdt, "memory@0"), "memory");
 	fdt_check_ret(fdt_property_string(fdt, "device_type", "memory"), "memory device_type");
@@ -315,7 +236,8 @@ static void fdt_add_psci(void *fdt)
 
 static void fdt_add_gic(void *fdt, struct acrn_vm *vm)
 {
-	uint64_t gicd_base = arm64_platform_guest_gicd_base(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t gicd_base = arch_config->guest_gicd_base;
 	char name[32];
 
 	snprintf(name, sizeof(name), "interrupt-controller@%lx", gicd_base);
@@ -357,8 +279,9 @@ static void fdt_add_uart_clock(void *fdt)
 
 static void fdt_add_uart(void *fdt, struct acrn_vm *vm)
 {
-	uint64_t uart_base = arm64_platform_guest_uart_base(vm->vm_id);
-	uint32_t irq = arm64_platform_guest_uart_irq(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t uart_base = arch_config->guest_uart_base;
+	uint32_t irq = arch_config->guest_uart_irq;
 	const uint32_t interrupts[] = {
 		RK356X_FDT_GIC_SPI, irq - 32U, RK356X_FDT_IRQ_TYPE_LEVEL,
 	};
@@ -368,7 +291,7 @@ static void fdt_add_uart(void *fdt, struct acrn_vm *vm)
 	snprintf(name, sizeof(name), "serial@%lx", uart_base);
 	fdt_check_ret(fdt_begin_node(fdt, name), "uart");
 	fdt_check_ret(fdt_property_string(fdt, "compatible", "arm,pl011"), "uart compatible");
-	fdt_property_reg64(fdt, "reg", uart_base, arm64_platform_guest_uart_size(vm->vm_id));
+	fdt_property_reg64(fdt, "reg", uart_base, arch_config->guest_uart_size);
 	fdt_property_irq4(fdt, "interrupts", interrupts, ARRAY_SIZE(interrupts));
 	fdt_check_ret(fdt_property(fdt, "clocks", &clock, sizeof(clock)), "uart clocks");
 	fdt_check_ret(fdt_property_u32(fdt, "clock-frequency", RK356X_FDT_UART_CLOCK_HZ), "uart clock-frequency");

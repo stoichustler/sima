@@ -7,9 +7,9 @@
 #include <types.h>
 #include <vcpu.h>
 #include <vm.h>
+#include <vm_config.h>
 #include <guest_memory.h>
 #include <errno.h>
-#include <asm/platform.h>
 
 /*
  * Raw-image loading and guest-copy helpers use the same platform RAM window
@@ -26,8 +26,9 @@
  */
 static bool gpa_range_is_valid(struct acrn_vm *vm, uint64_t gpa, uint32_t size)
 {
-	uint64_t ram_start = arm64_platform_guest_ram_start(vm->vm_id);
-	uint64_t ram_size = arm64_platform_guest_ram_size(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t ram_start = arch_config->guest_ram_start;
+	uint64_t ram_size = arch_config->guest_ram_size;
 	uint64_t ram_end = ram_start + ram_size;
 	uint64_t gpa_end = gpa + size;
 	bool ret = false;
@@ -51,12 +52,13 @@ int32_t gva2gpa(struct acrn_vcpu *vcpu, uint64_t gva, uint64_t *gpa, uint32_t *e
 
 uint64_t gpa2hpa(struct acrn_vm *vm, uint64_t gpa)
 {
-	uint64_t ram_start = arm64_platform_guest_ram_start(vm->vm_id);
-	uint64_t ram_size = arm64_platform_guest_ram_size(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t ram_start = arch_config->guest_ram_start;
+	uint64_t ram_size = arch_config->guest_ram_size;
 	uint64_t hpa = INVALID_HPA;
 
 	if ((gpa >= ram_start) && (gpa < (ram_start + ram_size))) {
-		hpa = arm64_platform_guest_ram_hpa(vm->vm_id) + (gpa - ram_start);
+		hpa = arch_config->guest_ram_hpa + (gpa - ram_start);
 	}
 
 	return hpa;

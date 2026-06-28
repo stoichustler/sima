@@ -38,6 +38,7 @@
 #include <bits.h>
 #include <vm.h>
 #include <vcpu.h>
+#include <vm_config.h>
 #include <io_req.h>
 #include <irq.h>
 #include <logmsg.h>
@@ -943,7 +944,7 @@ void arm64_vgicv3_init_vm(struct acrn_vm *vm, uint64_t cpu_affinity)
 	vgic->lr_count = vgic_lr_count;
 	vgic->vmcr = (uint32_t)(VGIC_VMCR_GROUP_ENABLES | ICH_VMCR_DEFAULT_MASK);
 	vgic->gicd_ctlr = VGIC_CTLR_ARE_NS | VGIC_CTLR_ENABLE_G1;
-	vgic->its_enabled = (arm64_platform_guest_its_size(vm->vm_id) != 0UL);
+	vgic->its_enabled = (get_vm_config(vm->vm_id)->arch.guest_its_size != 0UL);
 	vgic->gicd_typer = (((ARM64_VGIC_IRQ_NUM / 32U) - 1U) & 0x1fU) |
 		(((uint32_t)(vgic->vcpu_count - 1U) & 0x7U) << 5U);
 	if (vgic->its_enabled) {
@@ -2954,7 +2955,8 @@ static bool vgicd_mmio_write(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 static int32_t vgicd_mmio_access(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 	struct acrn_mmio_request *mmio)
 {
-	uint32_t offset = (uint32_t)(mmio->address - arm64_platform_guest_gicd_base(vcpu->vm->vm_id));
+	uint32_t offset = (uint32_t)(mmio->address -
+		get_vm_config(vcpu->vm->vm_id)->arch.guest_gicd_base);
 	uint32_t irq_base;
 	int32_t ret = 0;
 
@@ -3014,14 +3016,18 @@ static int32_t vgicd_mmio_access(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vg
 
 static uint16_t vgicr_pcpu_id(const struct acrn_vcpu *vcpu, uint64_t addr)
 {
-	return (uint16_t)((addr - arm64_platform_guest_gicr_base(vcpu->vm->vm_id)) /
-		arm64_platform_guest_gicr_stride(vcpu->vm->vm_id));
+	const struct arch_vm_config *arch_config = &get_vm_config(vcpu->vm->vm_id)->arch;
+
+	return (uint16_t)((addr - arch_config->guest_gicr_base) /
+		arch_config->guest_gicr_stride);
 }
 
 static uint32_t vgicr_offset(const struct acrn_vcpu *vcpu, uint64_t addr)
 {
-	return (uint32_t)((addr - arm64_platform_guest_gicr_base(vcpu->vm->vm_id)) %
-		arm64_platform_guest_gicr_stride(vcpu->vm->vm_id));
+	const struct arch_vm_config *arch_config = &get_vm_config(vcpu->vm->vm_id)->arch;
+
+	return (uint32_t)((addr - arch_config->guest_gicr_base) %
+		arch_config->guest_gicr_stride);
 }
 
 static bool vgicr_decode_frame(const struct acrn_vcpu *vcpu, const struct arm64_vgicv3 *vgic,
@@ -3317,17 +3323,18 @@ static int32_t vgicr_mmio_access(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vg
 static int32_t vgicv3_mmio_dispatch(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 	struct acrn_mmio_request *mmio)
 {
+	const struct arch_vm_config *arch_config = &get_vm_config(vcpu->vm->vm_id)->arch;
 	int32_t ret = -ENODEV;
 
-	if (addr_in_range(mmio->address, arm64_platform_guest_gicd_base(vcpu->vm->vm_id),
-		arm64_platform_guest_gicd_size(vcpu->vm->vm_id))) {
+	if (addr_in_range(mmio->address, arch_config->guest_gicd_base,
+		arch_config->guest_gicd_size)) {
 		ret = vgicd_mmio_access(vcpu, vgic, mmio);
-	} else if (addr_in_range(mmio->address, arm64_platform_guest_gicr_base(vcpu->vm->vm_id),
-		arm64_platform_guest_gicr_size(vcpu->vm->vm_id))) {
+	} else if (addr_in_range(mmio->address, arch_config->guest_gicr_base,
+		arch_config->guest_gicr_size)) {
 		ret = vgicr_mmio_access(vcpu, vgic, mmio);
 	} else if (vgic->its_enabled &&
-		addr_in_range(mmio->address, arm64_platform_guest_its_base(vcpu->vm->vm_id),
-		arm64_platform_guest_its_size(vcpu->vm->vm_id))) {
+		addr_in_range(mmio->address, arch_config->guest_its_base,
+		arch_config->guest_its_size)) {
 		ret = arm64_vgicv3_its_mmio_access(vcpu, vgic, mmio);
 	}
 
@@ -3337,13 +3344,14 @@ static int32_t vgicv3_mmio_dispatch(struct acrn_vcpu *vcpu, struct arm64_vgicv3 
 static int32_t vgicv3_mmio_dispatch64(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 	struct acrn_mmio_request *mmio)
 {
+	const struct arch_vm_config *arch_config = &get_vm_config(vcpu->vm->vm_id)->arch;
 	struct acrn_mmio_request low = *mmio;
 	struct acrn_mmio_request high = *mmio;
 	int32_t ret;
 
 	if (vgic->its_enabled &&
-		addr_in_range(mmio->address, arm64_platform_guest_its_base(vcpu->vm->vm_id),
-		arm64_platform_guest_its_size(vcpu->vm->vm_id)) &&
+		addr_in_range(mmio->address, arch_config->guest_its_base,
+		arch_config->guest_its_size) &&
 		arm64_vgicv3_its_mmio_access64(vcpu, vgic, mmio, &ret)) {
 		return ret;
 	}

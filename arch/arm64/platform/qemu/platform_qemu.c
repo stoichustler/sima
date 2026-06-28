@@ -42,22 +42,6 @@ static const struct arm64_mem_region platform_mmio_regions[] = {
 	},
 };
 
-static const struct arch_vm_config *qemu_guest_config(uint16_t vm_id)
-{
-	const struct acrn_vm_config *vm_config;
-
-	if (vm_id >= CONFIG_MAX_VM_NUM) {
-		panic("qemu vm%hu is out of range", vm_id);
-	}
-
-	vm_config = get_vm_config(vm_id);
-	if ((vm_config->cpu_affinity == 0UL) || (vm_config->arch.guest_ram_size == 0UL)) {
-		panic("qemu vm%hu has no guest platform config", vm_id);
-	}
-
-	return &vm_config->arch;
-}
-
 const struct arm64_mem_region *arm64_get_platform_mmio_regions(uint32_t *count)
 {
 	*count = ARRAY_SIZE(platform_mmio_regions);
@@ -77,71 +61,6 @@ uint64_t arm64_platform_ram_size(void)
 uint64_t arm64_platform_console_mmio_base(void)
 {
 	return QEMU_VIRT_PL011_BASE;
-}
-
-uint64_t arm64_platform_guest_ram_start(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_ram_start;
-}
-
-uint64_t arm64_platform_guest_ram_size(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_ram_size;
-}
-
-uint64_t arm64_platform_guest_ram_hpa(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_ram_hpa;
-}
-
-uint64_t arm64_platform_guest_gicd_base(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_gicd_base;
-}
-
-uint64_t arm64_platform_guest_gicd_size(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_gicd_size;
-}
-
-uint64_t arm64_platform_guest_gicr_base(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_gicr_base;
-}
-
-uint64_t arm64_platform_guest_gicr_stride(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_gicr_stride;
-}
-
-uint64_t arm64_platform_guest_gicr_size(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_gicr_size;
-}
-
-uint64_t arm64_platform_guest_its_base(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_its_base;
-}
-
-uint64_t arm64_platform_guest_its_size(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_its_size;
-}
-
-uint64_t arm64_platform_guest_uart_base(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_uart_base;
-}
-
-uint64_t arm64_platform_guest_uart_size(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_uart_size;
-}
-
-uint32_t arm64_platform_guest_uart_irq(uint16_t vm_id)
-{
-	return qemu_guest_config(vm_id)->guest_uart_irq;
 }
 
 uint64_t arm64_platform_gicd_base(void)
@@ -215,10 +134,11 @@ static void fdt_property_reg64(void *fdt, const char *name, uint64_t addr, uint6
 static void fdt_property_gic_reg(void *fdt, struct acrn_vm *vm)
 {
 	fdt32_t reg[8];
-	uint64_t gicd_base = arm64_platform_guest_gicd_base(vm->vm_id);
-	uint64_t gicd_size = arm64_platform_guest_gicd_size(vm->vm_id);
-	uint64_t gicr_base = arm64_platform_guest_gicr_base(vm->vm_id);
-	uint64_t gicr_size = arm64_platform_guest_gicr_size(vm->vm_id);
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
+	uint64_t gicd_base = arch_config->guest_gicd_base;
+	uint64_t gicd_size = arch_config->guest_gicd_size;
+	uint64_t gicr_base = arch_config->guest_gicr_base;
+	uint64_t gicr_size = arch_config->guest_gicr_size;
 
 	reg[0] = cpu_to_fdt32((uint32_t)(gicd_base >> 32U));
 	reg[1] = cpu_to_fdt32((uint32_t)gicd_base);
@@ -260,10 +180,10 @@ static void fdt_begin_cpu_node(void *fdt, uint32_t vcpu_id)
 
 static void fdt_add_chosen(void *fdt, struct acrn_vm *vm)
 {
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
 	char stdout_path[32];
 
-	snprintf(stdout_path, sizeof(stdout_path), "/pl011@%lx",
-		arm64_platform_guest_uart_base(vm->vm_id));
+	snprintf(stdout_path, sizeof(stdout_path), "/pl011@%lx", arch_config->guest_uart_base);
 	fdt_check_ret(fdt_begin_node(fdt, "chosen"), "chosen");
 	fdt_check_ret(fdt_property_string(fdt, "stdout-path", stdout_path), "stdout-path");
 	fdt_check_ret(fdt_end_node(fdt), "chosen end");
@@ -304,9 +224,10 @@ static void fdt_add_psci(void *fdt)
 
 static void fdt_add_memory(void *fdt, struct acrn_vm *vm)
 {
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
 	char name[32];
-	uint64_t ram_start = arm64_platform_guest_ram_start(vm->vm_id);
-	uint64_t ram_size = arm64_platform_guest_ram_size(vm->vm_id);
+	uint64_t ram_start = arch_config->guest_ram_start;
+	uint64_t ram_size = arch_config->guest_ram_size;
 
 	snprintf(name, sizeof(name), "memory@%lx", ram_start);
 	fdt_check_ret(fdt_begin_node(fdt, name), "memory");
@@ -318,8 +239,9 @@ static void fdt_add_memory(void *fdt, struct acrn_vm *vm)
 
 static void fdt_add_gic(void *fdt, struct acrn_vm *vm)
 {
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
 	char name[48];
-	uint64_t gicd_base = arm64_platform_guest_gicd_base(vm->vm_id);
+	uint64_t gicd_base = arch_config->guest_gicd_base;
 
 	snprintf(name, sizeof(name), "interrupt-controller@%lx", gicd_base);
 	fdt_check_ret(fdt_begin_node(fdt, name), "gic");
@@ -333,9 +255,10 @@ static void fdt_add_gic(void *fdt, struct acrn_vm *vm)
 
 static void fdt_add_its(void *fdt, struct acrn_vm *vm)
 {
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
 	char name[48];
-	uint64_t its_base = arm64_platform_guest_its_base(vm->vm_id);
-	uint64_t its_size = arm64_platform_guest_its_size(vm->vm_id);
+	uint64_t its_base = arch_config->guest_its_base;
+	uint64_t its_size = arch_config->guest_its_size;
 
 	if (its_size == 0UL) {
 		return;
@@ -385,18 +308,19 @@ static void fdt_add_uart_clock(void *fdt)
 
 static void fdt_add_uart(void *fdt, struct acrn_vm *vm)
 {
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
 	static const uint32_t interrupts[] = {
 		QEMU_FDT_GIC_SPI, 1U, QEMU_FDT_IRQ_TYPE_LEVEL,
 	};
 	static const char uart_compat[] = "arm,pl011\0arm,primecell";
 	char name[32];
-	uint64_t uart_base = arm64_platform_guest_uart_base(vm->vm_id);
+	uint64_t uart_base = arch_config->guest_uart_base;
 
 	snprintf(name, sizeof(name), "pl011@%lx", uart_base);
 	fdt_check_ret(fdt_begin_node(fdt, name), "uart");
 	fdt_check_ret(fdt_property(fdt, "compatible", uart_compat, sizeof(uart_compat)),
 		"uart compatible");
-	fdt_property_reg64(fdt, "reg", uart_base, arm64_platform_guest_uart_size(vm->vm_id));
+	fdt_property_reg64(fdt, "reg", uart_base, arch_config->guest_uart_size);
 	fdt_property_irq4(fdt, "interrupts", interrupts, ARRAY_SIZE(interrupts));
 	fdt_check_ret(fdt_property_u32(fdt, "current-speed", QEMU_FDT_UART_BAUD), "uart baud");
 	fdt_check_ret(fdt_property_u32(fdt, "clocks", QEMU_FDT_PHANDLE_UARTCLK), "uart clocks");

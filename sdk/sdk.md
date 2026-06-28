@@ -163,8 +163,9 @@ boot logs settle to show the `console:\>` prompt.
   pre-launched VMs.
 - QEMU guest RAM, GIC, and PL011 layout is centralized in each VM's
   `vm_configs[].arch` entry, following the ACRN-style `vm_configurations.c`
-  source-of-truth pattern. Generic ARM64 code gets those values through the
-  `asm/platform.h` platform API instead of hard-coded QEMU constants.
+  source-of-truth pattern. ARM64 code reads per-VM guest layout directly from
+  `get_vm_config(vm_id)->arch`; `asm/platform.h` is reserved for host/platform
+  properties rather than thin guest-layout getter wrappers.
 - Static QEMU RTOS VMs use a KISS stage-2 layout: each configured guest RAM
   window is mapped GPA/IPA == PA/HPA.
 - Raw-image copies are checked against the owning VM's configured guest RAM

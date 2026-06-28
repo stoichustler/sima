@@ -16,6 +16,7 @@
 #include <reloc.h>
 #include <vm.h>
 #include <vcpu.h>
+#include <vm_config.h>
 #include <vm_wdt.h>
 #include <host_pm.h>
 #include <schedule.h>
@@ -138,22 +139,23 @@ static void shell_print_host_maps(void)
 
 static void shell_print_vm_stage2_maps(const struct acrn_vm *vm)
 {
+	const struct arch_vm_config *arch_config = &get_vm_config(vm->vm_id)->arch;
 	char domain[16];
 
 	snprintf(domain, sizeof(domain), "vm-%u s2", vm->vm_id);
 	shell_print_mem_map(domain, "ram", "normal",
-		arm64_platform_guest_ram_start(vm->vm_id),
-		arm64_platform_guest_ram_hpa(vm->vm_id),
-		arm64_platform_guest_ram_size(vm->vm_id));
+		arch_config->guest_ram_start,
+		arch_config->guest_ram_hpa,
+		arch_config->guest_ram_size);
 	shell_print_mem_special(domain, "vgicd", "vio",
-		arm64_platform_guest_gicd_base(vm->vm_id),
-		arm64_platform_guest_gicd_size(vm->vm_id));
+		arch_config->guest_gicd_base,
+		arch_config->guest_gicd_size);
 	shell_print_mem_special(domain, "vgicr", "vio",
-		arm64_platform_guest_gicr_base(vm->vm_id),
-		arm64_platform_guest_gicr_size(vm->vm_id));
+		arch_config->guest_gicr_base,
+		arch_config->guest_gicr_size);
 	shell_print_mem_special(domain, "vpl011", "vio",
-		arm64_platform_guest_uart_base(vm->vm_id),
-		arm64_platform_guest_uart_size(vm->vm_id));
+		arch_config->guest_uart_base,
+		arch_config->guest_uart_size);
 }
 
 static int32_t shell_list_mem(__unused int32_t argc, __unused char **argv)
