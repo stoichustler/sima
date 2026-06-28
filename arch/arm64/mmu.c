@@ -64,8 +64,8 @@ void init_phys_mem_range(void)
 
 	fdt_get_rsvd_mem_regions(get_host_fdt(), rsvd_regions, &nr_rsvd_regions);
 #else
-	phys_mem_start = arm64_platform_ram_start();
-	phys_mem_size = arm64_platform_ram_size();
+	phys_mem_start = beau_config.ram_start;
+	phys_mem_size = beau_config.ram_size;
 #endif
 }
 

@@ -15,20 +15,25 @@ struct arm64_mem_region {
 	uint64_t size;
 };
 
+struct beau_config {
+	uint64_t ram_start;
+	uint64_t ram_size;
+
+	uint64_t console_mmio_base;
+
+	uint64_t gicd_base;
+	uint64_t gicd_size;
+	uint64_t gicr_base;
+	uint64_t gicr_stride;
+	uint64_t gicr_size;
+	uint64_t gits_base;
+	uint64_t gits_size;
+	uint32_t gic_iidr;
+};
+
+extern const struct beau_config beau_config;
+
 const struct arm64_mem_region *arm64_get_platform_mmio_regions(uint32_t *count);
-uint64_t arm64_platform_ram_start(void);
-uint64_t arm64_platform_ram_size(void);
-uint64_t arm64_platform_console_mmio_base(void);
-uint64_t arm64_platform_gicd_base(void);
-uint64_t arm64_platform_gicd_size(void);
-uint64_t arm64_platform_gicr_base(void);
-uint64_t arm64_platform_gicr_stride(void);
-uint64_t arm64_platform_gicr_size(void);
-uint64_t arm64_platform_gits_base(void);
-uint64_t arm64_platform_gits_size(void);
-uint64_t arm64_platform_gic_mmio_start(void);
-uint64_t arm64_platform_gic_mmio_end(void);
-uint32_t arm64_platform_gic_iidr(void);
 #endif
 
 #endif /* ARM64_PLATFORM_H */

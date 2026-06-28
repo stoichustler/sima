@@ -276,7 +276,7 @@ void arm64_gicv3_init_early(void)
 		gicv5_iaffids[i] = 0U;
 	}
 	gicv5_cpu_init();
-	beau_gicv5_its_init(arm64_platform_gits_base(), arm64_platform_gits_size());
+	beau_gicv5_its_init(beau_config.gits_base, beau_config.gits_size);
 	beau_gicv5_iwb_init(0UL, 0UL);
 	gicv5_initialized = true;
 }

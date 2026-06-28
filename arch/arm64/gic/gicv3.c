@@ -426,13 +426,13 @@ void arm64_gicv3_init_early(void)
 		return;
 	}
 
-	sc->gic_dist = arm64_platform_gicd_base();
-	sc->gic_dist_size = arm64_platform_gicd_size();
-	sc->gic_redist = arm64_platform_gicr_base();
-	sc->gic_redist_stride = arm64_platform_gicr_stride();
-	sc->gic_redist_size = arm64_platform_gicr_size();
-	sc->gic_its = arm64_platform_gits_base();
-	sc->gic_its_size = arm64_platform_gits_size();
+	sc->gic_dist = beau_config.gicd_base;
+	sc->gic_dist_size = beau_config.gicd_size;
+	sc->gic_redist = beau_config.gicr_base;
+	sc->gic_redist_stride = beau_config.gicr_stride;
+	sc->gic_redist_size = beau_config.gicr_size;
+	sc->gic_its = beau_config.gits_base;
+	sc->gic_its_size = beau_config.gits_size;
 
 	if ((sc->gic_dist == 0UL) || (sc->gic_dist_size == 0UL)) {
 		panic("invalid gic distributor base=0x%lx size=0x%lx",

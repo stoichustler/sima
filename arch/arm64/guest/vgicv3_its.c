@@ -554,7 +554,7 @@ static bool vits_mmio_read(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 		mmio->value = its->ctlr;
 		break;
 	case GITS_IIDR:
-		mmio->value = arm64_platform_gic_iidr();
+		mmio->value = beau_config.gic_iidr;
 		break;
 	case GITS_TYPER:
 		mmio->value = its->typer & UINT32_MAX;

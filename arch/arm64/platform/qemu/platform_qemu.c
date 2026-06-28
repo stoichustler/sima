@@ -42,75 +42,24 @@ static const struct arm64_mem_region platform_mmio_regions[] = {
 	},
 };
 
+const struct beau_config beau_config = {
+	.ram_start = QEMU_VIRT_RAM_START,
+	.ram_size = QEMU_VIRT_RAM_SIZE,
+	.console_mmio_base = QEMU_VIRT_PL011_BASE,
+	.gicd_base = QEMU_VIRT_GICD_BASE,
+	.gicd_size = QEMU_VIRT_GICD_SIZE,
+	.gicr_base = QEMU_VIRT_GICR_BASE,
+	.gicr_stride = QEMU_VIRT_GICR_STRIDE,
+	.gicr_size = QEMU_VIRT_GICR_SIZE,
+	.gits_base = QEMU_VIRT_GITS_BASE,
+	.gits_size = QEMU_VIRT_GITS_SIZE,
+	.gic_iidr = QEMU_VIRT_GIC_IIDR,
+};
+
 const struct arm64_mem_region *arm64_get_platform_mmio_regions(uint32_t *count)
 {
 	*count = ARRAY_SIZE(platform_mmio_regions);
 	return platform_mmio_regions;
-}
-
-uint64_t arm64_platform_ram_start(void)
-{
-	return QEMU_VIRT_RAM_START;
-}
-
-uint64_t arm64_platform_ram_size(void)
-{
-	return QEMU_VIRT_RAM_SIZE;
-}
-
-uint64_t arm64_platform_console_mmio_base(void)
-{
-	return QEMU_VIRT_PL011_BASE;
-}
-
-uint64_t arm64_platform_gicd_base(void)
-{
-	return QEMU_VIRT_GICD_BASE;
-}
-
-uint64_t arm64_platform_gicd_size(void)
-{
-	return QEMU_VIRT_GICD_SIZE;
-}
-
-uint64_t arm64_platform_gicr_base(void)
-{
-	return QEMU_VIRT_GICR_BASE;
-}
-
-uint64_t arm64_platform_gicr_stride(void)
-{
-	return QEMU_VIRT_GICR_STRIDE;
-}
-
-uint64_t arm64_platform_gicr_size(void)
-{
-	return QEMU_VIRT_GICR_SIZE;
-}
-
-uint64_t arm64_platform_gits_base(void)
-{
-	return QEMU_VIRT_GITS_BASE;
-}
-
-uint64_t arm64_platform_gits_size(void)
-{
-	return QEMU_VIRT_GITS_SIZE;
-}
-
-uint64_t arm64_platform_gic_mmio_start(void)
-{
-	return QEMU_VIRT_GIC_MMIO_START;
-}
-
-uint64_t arm64_platform_gic_mmio_end(void)
-{
-	return QEMU_VIRT_GIC_MMIO_END;
-}
-
-uint32_t arm64_platform_gic_iidr(void)
-{
-	return QEMU_VIRT_GIC_IIDR;
 }
 
 static void fdt_check_ret(int32_t ret, const char *op)

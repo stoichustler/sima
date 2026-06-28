@@ -37,75 +37,24 @@ static const struct arm64_mem_region platform_mmio_regions[] = {
 	},
 };
 
+const struct beau_config beau_config = {
+	.ram_start = RK356X_RAM_START,
+	.ram_size = RK356X_RAM_SIZE,
+	.console_mmio_base = RK356X_UART0_BASE,
+	.gicd_base = RK356X_GICD_BASE,
+	.gicd_size = RK356X_GICD_SIZE,
+	.gicr_base = RK356X_GICR_BASE,
+	.gicr_stride = RK356X_GICR_STRIDE,
+	.gicr_size = RK356X_GICR_SIZE,
+	.gits_base = 0UL,
+	.gits_size = 0UL,
+	.gic_iidr = RK356X_GIC_IIDR,
+};
+
 const struct arm64_mem_region *arm64_get_platform_mmio_regions(uint32_t *count)
 {
 	*count = ARRAY_SIZE(platform_mmio_regions);
 	return platform_mmio_regions;
-}
-
-uint64_t arm64_platform_ram_start(void)
-{
-	return RK356X_RAM_START;
-}
-
-uint64_t arm64_platform_ram_size(void)
-{
-	return RK356X_RAM_SIZE;
-}
-
-uint64_t arm64_platform_console_mmio_base(void)
-{
-	return RK356X_UART0_BASE;
-}
-
-uint64_t arm64_platform_gicd_base(void)
-{
-	return RK356X_GICD_BASE;
-}
-
-uint64_t arm64_platform_gicd_size(void)
-{
-	return RK356X_GICD_SIZE;
-}
-
-uint64_t arm64_platform_gicr_base(void)
-{
-	return RK356X_GICR_BASE;
-}
-
-uint64_t arm64_platform_gicr_stride(void)
-{
-	return RK356X_GICR_STRIDE;
-}
-
-uint64_t arm64_platform_gicr_size(void)
-{
-	return RK356X_GICR_SIZE;
-}
-
-uint64_t arm64_platform_gits_base(void)
-{
-	return 0UL;
-}
-
-uint64_t arm64_platform_gits_size(void)
-{
-	return 0UL;
-}
-
-uint64_t arm64_platform_gic_mmio_start(void)
-{
-	return RK356X_GIC_MMIO_START;
-}
-
-uint64_t arm64_platform_gic_mmio_end(void)
-{
-	return RK356X_GIC_MMIO_END;
-}
-
-uint32_t arm64_platform_gic_iidr(void)
-{
-	return RK356X_GIC_IIDR;
 }
 
 static void fdt_check_ret(int32_t ret, const char *op)

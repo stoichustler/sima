@@ -2884,7 +2884,7 @@ static void vgicd_mmio_read(struct acrn_vcpu *vcpu, struct arm64_vgicv3 *vgic,
 			mmio->value = vgic->gicd_typer;
 			break;
 		case VGICD_IIDR:
-			mmio->value = arm64_platform_gic_iidr();
+			mmio->value = beau_config.gic_iidr;
 			break;
 		case VGICD_ITARGETSR ... (VGICD_ICFGR - 1U):
 			mmio->value = vgic_read_irq_target(vcpu, offset - VGICD_ITARGETSR,
@@ -3153,7 +3153,7 @@ static void vgicr_mmio_read(struct arm64_vgicv3 *vgic,
 		mmio->value = vgic->gicr_ctlr[frame->pcpu_id] & ~VGICR_CTLR_RWP;
 		break;
 	case VGICR_IIDR:
-		mmio->value = arm64_platform_gic_iidr();
+		mmio->value = beau_config.gic_iidr;
 		break;
 	case VGICR_TYPER:
 		typer = vgicr_typer_value(vgic, frame);

@@ -69,7 +69,7 @@ void serial_init(bool early_boot)
 	}
 
 	if (uart.mmio_base_vaddr == NULL) {
-		uart.mmio_base_vaddr = (void *)arm64_platform_console_mmio_base();
+		uart.mmio_base_vaddr = (void *)beau_config.console_mmio_base;
 	}
 
 	if (!early_boot) {
