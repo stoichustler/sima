@@ -17,9 +17,17 @@
 #include <trace.h>
 
 /*
+ * 2026-06-30, hypercall principle:
+ *
  * ARM64 guests use HVC for two ABIs in this bring-up tree:
  * - PSCI, identified by the standard PSCI function IDs.
  * - ACRN hypercalls, identified by HC_ID in the top ID byte.
+ *
+ *   HVC64 exit
+ *      |
+ *      +--> PSCI function ID -> vcpu_exit.c power/CPU emulation
+ *      |
+ *      +--> ACRN HC_ID       -> this table -> small ARM64-safe handlers
  *
  * Keep the ACRN dispatcher small and explicit. x86-only device assignment,
  * VMX, VTD, LAPIC, and profiling calls return -ENOTTY on ARM64 until their

@@ -158,6 +158,17 @@ static void shell_print_vm_stage2_maps(const struct acrn_vm *vm)
 		arch_config->guest_uart_size);
 }
 
+/*
+ * 2026-06-30, mmap monitor:
+ *
+ * mmap is the quick ownership map for ARM64 address translation. It prints the
+ * EL2 stage-1 host view first, then each VM's stage-2 view. RAM rows are leaf
+ * mappings; vio rows are intentionally unmapped stage-2 device IPAs that exit
+ * to EL2 through MMIO emulation.
+ *
+ *   host VA -> EL2 stage-1 -> HPA
+ *   guest IPA -> VM stage-2 -> HPA, or vio data abort
+ */
 static int32_t shell_list_mem(__unused int32_t argc, __unused char **argv)
 {
 	uint16_t vm_id;
@@ -654,6 +665,19 @@ static const struct cpu_regs *shell_dumpstat_get_regs(struct acrn_vcpu *vcpu,
 	return snapshot->captured ? &snapshot->regs : &vcpu->arch.regs;
 }
 
+/*
+ * 2026-06-30, dumpstat monitor:
+ *
+ * dumpstat is a per-vCPU deep snapshot. If the target vCPU is current on a
+ * remote pCPU, an IPI samples live EL2 timer and vGIC state; otherwise the
+ * command falls back to the durable vCPU state saved in memory. Printing both
+ * saved and live fields separates context-save bugs from guest-visible stalls.
+ *
+ *   target vCPU current on remote pCPU
+ *        -> IPI live capture -> regs/vGIC/vtimer + stacks
+ *      otherwise
+ *        -> saved vCPU image -> regs/vGIC/vtimer + stacks
+ */
 static int32_t shell_find_valid_lr_for_virq(const uint64_t *lrs, uint32_t count, uint32_t virq)
 {
 	uint32_t idx;
@@ -891,6 +915,18 @@ static const char *shell_vcpu_state_to_str(enum vcpu_state state)
 	return str;
 }
 
+/*
+ * 2026-06-30, vmstat monitor:
+ *
+ * vmstat is the broad health summary before using dumpstat. It keeps one VM
+ * visible at a time: configured resources, runtime state, watchdog and console
+ * status, scheduler diagnostics, and the guest timer/vGIC delivery summary.
+ *
+ *   VM config + runtime VM object
+ *        -> VM resource/state rows
+ *        -> per-vCPU scheduler rows
+ *        -> per-vCPU timer/vGIC rows
+ */
 static bool shell_vm_config_present(const struct acrn_vm_config *vm_config)
 {
 	return (vm_config->name[0] != '\0') || (vm_config->cpu_affinity != 0UL) ||

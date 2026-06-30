@@ -13,11 +13,19 @@
 #include <asm/guest/vgicv3.h>
 
 /*
+ * 2026-06-30, virtual-IRQ principle:
+ *
  * ARM64 vIRQ is the bridge between common/device code and the architecture
  * interrupt model. Guest GIC INTIDs are delegated to VGICv3 so descriptor,
  * list-register, and wakeup state stay in one owner. The small bitmap fallback
  * exists for non-GIC virtual events that only need to wake the vCPU request
  * path; it is not a replacement for GIC interrupt lifecycle modeling.
+ *
+ *   common event -> vcpu_set_intr()
+ *        |
+ *        +--> GIC INTID -> vGIC descriptor/LR lifecycle
+ *        |
+ *        +--> private bitmap event -> request path wakeup only
  */
 void vcpu_set_trap(struct acrn_vcpu *vcpu, struct arm64_vcpu_trap_info *trap)
 {

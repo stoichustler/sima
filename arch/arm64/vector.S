@@ -8,12 +8,41 @@
 #include <asm/cpu.h>
 
 /*
+ * 2026-06-30 ARM64 exception-vector principle:
+ *
+ * Taking an exception to EL2 does a small hardware save, then jumps into one
+ * executable vector slot selected by source state and exception type.
+ *
+ *   pre-exception PSTATE -> SPSR_EL2     return PC -> ELR_EL2
+ *   syndrome            -> ESR_EL2      fault VA  -> FAR_EL2
+ *
+ * The vector table contains instructions, not handler addresses. Each slot is
+ * 0x80 bytes, so BEAU keeps the slot body to one branch and does the real
+ * save/dispatch/restore work in shared code below.
+ *
+ *   EL2 host exception          EL1 guest exit
+ *        |                           |
+ *        v                           v
+ *   current EL, SP_EL2          lower EL, AArch64
+ *        |                           |
+ *        v                           v
+ *   dispatch_trap()             dispatch_vcpu_*()
+ *        |                           |
+ *        v                           v
+ *   ERET to EL2 thread          ERET to EL1 guest
+ */
+
+/*
  * ARM64 exception entry saves a full cpu_regs frame on the current EL2 stack.
  * Host exceptions return through dispatch_trap, while guest exceptions enter
  * vcpu_exit.c and then branch to vcpu_exit_return so the modified guest frame
  * is restored directly into EL1 with ERET.
  */
 .macro save_cpu_context
+	/*
+	 * Hardware does not stack x0-x30. Save caller-visible state before the
+	 * C dispatcher can clobber it.
+	 */
 	stp	x0, x1, [sp, #CPU_REGS_OFFSET_X0]
 	stp	x2, x3, [sp, #CPU_REGS_OFFSET_X2]
 	stp	x4, x5, [sp, #CPU_REGS_OFFSET_X4]
@@ -45,12 +74,17 @@
 	/* HPFAR_EL2 carries the stage-2 IPA fault address for guest aborts. */
 	mrs	x0, hpfar_el2
 	str	x0, [sp, #CPU_REGS_OFFSET_HPFAR]
+	/* The saved SP names the top of this software-built cpu_regs frame. */
 	add	x0, sp, #CPU_REGS_OFFSET_LAST
 	str	x0, [sp, #CPU_REGS_OFFSET_SP]
 	str	x0, [sp, #CPU_REGS_OFFSET_EXC_SP]
 .endm
 
 .macro restore_cpu_context
+	/*
+	 * ERET consumes ELR_EL2 and SPSR_EL2 together: ELR selects the return
+	 * instruction and SPSR restores PSTATE, including DAIF and EL mode.
+	 */
 	ldr	x0, [sp, #CPU_REGS_OFFSET_ELR]
 	/* Restore the EL2 return PC consumed by ERET. */
 	msr	elr_el2, x0
@@ -110,6 +144,11 @@
  * |          + 0x700 | FIQ / vFIQ       |                         |
  * |          + 0x780 | SError / vSError |                         |
  * +------------------+------------------+-------------------------+
+ *
+ * BEAU keeps SPSel=1 in EL2, so normal host exceptions arrive in the
+ * current-EL/SPx group. Guest exits arrive in the lower-EL/AArch64 group.
+ * The SP0 and AArch32 groups are intentionally parked because they are not
+ * valid paths for the current ARM64 hypervisor design.
  */
 
 	.text
@@ -169,7 +208,11 @@ arm64_serror_handler:
 	vector_entry ARM64_TRAP_SERROR
 
 	.macro guest_vector_entry handler
-	/* Preserve the guest's SP_EL1 separately from the EL2 vector stack. */
+	/*
+	 * A lower-EL exception enters EL2 on SP_EL2. Preserve the guest SP_EL1
+	 * separately so C code can inspect and edit the guest frame, then ERET
+	 * can resume the same EL1 stack.
+	 */
 	sub	sp, sp, #CPU_REGS_OFFSET_LAST
 	save_cpu_context
 	/* SP_EL1 is the guest kernel stack pointer when EL1 uses SP_EL1. */

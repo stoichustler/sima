@@ -48,9 +48,28 @@ void init_acrn_boot_info(uint32_t *registers)
 	int32_t ret;
 
 	/*
-	 * Prefer a real bootloader protocol when present. ARM64 QEMU/rk356x static
-	 * builds can also run without Multiboot, so bare boot falls back to the
-	 * platform-compiled module table from vm_config.c.
+	 * 2026-06-30, boot-info normalization principle:
+	 *
+	 * The BSP reaches this point before VM creation, while bootloader records
+	 * are still available through the raw entry registers. Convert that
+	 * machine/protocol-specific handoff into the single global acrn_boot_info
+	 * object, then let the rest of the hypervisor consume only the normalized
+	 * module list, memory map, command line, loader name, and optional EFI/ACPI
+	 * pointers.
+	 *
+	 *   entry registers
+	 *        |
+	 *        v
+	 *   Multiboot/Multiboot2 parser
+	 *        |
+	 *        +-- success --> acrn_bi modules/mmap/EFI/ACPI
+	 *        |
+	 *        +-- absent  --> bare_boot_options[] -> acrn_bi modules
+	 *
+	 * x86 normally arrives through a Multiboot protocol and is later sanitized.
+	 * ARM64 QEMU/rk356x static builds pass zeroed boot_regs today, so the
+	 * Multiboot probe intentionally fails and bare boot supplies the compiled
+	 * image table used by the raw-image loader.
 	 */
 	ret = init_multiboot_info(registers);
 	if (ret < 0) {

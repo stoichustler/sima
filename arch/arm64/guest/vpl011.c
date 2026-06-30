@@ -41,6 +41,19 @@
 static const uint8_t pl011_pid[] = { 0x11U, 0x10U, 0x14U, 0x00U, 0x0dU, 0xf0U, 0x05U, 0xb1U };
 static const uint8_t pl011_cid[] = { 0x0dU, 0xf0U, 0x05U, 0xb1U };
 
+/*
+ * 2026-06-30, vPL011 principle:
+ *
+ * vPL011 is the ARM64 guest console device. Stage-2 deliberately leaves the
+ * UART IPA unmapped, data-abort MMIO reaches this file, and the common console
+ * ring remains the owner of host-side buffering and vsh replay ordering.
+ *
+ *   guest PL011 MMIO
+ *        -> stage-2 data abort
+ *        -> common MMIO request
+ *        -> vPL011 register model
+ *        -> console vuart ring and vGIC UART IRQ
+ */
 struct arm64_vpl011 {
 	uint64_t tx_count;
 	uint64_t tx_irq_count;
@@ -310,6 +323,11 @@ int32_t arm64_vpl011_mmio_handler(struct io_request *io_req, void *handler_priva
 	uint32_t offset;
 	int32_t ret = -EINVAL;
 
+	/*
+	 * Performance bottleneck: the guest PL011 is byte-oriented and stage-2
+	 * trapped. Heavy console output can turn into one VM-exit per character,
+	 * plus possible vGIC IRQ sync when RX/TX interrupt state changes.
+	 */
 	if ((vm != NULL) && (vm->vm_id < CONFIG_MAX_VM_NUM) &&
 		((mmio->size == 1UL) || (mmio->size == 2UL) || (mmio->size == 4UL))) {
 		base = get_vm_config(vm->vm_id)->arch.guest_uart_base;

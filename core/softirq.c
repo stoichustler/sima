@@ -10,6 +10,32 @@
 #include <per_cpu.h>
 #include <softirq.h>
 
+/*
+ * Deferred interrupt-work principle:
+ *
+ * Hard IRQ handlers should keep the architecture interrupt window short. They
+ * acknowledge or mask the source, set a per-pCPU softirq bit, and return. The
+ * softirq pass then runs the heavier common callback outside the immediate IRQ
+ * dispatch path.
+ *
+ *   IRQ handler
+ *      |
+ *      v
+ *   fire_softirq(nr)
+ *      |
+ *      v
+ *   per_cpu(softirq_pending) bit
+ *      |
+ *      v
+ *   do_softirq()
+ *     - prevent nested servicing on the same pCPU
+ *     - optionally re-enable local IRQs while callbacks run
+ *     - drain bits raised during callback execution
+ *
+ * The ARM64 host timer uses this path: the CNTHP PPI fires in EL2, the handler
+ * raises SOFTIRQ_TIMER, and core/timer.c advances software timers before
+ * programming the next architecture-timer deadline.
+ */
 static softirq_handler softirq_handlers[NR_SOFTIRQS];
 
 void init_softirq(void)

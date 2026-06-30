@@ -16,12 +16,41 @@
 #include <quirks/smbios.h>
 #include <boot.h>
 
+/*
+ * 2026-06-30, Security VM firmware-table fixup design:
+ *
+ * A pre-launched Security VM can receive selected host security inventory
+ * instead of a fully synthetic firmware view. This file keeps that policy
+ * narrow: only the guest's prepared ACPI/SMBIOS tables are patched, and only
+ * when GUEST_FLAG_SECURITY_VM marks the VM as needing the special firmware
+ * handoff.
+ *
+ *   host firmware tables
+ *          |
+ *          v
+ *   TPM2/SMBIOS discovery
+ *          |
+ *          v
+ *   guest ACPI/SMBIOS buffer fixup
+ *          |
+ *          v
+ *   pre-launched Security VM observes a coherent firmware view
+ *
+ * TPM2 passthrough preserves the host start method and event-log location,
+ * while SMBIOS passthrough copies the host SMBIOS entry point/table into guest
+ * firmware ranges and regenerates checksums after guest GPA rewrite.
+ */
 static void *get_acpi_mod_entry(const char *signature, void *acpi)
 {
 	struct acpi_table_xsdt *xsdt;
 	uint32_t i, entry_cnt = 0U;
 	struct acpi_table_header *header = NULL, *find = NULL;
 
+	/*
+	 * The ACPI module is a flat guest firmware image whose table pointers are
+	 * guest physical addresses. Convert each XSDT entry back into an offset
+	 * from VIRT_ACPI_DATA_ADDR before touching the backing module buffer.
+	 */
 	xsdt = acpi + VIRT_XSDT_ADDR - VIRT_ACPI_DATA_ADDR;
 	entry_cnt = (xsdt->header.length - sizeof(xsdt->header)) / (sizeof(xsdt->table_offset_entry[0]));
 
@@ -50,6 +79,13 @@ static void tpm2_fixup(uint16_t vm_id)
 		tpm2 = get_acpi_tbl(ACPI_SIG_TPM2);
 
 		if (config->arch.pt_tpm2 && (vtpm2 != NULL) && (tpm2 != NULL)) {
+			/*
+			 * The VM config owns the guest MMIO/resource mapping
+			 * for the passed-through TPM2 device. The host TPM2
+			 * table owns the real start method and event-log HPA.
+			 * This fixup joins those two views inside the guest
+			 * TPM2 ACPI table.
+			 */
 			for (i = 0U; i < MAX_MMIO_DEV_NUM; i++) {
 				if (strncmp(config->mmiodevs[i].name, "tpm2", 4) == 0) {
 					dev = &config->mmiodevs[i];
@@ -69,12 +105,17 @@ static void tpm2_fixup(uint16_t vm_id)
 					vtpm2->laml = tpm2->laml;
 					vtpm2->lasa = dev->res[1].user_vm_pa;
 
-					/* update log buffer length/HPA in vm_config */
+					/*
+					 * Keep vm_config's TPM2 event-log resource in
+					 * host terms. The guest sees user_vm_pa in the
+					 * ACPI table; the hypervisor uses host_pa/size
+					 * when wiring the resource.
+					 */
 					dev->res[1].size = tpm2->laml;
 					dev->res[1].host_pa = tpm2->lasa;
 				}
 
-				/* update checksum */
+				/* ACPI consumers reject patched tables unless checksum is refreshed. */
 				vtpm2->header.checksum = 0;
 				checksum = calculate_checksum8(vtpm2, sizeof(struct acpi_table_tpm2));
 				vtpm2->header.checksum = checksum;
@@ -90,6 +131,12 @@ void security_vm_fixup(uint16_t vm_id)
 	struct acrn_vm_config *vm_config = get_vm_config(vm_id);
 	struct acrn_vm *vm = get_vm_from_vmid(vm_id);
 
+	/*
+	 * TPM2 table fixup is an early, static-firmware operation. Post-launched
+	 * VMs and ordinary pre-launched VMs keep their normal synthetic ACPI view.
+	 * pre_user_access()/post_user_access() bracket accesses to guest/module
+	 * memory that may be protected by SMAP on x86.
+	 */
 	if (((vm_config->guest_flags & GUEST_FLAG_SECURITY_VM) != 0UL) &&
 			is_prelaunched_vm(vm)) {
 		pre_user_access();
@@ -98,7 +145,24 @@ void security_vm_fixup(uint16_t vm_id)
 	}
 }
 
-/* Below are code for SMBIOS passthrough */
+/*
+ * SMBIOS passthrough design:
+ *
+ * The hypervisor does not virtualize individual SMBIOS structures here. It
+ * finds the host entry point, copies the referenced structure table into a
+ * fixed guest firmware range, rewrites the entry point to that guest GPA, and
+ * recalculates the required checksums.
+ *
+ *   host EPS -> host SMBIOS table
+ *      |              |
+ *      |              v
+ *      |        copy_to_gpa(VIRT_SMBIOS_TABLE_ADDR)
+ *      v
+ *   rewrite table address + checksum
+ *      |
+ *      v
+ *   copy_to_gpa(VIRT_SMBIOS_EPS_ADDR)
+ */
 
 /* The region after the first 64kb is currently not used. On some platforms,
  * there might be an TPM2 event log region starting from VIRT_ACPI_NVS_ADDR + 0xB0000.
@@ -194,6 +258,11 @@ static int copy_smbios_to_guest(struct acrn_vm *vm, struct smbios_info *si)
     int ret = 0;
     uint64_t gpa;
 
+    /*
+     * Copy the structure table before publishing the guest entry point. The
+     * entry point address fields must describe guest-visible GPAs, not host
+     * firmware HPAs, so checksums are regenerated after the rewrite.
+     */
     gpa = VIRT_SMBIOS_TABLE_ADDR;
     ret = copy_to_gpa(vm, si->smbios_table, gpa, si->smbios_table_size);
     if (ret == 0) {
@@ -260,6 +329,11 @@ static int probe_smbios_table(struct acrn_boot_info *abi, struct smbios_info *si
 {
     int found = 0;
 
+    /*
+     * Firmware discovery follows the platform boot path. UEFI exposes SMBIOS
+     * through configuration-table GUIDs; legacy boot keeps the EPS in the
+     * conventional BIOS search window.
+     */
     if (boot_from_uefi(abi)) {
         /* Get from EFI system table */
         uint64_t efi_system_tab_paddr = ((uint64_t)abi->uefi_info.systab_hi << 32) | ((uint64_t)abi->uefi_info.systab);
@@ -291,6 +365,11 @@ void passthrough_smbios(struct acrn_vm *vm, struct acrn_boot_info *abi)
     struct smbios_info si;
 	struct acrn_vm_config *vm_config = get_vm_config(vm->vm_id);
 
+    /*
+     * SMBIOS passthrough is limited to pre-launched Security VMs for the same
+     * reason as TPM2: the guest firmware image is static and can be patched
+     * before the VM observes it.
+     */
     if (is_prelaunched_vm(vm) && ((vm_config->guest_flags & GUEST_FLAG_SECURITY_VM) != 0)) {
         memset(&si, 0, sizeof(struct smbios_info));
 

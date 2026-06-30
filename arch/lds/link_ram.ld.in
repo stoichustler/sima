@@ -8,12 +8,42 @@ OUTPUT_ARCH(aarch64)
 ENTRY(_start)
 EXTERN(_start)
 
+/*
+ * 2026-06-30, ARM64 RAM-link principle:
+ *
+ * This script describes the virtual/physical RAM image expected by the early
+ * EL2 boot path. CONFIG_HV_RAM_START is the address where firmware/QEMU places
+ * the BEAU image, and the startup code uses the linker symbols below before C
+ * runtime services exist.
+ *
+ *   CONFIG_HV_RAM_START
+ *        |
+ *        v
+ *   .text.entry -> .text -> .rodata -> .rela -> .data -> .boot_stack -> .bss
+ *
+ * Keep the section order and exported symbols synchronized with
+ * arch/arm64/boot/cpu_entry.S, arch/arm64/boot/reloc.c, and ld_sym.h.
+ */
 SECTIONS
 {
+	/*
+	 * The location counter is the link-time address of the first byte in
+	 * the image. ARM64 reloc.c measures any actual load delta by comparing
+	 * the runtime address of _start against this configured base.
+	 */
 	. = CONFIG_HV_RAM_START;
 
+	/*
+	 * ld_ram_start/ld_ram_end bracket the full load image. Common boot code
+	 * uses this pair to describe image size without knowing each section.
+	 */
 	ld_ram_start = .;
 
+	/*
+	 * Keep the reset entry first so the CPU starts in code that can mask
+	 * exceptions, select SP_EL2, install VBAR_EL2, clear BSS, and create the
+	 * first stack before calling C code.
+	 */
 	.text : {
 		_text_start = .;
 		KEEP(*(.text.entry))
@@ -26,6 +56,10 @@ SECTIONS
 
 	. = ALIGN(0x1000);
 
+	/*
+	 * Read-only data sits on its own page boundary so later EL2 stage-1
+	 * mappings can assign text/data permissions at page granularity.
+	 */
 	.rodata : {
 		_rodata_start = .;
 		*(.rodata)
@@ -36,6 +70,11 @@ SECTIONS
 
 	. = ALIGN(0x1000);
 
+	/*
+	 * Relocation and dynamic records are grouped even though the first-stage
+	 * ARM64 port does not apply dynamic relocations yet. Keeping the records
+	 * in a known range avoids mixing metadata into writable runtime data.
+	 */
 	.rela : {
 		*(.rela)
 		*(.rela.*)
@@ -44,6 +83,11 @@ SECTIONS
 
 	. = ALIGN(0x1000);
 
+	/*
+	 * Writable initialized data follows another page boundary. Objects that
+	 * request .data.page_aligned are placed first so page-table-like data can
+	 * keep its alignment contract after linking.
+	 */
 	.data : {
 		_data_start = .;
 		*(.data.page_aligned)
@@ -55,6 +99,11 @@ SECTIONS
 
 	. = ALIGN(0x1000);
 
+	/*
+	 * The BSP uses this temporary full-descending stack only long enough to
+	 * enter C and build the per-pCPU stack model. _boot_stack_end is the
+	 * initial SP_EL2 value written by cpu_entry.S.
+	 */
 	.boot_stack : {
 		_boot_stack_start = .;
 		. += 0x1000;
@@ -64,6 +113,11 @@ SECTIONS
 
 	. = ALIGN(0x1000);
 
+	/*
+	 * NOLOAD keeps zero-initialized storage out of the file image. The entry
+	 * code clears [_bss_start, _bss_end) explicitly before C code observes
+	 * globals, so the binary stays small while runtime state is still clean.
+	 */
 	.bss (NOLOAD) : {
 		_bss_start = .;
 		*(.bss)
@@ -75,5 +129,6 @@ SECTIONS
 
 	. = ALIGN(0x1000);
 
+	/* End of the linked RAM footprint, rounded up for page-table mappings. */
 	ld_ram_end = .;
 }

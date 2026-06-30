@@ -34,6 +34,29 @@ static int nr_rsvd_regions;
  *
  * This file owns only the EL2 stage-1 map. Guest memory isolation is built in
  * arch/arm64/guest/vm.c so the two regimes stay independently auditable.
+ *
+ * 2026-06-30 ARM64 MMU principle:
+ *
+ * Software issues virtual addresses. The MMU first looks for a cached
+ * translation in the TLB; on a miss, its table-walk unit reads translation
+ * table descriptors from memory. Even BEAU's identity map must go through this
+ * machinery after SCTLR_EL2.M is set:
+ *
+ *   EL2 VA/HVA
+ *      |
+ *      v
+ *   +-----+     hit      +----------------+
+ *   | TLB | -----------> | HPA + attrs    |
+ *   +-----+              +----------------+
+ *      |
+ *      | miss
+ *      v
+ *   +------------+       +----------------+
+ *   | table walk | ----> | page tables    |
+ *   +------------+       +----------------+
+ *
+ * Identity mapping keeps the address numbers equal; the descriptors still
+ * provide memory type, shareability, access flag, and execute permissions.
  */
 #ifdef CONFIG_LOG_VERBOSE
 static void log_host_map(const char *name, uint64_t vaddr, uint64_t paddr, uint64_t size)
@@ -127,8 +150,16 @@ static inline void ppt_set_pgentry(uint64_t *pte, uint64_t page, uint64_t prot,
 	uint64_t prot_tmp;
 
 	if (!is_leaf) {
+		/*
+		 * Non-leaf descriptors only point to the next table level. They
+		 * do not describe RAM/MMIO permissions for a final translation.
+		 */
 		prot_tmp = PAGE_TABLE_DESC;
 	} else {
+		/*
+		 * Leaf descriptors terminate the walk. Level 1/2 can use block
+		 * mappings; level 0 must be a page descriptor in this walker.
+		 */
 		prot_tmp = (prot & ~PAGE_DESC_TYPE_MASK) | arm64_leaf_desc_type(level) | PAGE_AF;
 		if ((prot_tmp & (PAGE_ATTR_IDX_DEVICE | PAGE_ATTR_NORMAL)) == 0UL) {
 			prot_tmp |= PAGE_ATTR_NORMAL;
@@ -199,6 +230,15 @@ static void init_hv_mapping(void)
 	 * image. This keeps early boot, exception vectors, memcpy, and MMIO helpers
 	 * using direct physical-looking addresses without giving reserved firmware
 	 * memory or ordinary RAM unintended execute permission.
+	 *
+	 * Attribute ownership:
+	 *
+	 *   MMIO      -> Device memory: ordered enough for registers, never execute.
+	 *   RAM       -> Normal cacheable memory: fast data access, initially XN.
+	 *   HV image  -> Same VA==PA range, but code must be executable.
+	 *
+	 * The page-table output address can be the same for all three cases only
+	 * because the descriptor attributes carry the real memory-management policy.
 	 */
 	mmio_regions = arm64_get_platform_mmio_regions(&mmio_region_count);
 	for (idx = 0U; idx < mmio_region_count; idx++) {
@@ -246,9 +286,15 @@ void enable_paging(void)
 	uint64_t sctlr;
 
 	/*
-	 * Program EL2 translation controls before setting SCTLR.M. The local TLB
-	 * flush ensures no stale translation survives a rebuild of the bootstrap
-	 * page table.
+	 * Program EL2 translation controls before setting SCTLR.M:
+	 *
+	 *   MAIR_EL2  names AttrIndx encodings used by descriptors.
+	 *   TCR_EL2   selects the VA size, granule, cacheability, and PA size.
+	 *   TTBR0_EL2 points the table-walk unit at BEAU's root table.
+	 *   SCTLR_EL2.M enables translation; C/I enable data and instruction cache.
+	 *
+	 * The local TLB flush ensures no stale translation survives a rebuild of
+	 * the bootstrap page table before the MMU begins using it.
 	 */
 	write_mair_el2(MAIR_EL2_VALUE);
 	write_tcr_el2(TCR_EL2_VALUE);

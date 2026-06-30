@@ -28,6 +28,8 @@
 #include <asm/guest/vgicv3.h>
 
 /*
+ * 2026-06-30, vCPU exit principle:
+ *
  * Guest exits are entered from the EL2 vector table. Assembly saves the live
  * CPU state into a temporary struct cpu_regs frame on the vCPU thread stack;
  * this file converts that architectural exit state into common ACRN concepts
@@ -538,6 +540,13 @@ static int32_t handle_mmio_abort(struct acrn_vcpu *vcpu)
 		mmio->direction = ACRN_IOREQ_DIR_READ;
 	}
 
+	/*
+	 * Performance bottleneck: every device MMIO access on an unmapped IPA
+	 * takes a full EL1->EL2 exit, handler lookup, device emulation, register
+	 * writeback, and ERET. Guest console and GIC polling loops can therefore
+	 * dominate boot/runtime cost here even when each emulated register access
+	 * is individually simple.
+	 */
 	ret = emulate_io(vcpu, io_req);
 	if (ret == 0) {
 		if (((esr & ESR_DABT_WNR) == 0UL) && (reg != NULL)) {

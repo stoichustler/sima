@@ -20,6 +20,8 @@
 #include "vgicv3_its.h"
 
 /*
+ * 2026-06-30, ITS virtualization principle:
+ *
  * vITS model:
  *
  * The ITS is a message-to-LPI translation unit. It owns GITS_* MMIO state, the
@@ -495,6 +497,11 @@ static bool vits_process_command_queue(struct acrn_vm *vm, struct arm64_vgicv3 *
 		return false;
 	}
 
+	/*
+	 * Performance bottleneck: command consumption runs while the VM vGIC lock
+	 * is held by the caller. Large MSI/LPI setup bursts therefore serialize
+	 * interrupt injection and GIC MMIO emulation until this bounded batch ends.
+	 */
 	while ((reader != writer) && (processed < GITS_CMD_QUEUE_BUDGET)) {
 		uint64_t cmd[4];
 

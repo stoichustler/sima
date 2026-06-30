@@ -23,6 +23,21 @@
 #include <spinlock.h>
 #include <asm/guest/vm.h>
 
+/*
+ * 2026-06-30, console ownership principle:
+ *
+ * The host has one physical serial stream, but BEAU must multiplex three
+ * roles on top of it: the hypervisor shell, the selected VM console, and
+ * background VM output. console_vmid is the ownership switch:
+ *
+ *   ACRN_INVALID_VMID  -> BEAU shell owns host input/output
+ *   VM id             -> that VM owns host input; its TX ring drains to host
+ *
+ * Guest TX does not write directly to the serial driver. vPL011/vUART pushes
+ * bytes into a per-VM ring, and the periodic console kick drains only the
+ * selected VM. Non-selected VMs keep buffering output for later diagnostics or
+ * vsh replay, which prevents one noisy guest from stealing the BEAU shell.
+ */
 struct hv_timer console_timer;
 
 #define CONSOLE_KICK_TIMER_TIMEOUT  5UL /* timeout is 5ms */
@@ -38,6 +53,11 @@ struct hv_timer console_timer;
 #if ((CONFIG_VM_CONSOLE_RINGBUF_SIZE & (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)) != 0U)
 #error "CONFIG_VM_CONSOLE_RINGBUF_SIZE must be a power of two"
 #endif
+/*
+ * Power-of-two rings use monotonic producer/consumer indexes and mask only
+ * when indexing the backing array. One byte is intentionally left unused so
+ * empty and full states are distinguishable from prod == cons style checks.
+ */
 #define VM_CONSOLE_RINGBUF_MASK     (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_RINGBUF_CAPACITY (CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1U)
 #ifndef CONFIG_VM_CONSOLE_DRAIN_BUDGET
@@ -88,6 +108,20 @@ uint16_t console_vmid = CONFIG_CONSOLE_DEFAULT_VM;
 uint16_t console_loglevel = CONFIG_CONSOLE_LOGLEVEL_DEFAULT;
 static spinlock_t console_log_lock;
 
+/*
+ * VM console output ring:
+ *
+ * prod/cons are monotonic counters, not bounded array indexes. Writers keep
+ * the newest CONFIG_VM_CONSOLE_RINGBUF_SIZE - 1 bytes by advancing cons on
+ * overflow. That drop-oldest policy is intentional for boot logs: recent guest
+ * failures are more useful than preserving stale early output at the cost of
+ * hiding the current prompt.
+ *
+ * pending marks queued bytes for shell diagnostics. draining prevents nested
+ * timer/vsh paths from replaying the same VM stream concurrently. line_start,
+ * last_cr, and terminal_query_* are host-serial presentation state used while
+ * adding VM prefixes and hiding terminal cursor-position probes.
+ */
 struct vm_console_ringbuf {
 	spinlock_t lock;
 	uint32_t cons;
@@ -124,6 +158,13 @@ struct vm_exception_ringbuf {
 
 static struct vm_console_ringbuf vm_console_ringbufs[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
 static struct vm_exception_ringbuf vm_exception_ringbufs[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
+/*
+ * Host-to-VM input is staged separately from the guest RX FIFO. The console
+ * timer first collects host serial bytes into this small backlog, then feeds
+ * at most VM_CONSOLE_RX_BUDGET bytes into the selected VM while the backend RX
+ * FIFO is below VM_CONSOLE_RX_LOW_WATERMARK. This keeps held keys from turning
+ * the timer callback into an unbounded UART-injection loop.
+ */
 static char vm_console_input_backlog[CONFIG_VM_CONSOLE_INPUT_BACKLOG_SIZE];
 static uint32_t vm_console_input_cons;
 static uint32_t vm_console_input_prod;
@@ -201,6 +242,12 @@ static void console_vm_ring_put(uint16_t vmid, char ch)
 	if (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM) {
 		rb = &vm_console_ringbufs[vmid];
 		spinlock_irqsave_obtain(&rb->lock, &rflags);
+		/*
+		 * TX can be called from guest MMIO exits on different pCPUs.
+		 * Serialize ring state here, but do not write host serial under
+		 * this producer lock; slow serial output is handled by the drain
+		 * side so guest TX exits remain bounded.
+		 */
 		rb->input_bytes++;
 		prod = rb->prod;
 		rb->buf[prod & VM_CONSOLE_RINGBUF_MASK] = ch;
@@ -350,6 +397,11 @@ static void console_vm_input_collect(uint16_t target_vmid)
 	char ch = -1;
 
 	console_vm_input_sync(target_vmid);
+	/*
+	 * Host serial input is polled in bounded chunks. Ctrl-D is consumed by
+	 * the multiplexer itself, not forwarded to the guest, because it changes
+	 * ownership back to the BEAU shell.
+	 */
 	while (budget > 0U) {
 		ch = serial_getc();
 		if (ch == -1) {
@@ -380,6 +432,11 @@ static bool console_vm_input_push_to_guest(struct acrn_vuart *vu)
 		target_vmid = vu->vm->vm_id;
 		if ((console_vmid == target_vmid) && (vm_console_input_guest_budget > 0U)) {
 			console_vm_input_sync(target_vmid);
+			/*
+			 * Keep the guest RX FIFO shallow. vPL011/vUART will ask
+			 * for another refill when the guest consumes DR, so input
+			 * stays ordered without flooding RX IRQ handling.
+			 */
 			if (!console_vm_input_empty() &&
 				(vuart_rx_numchars(vu) < VM_CONSOLE_RX_LOW_WATERMARK)) {
 				ch = console_vm_input_peek();
@@ -461,6 +518,11 @@ void console_vm_exception_log(uint16_t vmid, const char *buf, size_t len)
 	if ((buf != NULL) && (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM)) {
 		rb = &vm_exception_ringbufs[vmid];
 		spinlock_irqsave_obtain(&rb->lock, &rflags);
+		/*
+		 * Exception logs use a separate ring from normal console TX so
+		 * trap/oops evidence survives even when a guest fills its normal
+		 * PL011 output ring with noisy boot or stall messages.
+		 */
 		for (size_t i = 0U; i < len; i++) {
 			rb->input_bytes++;
 			prod = rb->prod;
@@ -637,6 +699,11 @@ static bool console_vm_ring_drain_begin(struct vm_console_ringbuf *rb)
 	bool draining;
 
 	spinlock_irqsave_obtain(&rb->lock, &rflags);
+	/*
+	 * The timer path, Ctrl-D switch path, and vsh command can all request a
+	 * drain. One active drain is enough because it claims bytes by advancing
+	 * cons; nested drains would only interleave prefixes and serial writes.
+	 */
 	draining = rb->draining;
 	if (!draining) {
 		rb->draining = true;
@@ -665,6 +732,11 @@ static uint32_t console_vm_ring_claim(struct vm_console_ringbuf *rb, char *buf, 
 	spinlock_irqsave_obtain(&rb->lock, &rflags);
 	count = rb->prod - rb->cons;
 	if (count > VM_CONSOLE_RINGBUF_CAPACITY) {
+		/*
+		 * A producer may have advanced beyond capacity before this drain
+		 * snapshot. Clamp to the newest valid window before copying so
+		 * the reader never replays bytes that have already been dropped.
+		 */
 		rb->cons = rb->prod - VM_CONSOLE_RINGBUF_CAPACITY;
 		count = VM_CONSOLE_RINGBUF_CAPACITY;
 	}
@@ -803,6 +875,11 @@ static void console_vm_ring_write_prefixed(uint16_t vmid, struct vm_console_ring
 	uint32_t out_len = 0U;
 	size_t prefix_len;
 
+	/*
+	 * vsh is a multiplexed debug console rather than a transparent terminal.
+	 * Prefix each visible guest line so interleaved host/guest diagnostics can
+	 * still be attributed after copying logs from a single serial stream.
+	 */
 	(void)snprintf(prefix, sizeof(prefix), "[vmid %u] ", vmid);
 	prefix_len = strnlen_s(prefix, sizeof(prefix));
 
@@ -865,6 +942,13 @@ bool console_vm_kick(void)
 	bool handled = !console_is_hv();
 
 	if (handled) {
+		/*
+		 * One periodic kick performs both directions for the selected VM:
+		 * host serial input is collected and injected into vUART first,
+		 * then guest TX backlog is drained to host serial. If the selected
+		 * vUART is no longer active, input state is reset so stale host
+		 * bytes cannot leak into a later VM selection.
+		 */
 		console_vm_input_sync(console_vmid);
 		vu = vuart_console_active();
 		vuart_console_rx_chars(vu);
@@ -890,6 +974,12 @@ void console_setup_timer(void)
 {
 	uint64_t period_in_cycle, fire_tsc;
 
+	/*
+	 * The console timer is the pacing boundary for shell and VM console work.
+	 * Keeping it periodic avoids doing slow serial output directly in guest
+	 * MMIO exits, while the 5ms cadence keeps vsh input/output responsive
+	 * enough for interactive debugging.
+	 */
 	period_in_cycle = TICKS_PER_MS * CONSOLE_KICK_TIMER_TIMEOUT;
 	fire_tsc = cpu_ticks() + period_in_cycle;
 	initialize_timer(&console_timer,

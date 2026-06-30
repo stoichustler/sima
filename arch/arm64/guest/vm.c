@@ -21,6 +21,8 @@
 #include <asm/guest/vpl011.h>
 
 /*
+ * 2026-06-30, VM/stage-2 principle:
+ *
  * VM memory virtualization is intentionally split from host MMU setup:
  * host stage-1 maps the hypervisor world, while each VM owns a stage-2 root
  * that translates guest IPAs into configured host physical memory. The QEMU
@@ -28,6 +30,9 @@
  *
  * Device windows such as vGIC and vPL011 are not mapped as RAM. They are left
  * unmapped at stage-2 so guest accesses trap into the common vio MMIO path.
+ *
+ *   VM config RAM window -> stage-2 identity map -> EL1 normal memory
+ *   VM config device IPA -> no stage-2 leaf map  -> data abort -> vio MMIO
  */
 #define ARM64_STAGE2_PAGES_PER_VM	64UL
 #define ARM64_STAGE2_PAGE_NUM		(CONFIG_MAX_VM_NUM * ARM64_STAGE2_PAGES_PER_VM)

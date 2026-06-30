@@ -53,11 +53,22 @@
 #include "vgicv3_its.h"
 
 /*
+ * 2026-06-30, interrupt virtualization coverage:
+ *
  * vGICv3 virtualization principle:
  *
  * The guest sees a GIC Distributor, Redistributors, CPU interface, and optional
  * ITS. EL2 backs that view with software descriptors and uses hardware list
  * registers only as a short-lived delivery cache for the currently loaded vCPU.
+ * Arm names the CPU-interface register groups by owner:
+ *
+ *   ICC_* : physical CPU interface used by EL2 for host IRQs
+ *   ICH_* : EL2 virtualization controls, LR state, VMCR/AP state
+ *   ICV_* : EL1 virtual CPU interface selected by HCR_EL2 routing
+ *
+ * Guest code normally uses the ICC_* instruction encodings. With HCR_EL2.IMO
+ * and HCR_EL2.FMO set, eligible EL1 accesses reach the ICV view instead, while
+ * BEAU traps only the SGI/control paths that need software policy.
  *
  *   authoritative software model              hardware delivery cache
  *   +-----------------------------+   flush   +-----------------------------+
@@ -576,6 +587,12 @@ static void vgicv3_write_lrs(const struct arm64_vgicv3_vcpu_ctx *ctx)
 	uint32_t idx;
 	uint32_t count = min_u32(vgic_lr_count, ARM64_VGIC_MAX_LRS);
 
+	/*
+	 * List registers do not name a target vCPU. Hardware treats every LR as
+	 * belonging to the vPE currently scheduled on this physical PE, so LR
+	 * load/save is part of the vCPU context switch rather than a global routing
+	 * operation.
+	 */
 	for (idx = 0U; idx < count; idx++) {
 		write_ich_lr_el2((uint8_t)idx, (idx < ctx->used_lrs) ? ctx->lr[idx] : 0UL);
 	}
@@ -584,16 +601,17 @@ static void vgicv3_write_lrs(const struct arm64_vgicv3_vcpu_ctx *ctx)
 static uint64_t vgicv3_control_hcr(uint64_t hcr)
 {
 	/*
-	 * 2026-06-27, vGICv3 CPU-interface boundary:
+	 * 2026-06-30, vGICv3 CPU-interface boundary:
 	 *
-	 *   EL1 IAR/EOIR/PMR/IGRPEN -> hardware virtual CPU interface
-	 *   EL1 SGI sysreg          -> HCR_EL2.IMO/FMO trap -> software SGI inject
+	 *   EL1 IAR/EOIR/PMR/IGRPEN -> ICV view backed by ICH_VMCR/AP/LRs
+	 *   EL1 SGI sysreg          -> sysreg trap -> software SGI inject
+	 *   maintenance PPI25       -> ICH_HCR condition reported in ICH_MISR
 	 *
-	 * ICH_HCR.TC traps common ICC registers, but BEAU does not need that for
-	 * Linux timer delivery leaves it clear. Keep common ICC accesses on
-	 * the hardware virtual interface and sync the live VMCR back instead.
-	 * EOIcount is a hardware-reported completion count, not persistent control
-	 * state, so it must not be replayed either.
+	 * ICH_HCR_EL2 controls the virtual CPU interface for the current pPE.
+	 * BEAU leaves TC clear so common guest ICC accesses stay on the hardware
+	 * virtual interface, then syncs VMCR/AP/LR state at explicit boundaries.
+	 * EOIcount is hardware-reported completion evidence, not persistent control
+	 * state, so it must not be replayed.
 	 */
 	return (hcr & ~(ICH_HCR_EOICOUNT_MASK | ICH_HCR_TC)) | ICH_HCR_EN;
 }
@@ -1192,9 +1210,10 @@ void arm64_vgicv3_load_vcpu(struct acrn_vcpu *vcpu)
 	struct arm64_vgicv3_vcpu_ctx *ctx = &vcpu->arch.vgic;
 
 	/*
-	 * Program the EL1-visible GIC CPU interface and then enable the virtual
-	 * control interface. LRs must be written before ICH_HCR.EN so pending
-	 * virtual interrupts are observable as soon as the guest resumes.
+	 * Program the EL1-visible virtual CPU interface and then enable ICH_HCR.
+	 * Context switching a vPE includes VMCR, active priorities, and pending LR
+	 * entries; LRs must be written before ICH_HCR.EN so pending virtual
+	 * interrupts are observable as soon as the guest resumes.
 	 */
 	write_icc_sre_el1(ctx->sre | ICC_SRE_SRE);
 	vgicv3_write_cpuif(ctx);
@@ -1384,6 +1403,11 @@ static void vgicv3_sync_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 		vgicv3_complete_eoi_lrs(vcpu, eoi_lrs, old_lrs, old_used_lrs);
 	}
 
+	/*
+	 * Performance bottleneck: sync reconciles hardware LR evidence with the
+	 * software descriptor model while the vGIC lock is normally held. Frequent
+	 * timer/IPI exits pay this LR walk before new interrupts can be flushed.
+	 */
 	for (idx = 0U; idx < old_used_lrs; idx++) {
 		uint64_t old_lr = old_lrs[idx];
 		uint32_t virq;
@@ -1834,6 +1858,12 @@ static void vgicv3_flush_vcpu(struct acrn_vcpu *vcpu, bool is_current)
 	 */
 	ctx->hcr &= ~ICH_HCR_UIE;
 
+	/*
+	 * Performance bottleneck: flush scans pending bitmap words, performs a
+	 * descriptor deliverability check, and linearly searches existing LRs for
+	 * each candidate. Interrupt-heavy guests are bounded by this lock-protected
+	 * scan until enough LRs are free to publish pending virtual IRQs.
+	 */
 	for (word = 0U; word < ARM64_VGIC_WORDS; word++) {
 		uint32_t bits = vgic->pending_bitmap[vcpu->vcpu_id][word];
 
@@ -2263,6 +2293,8 @@ int32_t arm64_vgicv3_handle_sgi1r(struct acrn_vcpu *vcpu, uint64_t value)
 	 * Guest SGI sends are trapped from ICC_SGI1R_EL1 and translated into
 	 * per-target virtual IRQ injections. The current affinity model matches
 	 * the QEMU vMPIDR layout where vCPU IDs occupy affinity level 0.
+	 * Unlike LRs, ICC_SGI1R carries a target-list/affinity payload, so the
+	 * hypervisor must decode it before choosing each target vCPU descriptor.
 	 *
 	 *   ICC_SGI1R_EL1 trap -> target mask -> per-target inject
 	 *        -> kick running target vCPU
@@ -2300,6 +2332,8 @@ void arm64_vgicv3_maintenance_irq_handler(__unused uint32_t irq, __unused void *
 		 * Maintenance IRQs are the hardware notification that LR state
 		 * needs service. Read back guest-consumed state, then refill LRs
 		 * from software pending state while still on the running pCPU.
+		 * Arm reports this as a PPI; BEAU wires it as INTID 25 and uses
+		 * ICH_MISR/EISR/ELRSR snapshots to decide what software state changed.
 		 *
 		 *   maintenance PPI -> CPU interface snapshot
 		 *        -> sync LRs -> flush pending backlog
@@ -3414,6 +3448,9 @@ int32_t arm64_vgicv3_mmio_handler(struct io_request *io_req, void *handler_priva
 	 * MMIO can race with host-side virtual IRQ injection. The vGIC lock makes
 	 * guest register programming, LR readback, and software IRQ descriptors a
 	 * single coherent state transition.
+	 * GICD/GICR/GITS MMIO changes the guest-visible distributor model, not the
+	 * live virtual CPU interface directly; sync first so guest-completed LR
+	 * state is not overwritten by stale software descriptors.
 	 *
 	 *   data abort -> io_request -> vGIC lock -> sync
 	 *        -> emulate GICD/GICR/GITS -> flush if LR state changed

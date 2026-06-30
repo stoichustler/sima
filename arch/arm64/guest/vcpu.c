@@ -21,6 +21,8 @@
 #include <asm/guest/vgicv3.h>
 
 /*
+ * 2026-06-30, vCPU scheduling coverage:
+ *
  * vCPU virtualization principle:
  *
  * BEAU models each vCPU as a scheduler thread. The thread owns a durable guest

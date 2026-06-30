@@ -19,8 +19,59 @@
 #include <asm/security.h>
 #endif
 
+/*
+ * 2026-06-30, ARM64 host boot principle:
+ *
+ * Assembly entry performs only the EL2 state that must exist before C code can
+ * run: exception masking, SP_EL2 selection, vector-base installation, BSS
+ * clearing, and the first stack. The C path then builds the host in two phases:
+ * global BSP setup first, followed by common per-pCPU setup for both the BSP
+ * and APs.
+ *
+ *   _start
+ *      |
+ *      v
+ *   init_primary_pcpu()
+ *     - percpu identity
+ *     - early console
+ *     - EL2 stage-1 MMU
+ *     - early GIC
+ *     - switch to per-CPU stack
+ *      |
+ *      v
+ *   init_pcpu_comm_post()
+ *     - IRQ / SGI / timer
+ *     - scheduler
+ *     - shell on BSP
+ *     - VM launch after APs are running
+ *     - idle thread
+ *
+ * Secondary CPUs skip global setup: PSCI drops them into
+ * _start_secondary_psci(), they enable the already-built EL2 stage-1 map, and
+ * then join the same init_pcpu_comm_post() path.
+ */
 static void init_pcpu_comm_post(void);
 
+/*
+ * 2026-06-30, ARM64 BSP stack handoff principle:
+ *
+ * The boot CPU enters C on the temporary _boot_stack_end stack. After EL2
+ * stage-1 mappings and per-pCPU identity are ready, common pCPU setup should
+ * run on the BSP's own scheduler stack so IRQ, timer, scheduler, shell, and VM
+ * launch code all share the same per-CPU stack model used by secondary CPUs.
+ *
+ *   _boot_stack_end
+ *        |
+ *        v
+ *   SWITCH_TO(per_cpu(stack), init_pcpu_comm_post)
+ *        |
+ *        v
+ *   IRQ / timer / scheduler / idle use the pCPU stack
+ *
+ * The magic word seeds the bottom frame for host call-trace unwinding. The
+ * target path is expected to end in run_idle_thread() or a fatal path, not by
+ * returning to the temporary boot-stack flow.
+ */
 #define SWITCH_TO(sp, to)					\
 {											\
 	asm volatile (							\
@@ -103,6 +154,11 @@ void init_secondary_pcpu(uint64_t mpidr)
 
 static void init_guest_mode(uint16_t pcpu_id)
 {
+	/*
+	 * VM launch is intentionally after IRQ, timer, scheduler, and AP bring-up.
+	 * Static VM creation builds vCPU scheduler threads; those threads must be
+	 * bound to initialized per-pCPU scheduler state before any guest can run.
+	 */
 	launch_vms(pcpu_id);
 }
 

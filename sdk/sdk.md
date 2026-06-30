@@ -45,6 +45,11 @@ that approved DTS change.
 
 ## ARM64 Development Status
 
+For a first-pass implementation reading path, start with
+`sdk/arm64-walkthrough.md`. It follows the ARM64 flow from EL2 entry through
+VM creation, vCPU entry/exit, stage-2 memory, vGIC/vtimer virtualization, and
+console debugging.
+
 The ARM64 bring-up currently targets QEMU `virt` for the standard manual
 validation path and rk356x for hardware-platform bring-up. QEMU uses
 `qemu-system-aarch64` with the `virt` machine, GICv3, EL2 virtualization

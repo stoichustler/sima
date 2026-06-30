@@ -1178,6 +1178,15 @@ static bool pcpu_is_shared_by_vcpus(uint16_t pcpu_id)
 	return false;
 }
 
+/*
+ * 2026-06-30, vcpus monitor:
+ *
+ * This command reports vCPU scheduler ownership, not guest CPU topology.
+ * It answers which pCPU owns each vCPU thread, whether that pCPU is shared by
+ * multiple vCPUs, and how long the vCPU has waited in its current state.
+ *
+ *   VM/vCPU -> scheduler thread -> pCPU binding -> latency snapshot
+ */
 static int32_t shell_list_vcpu(__unused int32_t argc, __unused char **argv)
 {
 	char temp_str[MAX_STR_SIZE];
@@ -1247,6 +1256,15 @@ static const char *thread_state_str(enum thread_object_state state)
 	return str;
 }
 
+/*
+ * 2026-06-30, threads monitor:
+ *
+ * This is the scheduler-wide inventory behind the VM-centric commands. It
+ * includes idle, shell, helper, and vCPU threads so a stuck VM can be compared
+ * with the actual runnable/current thread list on each pCPU.
+ *
+ *   scheduler thread list -> per-thread state -> per-pCPU current owner
+ */
 static int32_t shell_list_threads(__unused int32_t argc, __unused char **argv)
 {
 	const struct list_head *head = sched_get_thread_list();
@@ -1334,6 +1352,19 @@ static const struct shell_schedstat_thread_sample *shell_schedstat_find_thread_s
 	return NULL;
 }
 
+/*
+ * 2026-06-30, schedstat monitor:
+ *
+ * schedstat combines absolute scheduler counters with a two-sample runtime
+ * delta. The pCPU table shows whether ticks, reschedules, and switches are
+ * moving; the CPU-usage table shows which non-idle thread consumed the sample
+ * window since the previous schedstat command.
+ *
+ *   previous shell snapshot
+ *            |
+ *            v
+ *   current scheduler snapshot -> pCPU counters + per-thread runtime delta
+ */
 static void shell_schedstat_take_snapshot(struct shell_schedstat_snapshot *snapshot)
 {
 	const struct list_head *head = sched_get_thread_list();
@@ -1648,6 +1679,15 @@ static void shell_print_irq_cpu_counts(const struct irqstat_snapshot *snapshot,
 	shell_puts("\r\n");
 }
 
+/*
+ * 2026-06-30, irqstat monitor:
+ *
+ * irqstat is host-side interrupt accounting. It prints IRQ lines that either
+ * have a registered handler or have observed counts, then keeps the per-pCPU
+ * columns raw so interrupt affinity and unexpected routing stay visible.
+ *
+ *   irq_desc/action + per_cpu(irq_count) -> active/name + cpuN counts
+ */
 static int32_t shell_irqstat(int32_t argc, __unused char **argv)
 {
 	char temp_str[MAX_STR_SIZE];

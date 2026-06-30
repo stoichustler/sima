@@ -19,9 +19,21 @@ static struct arm64_irq_data irq_data[NR_IRQS];
 #define MAX_IRQ_DOMAIN_NAME_SIZE	32U
 
 /*
- * ARM64 separates source-local interrupt numbers from generic ACRN IRQ
- * numbers. Domains reserve contiguous ACRN IRQ ranges for CPU-local sources
- * and GIC INTIDs so common IRQ code can stay architecture-neutral.
+ * 2026-06-30, ARM64 IRQ-domain principle:
+ *
+ * Common IRQ code owns one flat ACRN IRQ namespace and uses it to index
+ * irq_desc_array[]. ARM64 hardware reports source-local numbers instead:
+ * CPU-local synthetic sources and GIC INTIDs. Those numbers can overlap, so
+ * raw source IDs must not be passed directly to request_irq() or do_irq().
+ *
+ *   source owner       source id        ACRN IRQ        common IRQ API
+ *   cpu-intc      +    local id    ->   base + id   ->   request_irq/do_irq
+ *   gicv3         +    INTID       ->   base + id   ->   request_irq/do_irq
+ *
+ * Register each domain once during IRQ setup, then use
+ * arm64_domain_get_acrn_irq(domain, source_id) whenever ARM64 code crosses
+ * into common IRQ APIs. Reverse translation is kept at ARM64 boundaries such
+ * as GIC enablement and debug naming.
  */
 struct arm64_irq_domain {
 	char name[MAX_IRQ_DOMAIN_NAME_SIZE];
@@ -56,6 +68,7 @@ uint32_t arm64_domain_get_acrn_irq(const char *name, uint32_t src_id)
 	uint32_t acrn_irq = IRQ_INVALID;
 	struct arm64_irq_domain *domain = find_domain_by_name(name);
 
+	/* Convert a domain-local source ID into the flat IRQ number used by core IRQ code. */
 	if ((domain != NULL) && (src_id < domain->irq_num)) {
 		acrn_irq = domain->base + src_id;
 	} else {

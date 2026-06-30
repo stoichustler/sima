@@ -12,9 +12,17 @@
 #include <errno.h>
 
 /*
+ * 2026-06-30, guest-memory principle:
+ *
  * Raw-image loading and guest-copy helpers use the same platform RAM window
  * that stage-2 maps in arch/arm64/guest/vm.c:
  *
+ *   copy_to/from_gpa()
+ *          |
+ *          v
+ *   validate GPA inside configured RAM window
+ *          |
+ *          v
  *   guest IPA/GPA = guest_ram_start + offset
  *   host PA       = guest_ram_hpa   + offset
  *

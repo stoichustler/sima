@@ -24,6 +24,12 @@ for mixed RTOS and Linux guests.
 └──────────────┴───────────────┘
 ```
 
+## Learning Path
+
+Start with [sdk/arm64-walkthrough.md](sdk/arm64-walkthrough.md) for the ARM64
+implementation flow from EL2 entry through VM creation, vCPU entry/exit,
+stage-2 memory, vGIC/vtimer virtualization, and console debugging.
+
 ## Source Base And License
 
 Check [LICENSE](LICENSE)

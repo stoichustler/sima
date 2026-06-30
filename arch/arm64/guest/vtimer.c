@@ -40,6 +40,8 @@
 #include <asm/guest/vgicv3.h>
 
 /*
+ * 2026-06-30, timer virtualization coverage:
+ *
  * BEAU deliberately keeps the two EL1 timer views separate:
  *
  *   CNTV_*  -> guest virtual timer, interrupt PPI27

@@ -14,9 +14,13 @@
 	.globl arm64_run_vcpu
 arm64_run_vcpu:
 	/*
+	 * 2026-06-30, vCPU entry principle:
+	 *
 	 * Build the same cpu_regs frame that guest_vector_entry would have saved
 	 * on an exit. vcpu_exit_return then programs ELR_EL2/SPSR_EL2/SP_EL1 and
 	 * executes ERET, so first entry and trap return share one restore path.
+	 *
+	 *   vcpu->arch.regs -> thread-stack cpu_regs -> vcpu_exit_return -> ERET
 	 */
 	sub	sp, sp, #VCPU_RUN_STACK_SIZE
 	/* x16 is the source vCPU register frame, x17 is the temporary EL2 frame. */

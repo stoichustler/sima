@@ -727,6 +727,12 @@ hv_emulate_mmio(struct acrn_vcpu *vcpu, struct io_request *io_req)
 	address = mmio_req->address;
 	size = mmio_req->size;
 
+	/*
+	 * Performance bottleneck: trapped ARM64 MMIO reaches this path on every
+	 * data-abort device access. Handler selection is a linear scan under
+	 * emul_mmio_lock, so adding more emulated regions or a high-frequency
+	 * device increases latency before the actual device handler runs.
+	 */
 	spinlock_obtain(&vcpu->vm->emul_mmio_lock);
 	for (idx = 0U; idx <= vcpu->vm->nr_emul_mmio_regions; idx++) {
 		mmio_handler = &(vcpu->vm->emul_mmio[idx]);
