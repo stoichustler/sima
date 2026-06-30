@@ -27,6 +27,8 @@
 #define SHELL_ASCII_TAB		'\t'
 #define SHELL_ASCII_DEL		0x7fU
 #define SHELL_VT100_CLEAR_LINE	"\033[2K"
+#define SHELL_SCHEDSTAT_MAX_THREADS	((CONFIG_MAX_VM_NUM * MAX_VCPUS_PER_VM) + MAX_PCPU_NUM + 8U)
+#define SHELL_SCHEDSTAT_PERCENT_SCALE	1000UL
 
 char shell_log_buf[SHELL_LOG_BUF_SIZE];
 
@@ -134,6 +136,24 @@ static bool shell_prompt_enabled;
 static bool shell_input_active;
 
 static void shell_thread_main(__unused struct thread_object *obj);
+
+struct shell_schedstat_thread_sample {
+	const struct thread_object *thread;
+	uint64_t runtime_ticks;
+};
+
+struct shell_schedstat_snapshot {
+	bool valid;
+	bool overflow;
+	uint64_t sample_ticks;
+	uint64_t idle_runtime_ticks[MAX_PCPU_NUM];
+	bool idle_seen[MAX_PCPU_NUM];
+	uint32_t thread_count;
+	struct shell_schedstat_thread_sample thread[SHELL_SCHEDSTAT_MAX_THREADS];
+};
+
+static struct shell_schedstat_snapshot shell_schedstat_last;
+static struct shell_schedstat_snapshot shell_schedstat_sample;
 
 static int32_t string_to_argv(char *argv_str, void *p_argv_mem,
 		__unused uint32_t argv_mem_size,
@@ -1273,6 +1293,161 @@ static uint32_t shell_sched_runqueue_count(uint16_t pcpu_id)
 	return count;
 }
 
+static uint64_t shell_schedstat_delta(uint64_t current, uint64_t previous)
+{
+	return (current >= previous) ? (current - previous) : 0UL;
+}
+
+static void shell_schedstat_format_percent(char *buf, size_t size, uint64_t used_ticks,
+	uint64_t window_ticks)
+{
+	uint64_t permille;
+
+	if (window_ticks == 0UL) {
+		snprintf(buf, size, "0.0");
+		return;
+	}
+
+	if ((used_ticks >= window_ticks) || (used_ticks > (UINT64_MAX / SHELL_SCHEDSTAT_PERCENT_SCALE))) {
+		permille = SHELL_SCHEDSTAT_PERCENT_SCALE;
+	} else {
+		permille = (used_ticks * SHELL_SCHEDSTAT_PERCENT_SCALE) / window_ticks;
+		if (permille > SHELL_SCHEDSTAT_PERCENT_SCALE) {
+			permille = SHELL_SCHEDSTAT_PERCENT_SCALE;
+		}
+	}
+
+	snprintf(buf, size, "%lu.%01lu", permille / 10UL, permille % 10UL);
+}
+
+static const struct shell_schedstat_thread_sample *shell_schedstat_find_thread_sample(
+	const struct shell_schedstat_snapshot *snapshot, const struct thread_object *thread)
+{
+	uint32_t idx;
+
+	for (idx = 0U; idx < snapshot->thread_count; idx++) {
+		if (snapshot->thread[idx].thread == thread) {
+			return &snapshot->thread[idx];
+		}
+	}
+
+	return NULL;
+}
+
+static void shell_schedstat_take_snapshot(struct shell_schedstat_snapshot *snapshot)
+{
+	const struct list_head *head = sched_get_thread_list();
+	struct list_head *pos;
+
+	(void)memset(snapshot, 0U, sizeof(*snapshot));
+
+	list_for_each(pos, head) {
+		struct thread_object *thread = container_of(pos, struct thread_object, node);
+		struct sched_latency_stats stats = { 0U };
+		uint16_t pcpu_id = thread->pcpu_id;
+
+		sched_get_latency(thread, &stats);
+		if (snapshot->thread_count < SHELL_SCHEDSTAT_MAX_THREADS) {
+			snapshot->thread[snapshot->thread_count].thread = thread;
+			snapshot->thread[snapshot->thread_count].runtime_ticks = stats.runtime_ticks;
+			snapshot->thread_count++;
+		} else {
+			snapshot->overflow = true;
+		}
+
+		if ((pcpu_id < MAX_PCPU_NUM) && is_idle_thread(thread)) {
+			snapshot->idle_runtime_ticks[pcpu_id] = stats.runtime_ticks;
+			snapshot->idle_seen[pcpu_id] = true;
+		}
+	}
+
+	snapshot->sample_ticks = cpu_ticks();
+	snapshot->valid = true;
+}
+
+static void shell_schedstat_format_pcpu_busy(char *buf, size_t size, uint16_t pcpu_id,
+	uint64_t window_ticks)
+{
+	uint64_t idle_delta;
+	uint64_t idle_permille;
+	uint64_t busy_permille;
+
+	if (!shell_schedstat_last.valid ||
+		!shell_schedstat_sample.idle_seen[pcpu_id] ||
+		!shell_schedstat_last.idle_seen[pcpu_id] ||
+		(window_ticks == 0UL)) {
+		snprintf(buf, size, "0.0");
+		return;
+	}
+
+	idle_delta = shell_schedstat_delta(shell_schedstat_sample.idle_runtime_ticks[pcpu_id],
+		shell_schedstat_last.idle_runtime_ticks[pcpu_id]);
+	if ((idle_delta >= window_ticks) || (idle_delta > (UINT64_MAX / SHELL_SCHEDSTAT_PERCENT_SCALE))) {
+		idle_permille = SHELL_SCHEDSTAT_PERCENT_SCALE;
+	} else {
+		idle_permille = (idle_delta * SHELL_SCHEDSTAT_PERCENT_SCALE) / window_ticks;
+		if (idle_permille > SHELL_SCHEDSTAT_PERCENT_SCALE) {
+			idle_permille = SHELL_SCHEDSTAT_PERCENT_SCALE;
+		}
+	}
+
+	busy_permille = SHELL_SCHEDSTAT_PERCENT_SCALE - idle_permille;
+	snprintf(buf, size, "%lu.%01lu", busy_permille / 10UL, busy_permille % 10UL);
+}
+
+static void shell_schedstat_print_cpu_usage(const struct list_head *head, uint64_t window_ticks)
+{
+	struct list_head *pos;
+	char temp_str[MAX_STR_SIZE];
+
+	/*
+	 * 2026-06-30 scheduler stats:
+	 *   schedule() accumulates per-thread running ticks.
+	 *   schedstat keeps the last shell snapshot and prints deltas.
+	 *
+	 *   previous snapshot --delta window--> current snapshot
+	 *          runtime[N] ----------------> runtime[N] + run_delta
+	 */
+	shell_puts("\r\nCPU usage since previous schedstat:\r\n\r\n");
+	shell_puts("name             pcpu  state     cpu%   run.us\r\n");
+	shell_puts("───────────────  ────  ────────  ─────  ─────────\r\n");
+
+	list_for_each(pos, head) {
+		struct thread_object *thread = container_of(pos, struct thread_object, node);
+		const struct shell_schedstat_thread_sample *current;
+		const struct shell_schedstat_thread_sample *previous;
+		uint64_t run_delta;
+		char percent[16U];
+
+		if (is_idle_thread(thread)) {
+			continue;
+		}
+
+		current = shell_schedstat_find_thread_sample(&shell_schedstat_sample, thread);
+		previous = shell_schedstat_find_thread_sample(&shell_schedstat_last, thread);
+		if ((current == NULL) || (previous == NULL) || (window_ticks == 0UL)) {
+			snprintf(percent, sizeof(percent), "0.0");
+			run_delta = 0UL;
+		} else {
+			run_delta = shell_schedstat_delta(current->runtime_ticks, previous->runtime_ticks);
+			shell_schedstat_format_percent(percent, sizeof(percent), run_delta, window_ticks);
+		}
+
+		snprintf(temp_str, MAX_STR_SIZE,
+			"%-15s  %-4hu  %-8s  %-5s  %-9lu\r\n",
+			thread->name,
+			thread->pcpu_id,
+			thread_state_str(thread->status),
+			percent,
+			ticks_to_us(run_delta));
+		shell_puts(temp_str);
+	}
+
+	if (shell_schedstat_sample.overflow || shell_schedstat_last.overflow) {
+		shell_puts("\r\nwarning: schedstat thread sample overflow; cpu% may omit some threads.\r\n");
+	}
+}
+
 static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 {
 	const struct list_head *head = sched_get_thread_list();
@@ -1282,6 +1457,11 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 	uint16_t pcpu_num = get_pcpu_nums();
 	bool has_bvt_stats = false;
 	bool has_rtds_stats = false;
+	uint64_t window_ticks;
+
+	shell_schedstat_take_snapshot(&shell_schedstat_sample);
+	window_ticks = shell_schedstat_last.valid ?
+		shell_schedstat_delta(shell_schedstat_sample.sample_ticks, shell_schedstat_last.sample_ticks) : 0UL;
 
 	snprintf(temp_str, MAX_STR_SIZE,
 		"\r\nschedstat pcpus:%hu\r\n", pcpu_num);
@@ -1292,19 +1472,23 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 	 * context switches are happening, and which thread currently owns a CPU.
 	 */
 	shell_puts("\r\nPer-pCPU hybrid scheduler counters:\r\n\r\n");
-	shell_puts("pcpu  role       scheduler    timer   switches  resched  runqueue  current\r\n");
-	shell_puts("────  ─────────  ───────────  ──────  ────────  ───────  ────────  ─────────────────\r\n");
+	shell_puts("pcpu  role       scheduler    busy%  timer   switches  resched  runqueue  current\r\n");
+	shell_puts("────  ─────────  ───────────  ─────  ──────  ────────  ───────  ────────  ─────────────────\r\n");
 
 	for (pcpu_id = 0U; pcpu_id < pcpu_num; pcpu_id++) {
 		struct thread_object *current = sched_get_current(pcpu_id);
 		const char *name = (current != NULL) ? current->name : "-";
 		bool shared_pcpu = pcpu_is_shared_by_vcpus(pcpu_id);
+		char busy[16U];
+
+		shell_schedstat_format_pcpu_busy(busy, sizeof(busy), pcpu_id, window_ticks);
 
 		snprintf(temp_str, MAX_STR_SIZE,
-			"%-5hu %-10s %-12s %-7lu %-9lu %-8lu %-9u %s\r\n",
+			"%-5hu %-10s %-12s %-6s %-7lu %-9lu %-8lu %-9u %s\r\n",
 			pcpu_id,
 			shared_pcpu ? "shared" : "exclusive",
 			sched_get_scheduler_name(pcpu_id),
+			busy,
 			sched_get_ticks(pcpu_id),
 			sched_get_context_switches(pcpu_id),
 			sched_get_reschedule_requests(pcpu_id),
@@ -1312,6 +1496,8 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 			name);
 		shell_puts(temp_str);
 	}
+
+	shell_schedstat_print_cpu_usage(head, window_ticks);
 
 	list_for_each(pos, head) {
 		struct thread_object *thread = container_of(pos, struct thread_object, node);
@@ -1386,6 +1572,8 @@ static int32_t shell_schedstat(__unused int32_t argc, __unused char **argv)
 			}
 		}
 	}
+
+	shell_schedstat_last = shell_schedstat_sample;
 
 	return 0;
 }

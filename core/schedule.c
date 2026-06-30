@@ -63,6 +63,23 @@ static inline bool is_runnable_or_running(const struct thread_object *obj)
 	return (obj->status == THREAD_STS_RUNNING) || (obj->status == THREAD_STS_RUNNABLE);
 }
 
+/*
+ * Runtime accounting is tied to scheduler ownership:
+ *
+ *   switch-in at T0        switch-out at T1
+ *   RUNNING state_since -> runtime += T1 - T0
+ *
+ * Live readers add the current RUNNING delta without mutating scheduler state.
+ */
+static void sched_add_runtime(struct thread_object *obj, uint64_t ticks)
+{
+	if (ticks > (UINT64_MAX - obj->latency.runtime_ticks)) {
+		obj->latency.runtime_ticks = UINT64_MAX;
+	} else {
+		obj->latency.runtime_ticks += ticks;
+	}
+}
+
 static inline void set_thread_status(struct thread_object *obj, enum thread_object_state status)
 {
 	obj->status = status;
@@ -174,6 +191,9 @@ static void sched_mark_running(struct thread_object *obj, uint64_t now)
 
 static void sched_mark_not_running(struct thread_object *obj, uint64_t now, bool runnable)
 {
+	if (obj->latency.state_since != 0UL) {
+		sched_add_runtime(obj, now - obj->latency.state_since);
+	}
 	obj->latency.state_since = now;
 	obj->latency.runnable_since = runnable ? now : 0UL;
 }
@@ -354,6 +374,14 @@ void sched_get_latency(const struct thread_object *obj, struct sched_latency_sta
 
 			if (wait_ticks > stats->max_wait_ticks) {
 				stats->max_wait_ticks = wait_ticks;
+			}
+		} else if ((status == THREAD_STS_RUNNING) && (stats->state_since != 0UL)) {
+			uint64_t run_ticks = now - stats->state_since;
+
+			if (run_ticks > (UINT64_MAX - stats->runtime_ticks)) {
+				stats->runtime_ticks = UINT64_MAX;
+			} else {
+				stats->runtime_ticks += run_ticks;
 			}
 		}
 	}

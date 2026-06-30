@@ -150,9 +150,9 @@ used by another VM.
 Useful BEAU shell commands:
 
 - `vcpus`: VM/vCPU pCPU binding and state.
-- `schedstat`: scheduler algorithm plus per-pCPU timer, switch, reschedule,
-  runnable-thread, current-thread statistics, and BVT `weight`/`avt`/`evt`
-  thread stats when BVT is active.
+- `schedstat`: scheduler algorithm plus per-pCPU busy, timer, switch,
+  reschedule, runnable-thread, current-thread statistics, consecutive-sample
+  CPU usage, and BVT `weight`/`avt`/`evt` thread stats when BVT is active.
 - `mmap`: host stage-1 and VM stage-2 maps.
 - `dumpstat [vm id]`: ARM64 VM/vCPU register, scheduler state, raw guest stack,
   and saved host stack for the vCPU thread on its bound pCPU. Guest stack
@@ -168,10 +168,14 @@ Useful BEAU shell commands:
 
 - `timer`: scheduler timer callback count on the pCPU. It represents periodic
   opportunities to charge runtime and request rescheduling.
+- `busy%`: pCPU busy percentage since the previous `schedstat` capture. It is
+  derived from the idle thread runtime delta.
 - `switches`: number of times `schedule()` actually selected a different
   thread. A tick may not switch; wake/sleep/yield can also switch.
 - `resched`: number of requests raised through `make_reschedule_request()`.
 - `runqueue`: number of runnable threads currently bound to the pCPU.
+- `cpu%`/`run.us`: per-thread runtime delta over the same sample window. The
+  first `schedstat` capture has no previous sample, so it reports zero usage.
 - `weight`/`avt`/`evt`: BVT thread weight and virtual-time ordering values.
 
 ## Runtime Checklist

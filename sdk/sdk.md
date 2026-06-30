@@ -247,15 +247,22 @@ boot logs settle to show the `console:\>` prompt.
 - `vsh <vm id>` switches the serial console to a VM vPL011/vUART console.
   Ctrl-D switches back to the BEAU shell.
 - `schedstat` prints the scheduler algorithm and one physical-CPU row with
-  `pcpu`, scheduler `timer` callbacks, context `switches`, `resched` requests,
-  runnable-thread count, and current `thread`. When BVT is active, it also
-  prints a thread table with BVT `weight`, `avt`, and `evt`.
+  `pcpu`, scheduler `busy%`, `timer` callbacks, context `switches`, `resched`
+  requests, runnable-thread count, and current `thread`. It also prints CPU
+  usage for non-idle scheduler threads from the delta between consecutive
+  `schedstat` samples. When BVT is active, it also prints a thread table with
+  BVT `weight`, `avt`, and `evt`.
+  - `busy%` is the pCPU busy percentage over the previous `schedstat` sample
+    window, derived from the idle thread runtime delta.
   - `timer` is the number of scheduler timer callbacks observed on that pCPU.
   - `switches` is the number of times `schedule()` actually selected a
     different thread.
   - `resched` counts requests raised through `make_reschedule_request()`,
     including tick, wake, yield, and remote reschedule paths.
   - `runqueue` is the current count of runnable threads bound to that pCPU.
+  - `cpu%` and `run.us` in the CPU usage table are per-thread running-time
+    deltas over the same sample window; the first `schedstat` capture has no
+    previous sample, so it reports `0.0` and zero runtime deltas.
   - `weight`, `avt`, and `evt` expose BVT share and virtual-time ordering;
     running threads are sampled against current host ticks for a live view.
 
@@ -399,6 +406,7 @@ captures during boot, reboot, or VM2 latency work:
   - `role`: `shared` means more than one vCPU is bound to the pCPU; `exclusive`
     means no vCPU sharing was detected there.
   - `scheduler`: active scheduler implementation on that pCPU.
+  - `busy%`: pCPU busy percentage since the previous `schedstat` capture.
   - `timer`: scheduler timer callback count.
   - `switches`: context switches where `schedule()` selected a different
     thread.
@@ -406,6 +414,14 @@ captures during boot, reboot, or VM2 latency work:
     reschedule paths.
   - `runqueue`: runnable threads currently bound to the pCPU.
   - `current`: thread currently selected on that pCPU.
+- `schedstat` CPU usage table:
+  - `window.us`: sample duration between the current and previous `schedstat`
+    command.
+  - `cpu%`: non-idle thread runtime delta divided by `window.us` on its bound
+    pCPU.
+  - `run.us`: non-idle thread runtime delta in microseconds for that sample.
+    The first `schedstat` capture reports zero usage because no previous
+    sample exists yet.
 - `schedstat` BVT table:
   - `weight`: BVT CPU share. Higher weight advances virtual time more slowly.
   - `avt`: actual virtual time used for long-term fairness.

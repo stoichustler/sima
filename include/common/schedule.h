@@ -50,6 +50,7 @@ struct sched_latency_stats {
 	uint64_t max_wait_ticks;
 	uint64_t state_since;
 	uint64_t runnable_since;
+	uint64_t runtime_ticks;
 };
 
 struct sched_bvt_stats {
