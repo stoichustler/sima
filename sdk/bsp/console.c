@@ -40,7 +40,10 @@
  */
 struct hv_timer console_timer;
 
-#define CONSOLE_KICK_TIMER_TIMEOUT  5UL /* timeout is 5ms */
+#ifndef CONFIG_CONSOLE_KICK_TIMER_TIMEOUT
+#define CONFIG_CONSOLE_KICK_TIMER_TIMEOUT 2UL
+#endif
+#define CONSOLE_KICK_TIMER_TIMEOUT CONFIG_CONSOLE_KICK_TIMER_TIMEOUT
 #ifndef CONFIG_VM_CONSOLE_RINGBUF_SIZE
 #define CONFIG_VM_CONSOLE_RINGBUF_SIZE  4096U
 #endif
@@ -73,7 +76,7 @@ struct hv_timer console_timer;
 #endif
 #define VM_CONSOLE_DRAIN_BURST_THRESHOLD CONFIG_VM_CONSOLE_DRAIN_BURST_THRESHOLD
 #ifndef CONFIG_VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET
-#define CONFIG_VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET 256U
+#define CONFIG_VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET 512U
 #endif
 #define VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET CONFIG_VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET
 #ifndef CONFIG_VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET
@@ -81,7 +84,7 @@ struct hv_timer console_timer;
 #endif
 #define VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET CONFIG_VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET
 #ifndef CONFIG_VM_CONSOLE_RX_BUDGET
-#define CONFIG_VM_CONSOLE_RX_BUDGET 4U
+#define CONFIG_VM_CONSOLE_RX_BUDGET 32U
 #endif
 #define VM_CONSOLE_RX_BUDGET CONFIG_VM_CONSOLE_RX_BUDGET
 #ifndef CONFIG_VM_CONSOLE_RX_LOW_WATERMARK
@@ -109,6 +112,16 @@ struct hv_timer console_timer;
 #define VM_CONSOLE_EXCEPTION_RINGBUF_SIZE 4096U
 #define VM_CONSOLE_EXCEPTION_RINGBUF_MASK (VM_CONSOLE_EXCEPTION_RINGBUF_SIZE - 1U)
 #define VM_CONSOLE_EXCEPTION_RINGBUF_CAPACITY (VM_CONSOLE_EXCEPTION_RINGBUF_SIZE - 1U)
+#ifndef CONFIG_VM_CONSOLE_TX_BACKPRESSURE_HIGH_WATER
+#define CONFIG_VM_CONSOLE_TX_BACKPRESSURE_HIGH_WATER \
+	((VM_CONSOLE_RINGBUF_CAPACITY * 7U) / 8U)
+#endif
+#ifndef CONFIG_VM_CONSOLE_TX_BACKPRESSURE_LOW_WATER
+#define CONFIG_VM_CONSOLE_TX_BACKPRESSURE_LOW_WATER \
+	((VM_CONSOLE_RINGBUF_CAPACITY * 3U) / 4U)
+#endif
+#define VM_CONSOLE_TX_BACKPRESSURE_HIGH_WATER CONFIG_VM_CONSOLE_TX_BACKPRESSURE_HIGH_WATER
+#define VM_CONSOLE_TX_BACKPRESSURE_LOW_WATER CONFIG_VM_CONSOLE_TX_BACKPRESSURE_LOW_WATER
 /* Switching key combinations for shell and uart console */
 #define GUEST_CONSOLE_TO_HV_SWITCH_KEY  0x4U /* Ctrl-D */
 uint16_t console_vmid = CONFIG_CONSOLE_DEFAULT_VM;
@@ -170,6 +183,7 @@ struct vm_exception_ringbuf {
 
 static struct vm_console_ringbuf vm_console_ringbufs[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
 static struct vm_exception_ringbuf vm_exception_ringbufs[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
+static bool vm_console_tx_blocked[CONFIG_VM_CONSOLE_RINGBUF_VM_NUM];
 /*
  * Host-to-VM input is staged separately from the guest RX FIFO. The console
  * timer first collects host serial bytes into this small backlog, then feeds
@@ -189,8 +203,13 @@ static char vm_console_output_buf[VM_CONSOLE_DRAIN_BUF_SIZE + 128U];
 static const char vm_console_cpr_query[] = "\033[6n";
 static const char vm_console_cpr_reply[] = "\033[1;1R";
 
+static uint32_t console_ring_queued(uint32_t prod, uint32_t cons, uint32_t capacity);
 static void console_vm_vuart_receive(uint16_t vmid, char ch);
 static void console_vm_ring_drain_internal(uint16_t vmid);
+
+__attribute__((weak)) void console_vm_tx_space_changed(__unused uint16_t vmid)
+{
+}
 
 void console_init(void)
 {
@@ -235,6 +254,48 @@ bool console_vm_tx_put(uint16_t vmid, char ch)
 	return handled;
 }
 
+static bool console_vm_tx_update_blocked(uint16_t vmid, uint32_t queued)
+{
+	bool blocked = false;
+
+	if (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM) {
+		blocked = vm_console_tx_blocked[vmid];
+		if (queued >= VM_CONSOLE_TX_BACKPRESSURE_HIGH_WATER) {
+			blocked = true;
+		} else if (queued <= VM_CONSOLE_TX_BACKPRESSURE_LOW_WATER) {
+			blocked = false;
+		}
+		vm_console_tx_blocked[vmid] = blocked;
+	}
+
+	return blocked;
+}
+
+static bool console_vm_tx_update_blocked_locked(uint16_t vmid,
+	const struct vm_console_ringbuf *rb)
+{
+	uint32_t queued;
+
+	queued = console_ring_queued(rb->prod, rb->cons, VM_CONSOLE_RINGBUF_CAPACITY);
+	return console_vm_tx_update_blocked(vmid, queued);
+}
+
+bool console_vm_tx_can_accept(uint16_t vmid)
+{
+	struct vm_console_ringbuf *rb;
+	uint64_t rflags;
+	bool can_accept = false;
+
+	if (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM) {
+		rb = &vm_console_ringbufs[vmid];
+		spinlock_irqsave_obtain(&rb->lock, &rflags);
+		can_accept = !console_vm_tx_update_blocked_locked(vmid, rb);
+		spinlock_irqrestore_release(&rb->lock, rflags);
+	}
+
+	return can_accept;
+}
+
 size_t console_write(const char *s, size_t len)
 {
 	return  serial_puts(s, len);
@@ -270,16 +331,17 @@ static void console_vm_vuart_receive(uint16_t vmid, char ch)
 			rb->overflow_events++;
 			rb->last_overflow_tsc = cpu_ticks();
 			rb->cons = rb->prod - VM_CONSOLE_RINGBUF_CAPACITY;
+			}
+			queued = rb->prod - rb->cons;
+			if (queued > rb->high_water) {
+				rb->high_water = queued;
+			}
+			(void)console_vm_tx_update_blocked(vmid, queued);
+			rb->stored_bytes++;
+			rb->pending = rb->vuart_bound;
+			spinlock_irqrestore_release(&rb->lock, rflags);
 		}
-		queued = rb->prod - rb->cons;
-		if (queued > rb->high_water) {
-			rb->high_water = queued;
-		}
-		rb->stored_bytes++;
-		rb->pending = rb->vuart_bound;
-		spinlock_irqrestore_release(&rb->lock, rflags);
 	}
-}
 
 void console_vm_ring_drain(uint16_t vmid)
 {
@@ -844,6 +906,22 @@ static uint32_t console_vm_ring_claim(struct vm_console_ringbuf *rb, char *buf, 
 	return count;
 }
 
+static bool console_vm_ring_release_tx_backpressure(uint16_t vmid, struct vm_console_ringbuf *rb)
+{
+	uint64_t rflags;
+	bool was_blocked = false;
+	bool is_blocked = false;
+
+	spinlock_irqsave_obtain(&rb->lock, &rflags);
+	if (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM) {
+		was_blocked = vm_console_tx_blocked[vmid];
+		is_blocked = console_vm_tx_update_blocked_locked(vmid, rb);
+	}
+	spinlock_irqrestore_release(&rb->lock, rflags);
+
+	return was_blocked && !is_blocked;
+}
+
 static void console_vm_prefixed_write_flush(char *out, uint32_t *out_len)
 {
 	if (*out_len > 0U) {
@@ -996,6 +1074,8 @@ static void console_vm_ring_drain_internal(uint16_t vmid)
 	if (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM) {
 		rb = &vm_console_ringbufs[vmid];
 		if (console_vm_ring_drain_begin(rb)) {
+			bool tx_space_released;
+
 			/*
 			 * 2026-07-01, vuart live-drain pacing:
 			 *
@@ -1017,6 +1097,10 @@ static void console_vm_ring_drain_internal(uint16_t vmid)
 				}
 			} while ((count == chunk) && (budget > 0U));
 			console_vm_ring_drain_end(rb);
+			tx_space_released = console_vm_ring_release_tx_backpressure(vmid, rb);
+			if (tx_space_released) {
+				console_vm_tx_space_changed(vmid);
+			}
 		}
 	}
 }
@@ -1062,8 +1146,8 @@ void console_setup_timer(void)
 	/*
 	 * The console timer is the pacing boundary for shell and VM console work.
 	 * Keeping it periodic avoids doing slow serial output directly in guest
-	 * MMIO exits, while the 5ms cadence keeps vsh input/output responsive
-	 * enough for interactive debugging.
+	 * MMIO exits, while the configurable low-ms cadence keeps vsh input/output
+	 * responsive enough for interactive debugging.
 	 */
 	period_in_cycle = TICKS_PER_MS * CONSOLE_KICK_TIMER_TIMEOUT;
 	fire_tsc = cpu_ticks() + period_in_cycle;

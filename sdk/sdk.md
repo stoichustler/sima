@@ -480,18 +480,19 @@ captures during boot, reboot, or VM2 latency work:
   FIFO, using monotonic producer/consumer indexes and a 4KB power-of-two data
   area with 4095 bytes of usable capacity. `vsh` binds the host vuart to one VM
   console at a time; unbound VM output stays buffered until that VM is selected.
-  The console timer path runs every 5ms and drains the bound VM to the host
+  The console timer path runs every `CONFIG_CONSOLE_KICK_TIMER_TIMEOUT`,
+  default 2ms, and drains the bound VM to the host
   serial console with a small live-output slice. The raw slice starts from
   `CONFIG_VM_CONSOLE_DRAIN_BUDGET`, default 512, or
   `CONFIG_VM_CONSOLE_DRAIN_BURST_BUDGET`, default 2048, when the selected VM
   has at least half a ring queued. It is then capped by
-  `CONFIG_VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET`, default 256, so commands such as
+  `CONFIG_VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET`, default 512, so commands such as
   `dmesg`, `cat`, or `find` cannot hold the physical serial path for a long
   synchronous write. If host input was collected or remains queued in the same
   pass, the cap drops to `CONFIG_VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET`, default
   64, so Ctrl-D and typed commands get priority over guest TX backlog.
   Host-to-VM console input is first buffered in a small host backlog, then fed to
-  the guest with `CONFIG_VM_CONSOLE_RX_BUDGET`, default 4 bytes per pass, and
+  the guest with `CONFIG_VM_CONSOLE_RX_BUDGET`, default 32 bytes per pass, and
   only while the guest RX FIFO is below `CONFIG_VM_CONSOLE_RX_LOW_WATERMARK`,
   default 1 byte. Ordinary input beyond the backlog can be dropped under
   sustained key repeat. Guest RX reads refill one queued byte while budget

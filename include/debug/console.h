@@ -17,6 +17,8 @@ struct console_vm_ring_stats {
 	uint32_t size;
 	uint32_t capacity;
 	uint32_t drain_budget;
+	uint32_t tx_high_water;
+	uint32_t tx_low_water;
 	uint32_t queued;
 	uint32_t high_water;
 	uint64_t input_bytes;
@@ -28,6 +30,7 @@ struct console_vm_ring_stats {
 	bool pending;
 	bool draining;
 	bool vuart_bound;
+	bool tx_blocked;
 };
 
 struct console_vm_exception_stats {
@@ -85,6 +88,8 @@ bool console_is_hv(void);
 bool console_is_vm_active(uint16_t vmid);
 bool console_vm_kick(void);
 bool console_vm_tx_put(uint16_t vmid, char ch);
+bool console_vm_tx_can_accept(uint16_t vmid);
+void console_vm_tx_space_changed(uint16_t vmid);
 bool console_vm_rx_refill(struct acrn_vuart *vu);
 void console_vm_ring_drain(uint16_t vmid);
 bool console_vm_vuart_bind(uint16_t vmid);

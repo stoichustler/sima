@@ -29,7 +29,9 @@
 #define PL011_ICR		0x044U
 
 #define PL011_FR_TXFE		(1U << 7U)
+#define PL011_FR_TXFF		(1U << 5U)
 #define PL011_FR_RXFE		(1U << 4U)
+#define PL011_FR_BUSY		(1U << 3U)
 #define PL011_INT_TX		(1U << 5U)
 #define PL011_INT_RX		(1U << 4U)
 #define PL011_INT_RT		(1U << 6U)
@@ -83,6 +85,23 @@ static uint32_t vpl011_pending_state(struct acrn_vm *vm, const struct arm64_vpl0
 	return vu->ris | vpl011_rx_int_state(vm);
 }
 
+static bool vpl011_tx_can_accept(const struct acrn_vm *vm)
+{
+	return console_vm_tx_can_accept(vm->vm_id);
+}
+
+static void vpl011_refresh_tx_state(struct acrn_vm *vm, struct arm64_vpl011 *vu)
+{
+	if (vpl011_tx_can_accept(vm)) {
+		if ((vu->ris & PL011_INT_TX) == 0U) {
+			vu->ris |= PL011_INT_TX;
+			vu->tx_irq_count++;
+		}
+	} else {
+		vu->ris &= ~PL011_INT_TX;
+	}
+}
+
 static void vpl011_update_irq(struct acrn_vm *vm, struct arm64_vpl011 *vu, bool kick_asserted)
 {
 	uint32_t pending = vpl011_pending_state(vm, vu);
@@ -112,32 +131,14 @@ static void vpl011_update_irq(struct acrn_vm *vm, struct arm64_vpl011 *vu, bool 
 	}
 }
 
-static bool vpl011_raise_tx_if_needed(struct arm64_vpl011 *vu)
-{
-	bool raised = false;
-
-	if ((vu->ris & PL011_INT_TX) == 0U) {
-		/*
-		 * The emulated TX path has no backing FIFO: the transmit FIFO is
-		 * immediately below the interrupt threshold whenever the guest asks
-		 * for TX-ready state. IMSC still decides whether this raw state
-		 * reaches the virtual IRQ line.
-		 */
-		vu->ris |= PL011_INT_TX;
-		vu->tx_irq_count++;
-		raised = true;
-	}
-
-	return raised;
-}
-
 static void vpl011_set_imsc(struct acrn_vuart *console, struct arm64_vpl011 *vu, uint32_t value)
 {
 	uint32_t old_imsc = vu->imsc;
+	struct acrn_vm *vm = console->vm;
 
 	vu->imsc = value;
 	if (((old_imsc & PL011_INT_TX) == 0U) && ((value & PL011_INT_TX) != 0U)) {
-		vpl011_raise_tx_if_needed(vu);
+		vpl011_refresh_tx_state(vm, vu);
 	}
 	if ((value & PL011_INT_RX_ANY) != 0U) {
 		console->ier |= IER_ERBFI;
@@ -148,10 +149,14 @@ static void vpl011_set_imsc(struct acrn_vuart *console, struct arm64_vpl011 *vu,
 
 static bool vpl011_push_tx(struct acrn_vm *vm, struct arm64_vpl011 *vu, char ch)
 {
+	uint32_t old_ris = vu->ris;
+
 	vu->tx_count++;
 	vu->last_tx = (uint8_t)ch;
 	(void)console_vm_tx_put(vm->vm_id, ch);
-	return vpl011_raise_tx_if_needed(vu);
+	vpl011_refresh_tx_state(vm, vu);
+
+	return ((old_ris ^ vu->ris) & PL011_INT_TX) != 0U;
 }
 
 static void vpl011_notify_rx(struct acrn_vuart *console)
@@ -165,6 +170,25 @@ static void vpl011_notify_rx(struct acrn_vuart *console)
 		console->ier &= (uint8_t)~IER_ERBFI;
 	}
 	vpl011_update_irq(vm, vu, true);
+}
+
+void console_vm_tx_space_changed(uint16_t vmid)
+{
+	struct acrn_vm *vm;
+	struct arm64_vpl011 *vu;
+	uint32_t old_ris;
+
+	if (vmid < CONFIG_MAX_VM_NUM) {
+		vm = get_vm_from_vmid(vmid);
+		if ((vm != NULL) && !is_poweroff_vm(vm)) {
+			vu = &vpl011_devs[vmid];
+			old_ris = vu->ris;
+			vpl011_refresh_tx_state(vm, vu);
+			if (((old_ris ^ vu->ris) & PL011_INT_TX) != 0U) {
+				vpl011_update_irq(vm, vu, true);
+			}
+		}
+	}
 }
 
 static const struct vuart_backend_ops vpl011_backend_ops = {
@@ -225,7 +249,11 @@ static uint32_t vpl011_read(struct acrn_vm *vm, struct arm64_vpl011 *vu, uint32_
 		update_irq = true;
 		break;
 	case PL011_FR:
-		value = PL011_FR_TXFE;
+		if (vpl011_tx_can_accept(vm)) {
+			value = PL011_FR_TXFE;
+		} else {
+			value = PL011_FR_TXFF | PL011_FR_BUSY;
+		}
 		if (!vuart_rx_pending(console)) {
 			value |= PL011_FR_RXFE;
 		}
