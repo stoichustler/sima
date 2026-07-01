@@ -80,7 +80,7 @@ struct hv_timer console_timer;
 #endif
 #define VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET CONFIG_VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET
 #ifndef CONFIG_VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET
-#define CONFIG_VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET 64U
+#define CONFIG_VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET 256U
 #endif
 #define VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET CONFIG_VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET
 #ifndef CONFIG_VM_CONSOLE_RX_BUDGET
@@ -254,16 +254,18 @@ bool console_vm_tx_put(uint16_t vmid, char ch)
 	return handled;
 }
 
-static bool console_vm_tx_update_blocked(uint16_t vmid, uint32_t queued)
+static bool console_vm_tx_update_blocked(uint16_t vmid, uint32_t queued, bool bound)
 {
 	bool blocked = false;
 
 	if (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM) {
-		blocked = vm_console_tx_blocked[vmid];
-		if (queued >= VM_CONSOLE_TX_BACKPRESSURE_HIGH_WATER) {
-			blocked = true;
-		} else if (queued <= VM_CONSOLE_TX_BACKPRESSURE_LOW_WATER) {
-			blocked = false;
+		if (bound) {
+			blocked = vm_console_tx_blocked[vmid];
+			if (queued >= VM_CONSOLE_TX_BACKPRESSURE_HIGH_WATER) {
+				blocked = true;
+			} else if (queued <= VM_CONSOLE_TX_BACKPRESSURE_LOW_WATER) {
+				blocked = false;
+			}
 		}
 		vm_console_tx_blocked[vmid] = blocked;
 	}
@@ -277,7 +279,7 @@ static bool console_vm_tx_update_blocked_locked(uint16_t vmid,
 	uint32_t queued;
 
 	queued = console_ring_queued(rb->prod, rb->cons, VM_CONSOLE_RINGBUF_CAPACITY);
-	return console_vm_tx_update_blocked(vmid, queued);
+	return console_vm_tx_update_blocked(vmid, queued, rb->vuart_bound);
 }
 
 bool console_vm_tx_can_accept(uint16_t vmid)
@@ -331,17 +333,17 @@ static void console_vm_vuart_receive(uint16_t vmid, char ch)
 			rb->overflow_events++;
 			rb->last_overflow_tsc = cpu_ticks();
 			rb->cons = rb->prod - VM_CONSOLE_RINGBUF_CAPACITY;
-			}
-			queued = rb->prod - rb->cons;
-			if (queued > rb->high_water) {
-				rb->high_water = queued;
-			}
-			(void)console_vm_tx_update_blocked(vmid, queued);
-			rb->stored_bytes++;
-			rb->pending = rb->vuart_bound;
-			spinlock_irqrestore_release(&rb->lock, rflags);
 		}
+		queued = rb->prod - rb->cons;
+		if (queued > rb->high_water) {
+			rb->high_water = queued;
+		}
+		(void)console_vm_tx_update_blocked(vmid, queued, rb->vuart_bound);
+		rb->stored_bytes++;
+		rb->pending = rb->vuart_bound;
+		spinlock_irqrestore_release(&rb->lock, rflags);
 	}
+}
 
 void console_vm_ring_drain(uint16_t vmid)
 {
@@ -368,6 +370,7 @@ bool console_vm_vuart_bind(uint16_t vmid)
 		 */
 		rb->vuart_bound = true;
 		rb->pending = (rb->prod != rb->cons);
+		(void)console_vm_tx_update_blocked_locked(vmid, rb);
 		spinlock_irqrestore_release(&rb->lock, rflags);
 		valid = true;
 	}
@@ -379,13 +382,19 @@ void console_vm_vuart_unbind(uint16_t vmid)
 {
 	struct vm_console_ringbuf *rb;
 	uint64_t rflags;
+	bool was_blocked = false;
 
 	if (vmid < CONFIG_VM_CONSOLE_RINGBUF_VM_NUM) {
 		rb = &vm_console_ringbufs[vmid];
 		spinlock_irqsave_obtain(&rb->lock, &rflags);
+		was_blocked = vm_console_tx_blocked[vmid];
 		rb->vuart_bound = false;
 		rb->pending = false;
+		vm_console_tx_blocked[vmid] = false;
 		spinlock_irqrestore_release(&rb->lock, rflags);
+		if (was_blocked) {
+			console_vm_tx_space_changed(vmid);
+		}
 	}
 }
 
@@ -588,11 +597,11 @@ static uint32_t console_vm_ring_budget_from_queued(uint32_t queued, bool input_p
 	uint32_t budget = (queued >= VM_CONSOLE_DRAIN_BURST_THRESHOLD) ?
 		VM_CONSOLE_DRAIN_BURST_BUDGET : VM_CONSOLE_DRAIN_BUDGET;
 
-	if (budget > VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET) {
-		budget = VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET;
-	}
 	if (input_pending && (budget > VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET)) {
 		budget = VM_CONSOLE_INPUT_PENDING_DRAIN_BUDGET;
+	} else if ((queued < VM_CONSOLE_DRAIN_BURST_THRESHOLD) &&
+		(budget > VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET)) {
+		budget = VM_CONSOLE_INTERACTIVE_DRAIN_BUDGET;
 	}
 
 	return budget;
